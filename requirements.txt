@@ -1,0 +1,29 @@
+# Прокси-сервер анонимизации для облачных LLM
+# Зависимости Python
+
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# HTTP клиенты
+httpx>=0.28.0
+
+# Парсинг документов
+python-docx>=1.1.0      # DOCX (Word)
+openpyxl>=3.1.0         # XLSX (Excel)
+# XML парсинг через встроенный xml.etree.ElementTree
+
+# NLP (fallback для regex)
+# spacy>=3.8.0  # Опционально, требует компиляции
+
+# Схемы данных
+pydantic>=2.0.0
+
+# Async SQLite
+aiosqlite>=0.20.0
+
+# Загрузка файлов
+python-multipart>=0.0.18
+
+# Утилиты
+python-dotenv>=1.0.0    # Загрузка .env файлов

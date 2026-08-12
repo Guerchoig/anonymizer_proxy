@@ -1,0 +1,17 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "setup-env: создать .venv и установить зависимости",
+            "type": "shell",
+            "command": "python -m venv .venv; .\\.venv\\Scripts\\python.exe -m pip install --upgrade pip; .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt",
+            "problemMatcher": []
+        },
+        {
+            "label": "run-tests: прогон функциональных тестов",
+            "type": "shell",
+            "command": "$failed = 0; foreach ($t in 'test_fixes','test_tools_passthrough','test_anonymize_only','test_file_parser','test_ner_quality') { Write-Host \"=== $t ===\"; & .\\.venv\\Scripts\\python.exe \"anonymizer_proxy\\tests\\$t.py\"; if ($LASTEXITCODE -ne 0) { $failed = 1; Write-Host \"FAILED: $t\" } }; if ($failed -ne 0) { exit 1 }",
+            "problemMatcher": []
+        }
+    ]
+}

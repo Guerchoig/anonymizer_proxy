@@ -1,0 +1,30 @@
+# Секреты и локальная конфигурация
+.env
+*.env.local
+
+# Данные (содержат PII!)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи
+*.log
+stdout.log
+stderr.log
+proxy_stdout.log
+proxy_stderr.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Тестовые файлы с потенциальными PII
+*.docx
+*.xlsx
+
+# IDE (.vscode/ НЕ игнорируется — настройки окружения проекта коммитятся)
+.idea/
