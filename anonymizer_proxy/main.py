@@ -26,11 +26,15 @@ from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
 from anonymizer_proxy.proxy.openrouter_client import OpenRouterClient, OpenRouterError
 from anonymizer_proxy.proxy.handlers import RequestHandler
+from anonymizer_proxy.proxy.review_queue import ReviewQueue, ReviewRejectedError
 from anonymizer_proxy.models.schemas import (
     ChatCompletionRequest,
     AnonymizeRequest,
     AnonymizeResponse,
     DeanonymizeRequest,
+    ReviewApproveRequest,
+    ReviewRejectRequest,
+    PendingReviewsResponse,
     validate_session_id,
 )
 
@@ -40,6 +44,7 @@ ner_service: Optional[NERService] = None
 mapping_store: Optional[MappingStore] = None
 openrouter_client: Optional[OpenRouterClient] = None
 request_handler: Optional[RequestHandler] = None
+review_queue: Optional[ReviewQueue] = None
 
 
 def _is_local_bind() -> bool:
@@ -50,7 +55,7 @@ def _is_local_bind() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
-    global ner_service, mapping_store, openrouter_client, request_handler
+    global ner_service, mapping_store, openrouter_client, request_handler, review_queue
 
     logger.info("=" * 60)
     logger.info("  Прокси-сервер анонимизации")
@@ -81,10 +86,12 @@ async def lifespan(app: FastAPI):
     await mapping_store.initialize()
 
     openrouter_client = OpenRouterClient()
+    review_queue = ReviewQueue()
     request_handler = RequestHandler(
         ner_service=ner_service,
         mapping_store=mapping_store,
         openrouter_client=openrouter_client,
+        review_queue=review_queue,
     )
 
     # Проверяем доступность LM Studio
@@ -238,6 +245,8 @@ async def chat_completions(
         return _make_openai_error(400, "Invalid JSON in request body", "invalid_request_error")
     except OpenRouterError as e:
         return _make_openai_error(e.status_code, str(e), "upstream_error")
+    except ReviewRejectedError as e:
+        return _make_openai_error(400, str(e), "invalid_request_error")
     except Exception as e:
         logger.exception("Необработанная ошибка запроса")
         return _make_openai_error(500, str(e), "server_error")
@@ -287,6 +296,43 @@ async def deanonymize(request: DeanonymizeRequest):
         return {"deanonymized_text": result, "session_id": request.session_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Эндпоинты ручного ревью ====================
+
+@app.get(
+    "/api/review/pending",
+    response_model=PendingReviewsResponse,
+    dependencies=[Depends(require_api_token)],
+)
+async def review_pending():
+    """Список запросов, ожидающих ручного ревью"""
+    pending = await review_queue.get_pending_list()
+    return {"pending": pending, "count": len(pending)}
+
+
+@app.post("/api/review/approve", dependencies=[Depends(require_api_token)])
+async def review_approve(request: ReviewApproveRequest):
+    """Одобрить запрос из очереди ревью (опционально с отредактированным контентом)"""
+    ok = await review_queue.approve(request.request_id, request.edited_content)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail="Запрос не найден или уже обработан",
+        )
+    return {"message": "Запрос одобрен", "request_id": request.request_id}
+
+
+@app.post("/api/review/reject", dependencies=[Depends(require_api_token)])
+async def review_reject(request: ReviewRejectRequest):
+    """Отклонить запрос из очереди ревью"""
+    ok = await review_queue.reject(request.request_id, request.reason)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail="Запрос не найден или уже обработан",
+        )
+    return {"message": "Запрос отклонён", "request_id": request.request_id}
 
 
 # ==================== Эндпоинты для логирования ====================
