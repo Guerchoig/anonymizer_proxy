@@ -125,10 +125,60 @@ class AnonymizeRequest(BaseModel):
         return validate_session_id(v)
 
 
+class AnonymizeFileRequest(BaseModel):
+    """Запрос на анонимизацию локального файла (создание копии рядом с оригиналом)"""
+    file_path: str = Field(..., description="Путь к локальному файлу")
+    session_id: Optional[str] = Field(None, description="ID сессии для маппингов")
+    output_path: Optional[str] = Field(
+        None,
+        description="Куда сохранить анонимизированную копию (по умолчанию — <name>.anonymized.<ext> рядом с оригиналом)",
+    )
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session_id(cls, v: Optional[str]) -> Optional[str]:
+        return validate_session_id(v)
+
+
 class DeanonymizeRequest(BaseModel):
     """Запрос на де-анонимизацию текста"""
     text: str = Field(..., description="Текст с токенами для восстановления")
     session_id: str = Field(..., description="ID сессии с маппингами")
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session_id(cls, v: str) -> str:
+        result = validate_session_id(v)
+        if result is None:
+            raise ValueError("session_id обязателен")
+        return result
+
+
+class SendAnonymizedRequest(BaseModel):
+    """Запрос на отправку анонимизированного промпта в облако"""
+    session_id: str = Field(..., description="ID сессии с маппингами")
+    content: str = Field(..., description="Анонимизированный контент (markdown или текст)")
+    stream: Optional[bool] = Field(False, description="Стриминг ответа")
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+    @field_validator("session_id")
+    @classmethod
+    def _check_session_id(cls, v: str) -> str:
+        result = validate_session_id(v)
+        if result is None:
+            raise ValueError("session_id обязателен")
+        return result
+
+
+class DeanonymizeFileRequest(BaseModel):
+    """Запрос на де-анонимизацию файла (замена плейсхолдеров на реальные значения)"""
+    session_id: str = Field(..., description="ID сессии с маппингами")
+    file_path: str = Field(..., description="Путь к файлу с плейсхолдерами")
+    output_path: Optional[str] = Field(
+        None,
+        description="Куда сохранить результат (по умолчанию — перезапись исходного)",
+    )
 
     @field_validator("session_id")
     @classmethod

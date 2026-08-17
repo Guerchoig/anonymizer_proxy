@@ -10,6 +10,9 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
 
@@ -19,6 +22,7 @@ class ParsedContent:
     text: str = ""
     structure: dict = field(default_factory=dict)  # Сохранение структуры для обратной сборки
     metadata: dict = field(default_factory=dict)
+    markdown: str = ""  # Форматированное markdown-представление (с таблицами)
 
 
 def _normalize_line(text: str) -> str:
@@ -32,6 +36,29 @@ def _cell_to_line(value) -> str:
     if value is None:
         return ""
     return _normalize_line(str(value))
+
+
+def _rows_to_markdown(rows: list[list[str]]) -> str:
+    """Список списков строк -> markdown-таблица (первая строка — заголовок)."""
+    if not rows:
+        return ""
+    header = rows[0]
+    col_count = max((len(r) for r in rows), default=len(header))
+    lines = ["| " + " | ".join((header + [""] * col_count)[:col_count]) + " |"]
+    lines.append("|" + " --- |" * col_count)
+    for r in rows[1:]:
+        cells = (r + [""] * col_count)[:col_count]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _table_to_markdown(table) -> str:
+    """docx Table -> markdown-таблица (сохраняет сетку ячеек)."""
+    rows = []
+    for row in table.rows:
+        cells = [_normalize_line(cell.text) for cell in row.cells]
+        rows.append(cells)
+    return _rows_to_markdown(rows)
 
 
 def _set_paragraph_text(para, text: str) -> None:
@@ -146,6 +173,20 @@ class FileParser:
                 "data": table_data
             })
 
+        # Markdown-представление с таблицами (для review и облака):
+        # абзацы и таблицы в порядке документа, таблицы -> markdown-таблицы
+        markdown_parts = []
+        for child in doc.element.body.iterchildren():
+            if child.tag == qn("w:p"):
+                para = Paragraph(child, doc)
+                text = _normalize_line(para.text)
+                if text:
+                    markdown_parts.append(text)
+            elif child.tag == qn("w:tbl"):
+                table = Table(child, doc)
+                markdown_parts.append(_table_to_markdown(table))
+        markdown = "\n\n".join(p for p in markdown_parts if p)
+
         return ParsedContent(
             text="\n".join(segments),
             structure=structure,
@@ -153,7 +194,8 @@ class FileParser:
                 "format": "docx",
                 "paragraphs_count": len(doc.paragraphs),
                 "tables_count": len(doc.tables)
-            }
+            },
+            markdown=markdown,
         )
 
     def _parse_xlsx(self, content: bytes) -> ParsedContent:
@@ -192,10 +234,24 @@ class FileParser:
 
             structure["sheets"].append(sheet_data)
 
+        # Markdown-представление: каждый лист -> markdown-таблица
+        markdown_parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows():
+                cells = [_cell_to_line(cell.value) for cell in row]
+                if not any(cells):
+                    continue
+                rows.append(cells)
+            markdown_parts.append(f"## {sheet_name}\n\n{_rows_to_markdown(rows)}")
+        markdown = "\n\n".join(markdown_parts)
+
         return ParsedContent(
             text="\n".join(segments),
             structure=structure,
-            metadata={"format": "xlsx", "sheets_count": len(wb.sheetnames)}
+            metadata={"format": "xlsx", "sheets_count": len(wb.sheetnames)},
+            markdown=markdown,
         )
 
     def _parse_xml(self, content: bytes) -> ParsedContent:
@@ -269,7 +325,8 @@ class FileParser:
                 "xml_type": xml_type,
                 "root_tag": root.tag,
                 "elements_count": len(structure["elements"])
-            }
+            },
+            markdown=full_text,
         )
     
     def _parse_text(self, content: bytes) -> ParsedContent:
@@ -286,7 +343,8 @@ class FileParser:
         return ParsedContent(
             text=text,
             structure={"type": "plain_text"},
-            metadata={"format": "text", "encoding": "auto-detected"}
+            metadata={"format": "text", "encoding": "auto-detected"},
+            markdown=text,
         )
 
 

@@ -123,6 +123,21 @@ class TextReplacer:
         """Проверить, есть ли токены в тексте"""
         return bool(self.TOKEN_PATTERN.search(text))
 
+    def replace_by_value(self, text: str, value_to_token: dict[str, str]) -> str:
+        """
+        Заменить значения на токены по точному совпадению (без regex-оффсетов).
+
+        Используется для анонимизации markdown-представления файлов: маппинг
+        value -> token уже получен из NER, а оффсеты в markdown отличаются от
+        оффсетов в плоском тексте (таблицы, разделители).
+        """
+        if not value_to_token or not text:
+            return text
+        result = text
+        for value in sorted(value_to_token.keys(), key=len, reverse=True):
+            result = result.replace(value, value_to_token[value])
+        return result
+
 
 class StreamDeAnonymizer:
     """

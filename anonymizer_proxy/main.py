@@ -31,7 +31,10 @@ from anonymizer_proxy.models.schemas import (
     ChatCompletionRequest,
     AnonymizeRequest,
     AnonymizeResponse,
+    AnonymizeFileRequest,
     DeanonymizeRequest,
+    DeanonymizeFileRequest,
+    SendAnonymizedRequest,
     ReviewApproveRequest,
     ReviewRejectRequest,
     PendingReviewsResponse,
@@ -204,6 +207,18 @@ async def chat_completions(
 
         # Стриминг режим
         if chat_request.stream:
+            # Passthrough: anonymize=False — стримим без анонимизации
+            if not chat_request.anonymize:
+                return StreamingResponse(
+                    request_handler.stream_passthrough(chat_request),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",  # Для nginx
+                    }
+                )
+
             # Сначала выполняем NER + анонимизацию ДО создания StreamingResponse
             # Это позволяет вернуть нормальный JSON error при ошибке
             try:
@@ -288,12 +303,66 @@ async def anonymize(request: AnonymizeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/anonymize_file", dependencies=[Depends(require_api_token)])
+async def anonymize_file(request: AnonymizeFileRequest):
+    """Анонимизировать локальный файл (создать копию с плейсхолдерами рядом с оригиналом)"""
+    try:
+        return await request_handler.handle_anonymize_file(
+            request.file_path, request.session_id, request.output_path
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/deanonymize", dependencies=[Depends(require_api_token)])
 async def deanonymize(request: DeanonymizeRequest):
     """Де-анонимизировать текст по session_id"""
     try:
         result = await request_handler.handle_deanonymize(request.text, request.session_id)
         return {"deanonymized_text": result, "session_id": request.session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/deanonymize_file", dependencies=[Depends(require_api_token)])
+async def deanonymize_file(request: DeanonymizeFileRequest):
+    """Де-анонимизировать файл (заменить плейсхолдеры на реальные значения)"""
+    try:
+        result = await request_handler.handle_deanonymize_file(
+            request.session_id, request.file_path, request.output_path
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/send", dependencies=[Depends(require_api_token)])
+async def send_anonymized(request: SendAnonymizedRequest):
+    """Отправить анонимизированный промпт в облако и де-анонимизировать ответ"""
+    if request.stream:
+        return StreamingResponse(
+            request_handler.stream_send_anonymized(request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Для nginx
+            }
+        )
+    try:
+        response, session_id = await request_handler.handle_send_anonymized(request)
+        return JSONResponse(
+            content=response.model_dump(exclude_none=True),
+            headers={"X-Session-Id": session_id}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

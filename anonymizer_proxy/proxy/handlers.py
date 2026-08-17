@@ -31,6 +31,7 @@ from ..models.schemas import (
     UsageInfo,
     AnonymizeRequest,
     AnonymizeResponse,
+    SendAnonymizedRequest,
 )
 from .openrouter_client import OpenRouterClient
 from .review_queue import ReviewQueue, ReviewRejectedError
@@ -280,7 +281,8 @@ class RequestHandler:
                 )
                 return None
             parsed = await self.file_parser.parse(path.read_bytes(), path.name)
-            text = parsed.text.strip()
+            # Для review и облака используем markdown-представление (с таблицами)
+            text = (parsed.markdown or parsed.text).strip()
             if not text:
                 logger.warning("Из файла %s не извлечён текст", path)
                 return None
@@ -555,6 +557,11 @@ class RequestHandler:
             Кортеж (ответ, session_id)
         """
         start_time = time.time()
+
+        # Passthrough: anonymize=False — отправляем в облако без
+        # анонимизации и де-анонимизации (обычный прокси).
+        if not request.anonymize:
+            return await self._handle_passthrough(request, session_id)
 
         # Переиспользуем prepare_chat_request (нет дублирования логики)
         prepared = await self.prepare_chat_request(request, session_id)
@@ -998,6 +1005,235 @@ class RequestHandler:
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
+    async def _handle_passthrough(
+        self,
+        request: ChatCompletionRequest,
+        session_id: Optional[str] = None,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """
+        Passthrough-режим (anonymize=False): отправить запрос в OpenRouter
+        БЕЗ анонимизации и де-анонимизации (обычный прокси).
+        """
+        messages_payload = [
+            m.model_dump(exclude_none=True) for m in request.messages
+        ]
+
+        cloud_response = await self.openrouter.chat_completion(
+            messages=messages_payload,
+            model=None,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+            n=request.n,
+            stop=request.stop,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
+
+        choices = []
+        for choice in cloud_response.get("choices", []):
+            message_data = choice.get("message", {})
+            resp_message = ChatMessage(
+                role=message_data.get("role", "assistant"),
+                content=message_data.get("content"),
+            )
+            if message_data.get("tool_calls"):
+                resp_message.tool_calls = message_data["tool_calls"]
+            if message_data.get("name"):
+                resp_message.name = message_data["name"]
+            if message_data.get("tool_call_id"):
+                resp_message.tool_call_id = message_data["tool_call_id"]
+            choices.append(
+                ChatCompletionChoice(
+                    index=choice.get("index", 0),
+                    message=resp_message,
+                    finish_reason=choice.get("finish_reason"),
+                )
+            )
+
+        response = ChatCompletionResponse(
+            id=cloud_response.get("id", f"passthrough-{int(time.time())}"),
+            created=cloud_response.get("created", int(time.time())),
+            model=cloud_response.get("model", request.model),
+            choices=choices,
+            usage=UsageInfo(**cloud_response.get("usage", {})),
+            anonymization_metadata={"mode": "passthrough"},
+        )
+        return response, session_id or "passthrough"
+
+    async def stream_passthrough(
+        self,
+        request: ChatCompletionRequest,
+    ) -> AsyncIterator[str]:
+        """
+        Стриминг passthrough (anonymize=False): без анонимизации и
+        де-анонимизации (обычный прокси-стрим).
+        """
+        messages_payload = [
+            m.model_dump(exclude_none=True) for m in request.messages
+        ]
+
+        try:
+            async for chunk in self.openrouter.chat_completion_stream(
+                messages=messages_payload,
+                model=None,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                top_p=request.top_p,
+                n=request.n,
+                stop=request.stop,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+            ):
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            error_chunk = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    async def handle_send_anonymized(
+        self,
+        request: SendAnonymizedRequest,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """
+        Отправить анонимизированный промпт в облако и де-анонимизировать ответ.
+
+        content отправляется как единое user-сообщение; ответ де-анонимизируется
+        по маппингам session_id.
+        """
+        mappings_dict = await self.store.get_all_mappings(request.session_id)
+        messages = [{"role": "user", "content": request.content}]
+
+        cloud_response = await self.openrouter.chat_completion(
+            messages=messages,
+            model=None,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
+
+        deanonymized_choices = []
+        for choice in cloud_response.get("choices", []):
+            message = choice.get("message", {})
+            content = message.get("content")
+            if isinstance(content, str):
+                content = await self.text_replacer.deanonymize(content, mappings_dict)
+
+            resp_message = ChatMessage(
+                role=message.get("role", "assistant"),
+                content=content,
+            )
+            if message.get("tool_calls"):
+                resp_message.tool_calls = await self._deanonymize_tool_calls(
+                    message["tool_calls"], mappings_dict
+                )
+            deanonymized_choices.append(
+                ChatCompletionChoice(
+                    index=choice.get("index", 0),
+                    message=resp_message,
+                    finish_reason=choice.get("finish_reason"),
+                )
+            )
+
+        response = ChatCompletionResponse(
+            id=cloud_response.get("id", f"send-{request.session_id}"),
+            created=cloud_response.get("created", int(time.time())),
+            model=cloud_response.get("model", "openrouter"),
+            choices=deanonymized_choices,
+            usage=UsageInfo(**cloud_response.get("usage", {})),
+            anonymization_metadata={
+                "mode": "send",
+                "session_id": request.session_id,
+                "mappings_count": len(mappings_dict),
+            },
+        )
+        return response, request.session_id
+
+    async def stream_send_anonymized(
+        self,
+        request: SendAnonymizedRequest,
+    ) -> AsyncIterator[str]:
+        """Стриминг: отправить анонимизированный промпт и де-анонимизировать ответ."""
+        mappings_dict = await self.store.get_all_mappings(request.session_id)
+        messages = [{"role": "user", "content": request.content}]
+
+        collected_content = ""
+        deano = StreamDeAnonymizer(self.text_replacer, mappings_dict)
+        arg_deanos: dict[tuple[int, int], StreamDeAnonymizer] = {}
+
+        try:
+            async for chunk in self.openrouter.chat_completion_stream(
+                messages=messages,
+                model=None,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            ):
+                choices = chunk.get("choices", [])
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        deanonymized = await deano.feed(delta["content"])
+                        collected_content += deanonymized
+                        delta["content"] = deanonymized if deanonymized else ""
+
+                    for tc_delta in delta.get("tool_calls") or []:
+                        if not isinstance(tc_delta, dict):
+                            continue
+                        tc_index = tc_delta.get("index", 0)
+                        fn = tc_delta.get("function")
+                        if not isinstance(fn, dict):
+                            continue
+                        args_frag = fn.get("arguments")
+                        if isinstance(args_frag, str) and args_frag:
+                            key = (choice.get("index", 0), tc_index)
+                            if key not in arg_deanos:
+                                arg_deanos[key] = StreamDeAnonymizer(
+                                    self.text_replacer, mappings_dict
+                                )
+                            fn["arguments"] = await arg_deanos[key].feed(args_frag)
+
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            tail = await deano.flush()
+            if tail:
+                collected_content += tail
+                tail_chunk = {
+                    "id": f"send-{request.session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "openrouter",
+                    "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(tail_chunk, ensure_ascii=False)}\n\n"
+
+            for (choice_idx, tc_index), tc_deano in arg_deanos.items():
+                tail_args = await tc_deano.flush()
+                if tail_args:
+                    args_tail_chunk = {
+                        "id": f"send-{request.session_id}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "openrouter",
+                        "choices": [{
+                            "index": choice_idx,
+                            "delta": {"tool_calls": [{"index": tc_index, "function": {"arguments": tail_args}}]},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(args_tail_chunk, ensure_ascii=False)}\n\n"
+
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            error_chunk = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
     async def handle_anonymize_only(
         self,
         request: AnonymizeRequest
@@ -1119,6 +1355,122 @@ class RequestHandler:
         """Де-анонимизировать текст по session_id"""
         mappings = await self.store.get_all_mappings(session_id)
         return await self.text_replacer.deanonymize(text, mappings)
+
+    async def handle_deanonymize_file(
+        self,
+        session_id: str,
+        file_path: str,
+        output_path: Optional[str] = None,
+    ) -> dict:
+        """
+        Де-анонимизировать файл: заменить плейсхолдеры на реальные значения
+        из маппингов сессии и пересохранить файл (структура/таблицы сохраняются).
+        """
+        mappings_dict = await self.store.get_all_mappings(session_id)
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Файл не найден: {path}")
+
+        target = Path(output_path) if output_path else path
+        ext = path.suffix.lower()
+
+        if ext in (".txt", ".md"):
+            text = path.read_text(encoding="utf-8")
+            deanonymized = await self.text_replacer.deanonymize(text, mappings_dict)
+            target.write_text(deanonymized, encoding="utf-8")
+        elif ext in (".docx", ".xlsx", ".xml"):
+            original = path.read_bytes()
+            parsed = await self.file_parser.parse(original, path.name)
+            deanonymized_text = await self.text_replacer.deanonymize(
+                parsed.text, mappings_dict
+            )
+            assembled = await self.file_assembler.assemble(
+                original, path.name, deanonymized_text, parsed.structure
+            )
+            target.write_bytes(assembled)
+        else:
+            raise ValueError(f"Неподдерживаемый формат файла: {ext}")
+
+        return {
+            "session_id": session_id,
+            "file_path": str(target),
+            "mappings_count": len(mappings_dict),
+        }
+
+    async def handle_anonymize_file(
+        self,
+        file_path: str,
+        session_id: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> dict:
+        """
+        Анонимизировать локальный файл: создать анонимизированную копию
+        (структура/таблицы сохраняются) рядом с оригиналом.
+
+        Возвращает путь к анонимизированной копии — модель (Cline) редактирует
+        именно её, а в конце де-анонимизация через /api/deanonymize_file.
+        """
+        session_id = await self.store.get_or_create_session(session_id)
+        path = Path(file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Файл не найден: {path}")
+        if not FileParser.is_supported(path.name):
+            raise ValueError(f"Неподдерживаемый формат файла: {path.name}")
+
+        content = path.read_bytes()
+        parsed = await self.file_parser.parse(content, path.name)
+
+        async def add_mapping(original_value: str, entity_type: str) -> str:
+            return await self.store.add_mapping(
+                session_id, original_value, entity_type
+            )
+
+        entities, _ = await self.ner.extract_entities(parsed.text, use_llm=True)
+
+        # Маппинг value -> token для анонимизации markdown-представления
+        value_to_token: dict[str, str] = {}
+        for e in entities:
+            if e.text not in value_to_token:
+                value_to_token[e.text] = await add_mapping(e.text, e.type)
+
+        anon_text, _ = await self.text_replacer.anonymize(
+            parsed.text, entities, add_mapping
+        )
+        anon_content = await self.file_assembler.assemble(
+            content, path.name, anon_text, parsed.structure
+        )
+
+        # Анонимизированный markdown (с таблицами) для review
+        anon_markdown = self.text_replacer.replace_by_value(
+            parsed.markdown or parsed.text, value_to_token
+        )
+
+        if output_path:
+            target = Path(output_path)
+        else:
+            target = path.with_name(f"{path.stem}.anonymized{path.suffix}")
+        target.write_bytes(anon_content)
+
+        # Сохраняем review-файл (.md) с форматированным анонимизированным видом
+        review_path = None
+        if anon_markdown and STORAGE["save_anonymized_files"]:
+            try:
+                review_path = await self.store.save_anonymized_text(
+                    session_id, anon_markdown, prefix="review"
+                )
+            except Exception as e:
+                logger.error("Не удалось сохранить review-файл: %s", e)
+
+        mappings = await self.store.get_all_mappings(session_id)
+        return {
+            "session_id": session_id,
+            "original_file": str(path),
+            "anonymized_file": str(target),
+            "review_file": str(review_path) if review_path else None,
+            "anonymized_markdown": anon_markdown,
+            "entities_found": len(entities),
+            "mappings_count": len(mappings),
+        }
 
     async def get_session_logs(
         self,
