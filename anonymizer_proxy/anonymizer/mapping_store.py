@@ -411,11 +411,15 @@ class MappingStore:
                 "SELECT COUNT(*) FROM mappings WHERE session_id = ?", (sid,)
             )
             map_row = await map_cursor.fetchone()
+            # Пути к .md файлам ревью
+            session_dir = ANONYMIZED_FILES_DIR / sid
+            review_files = [str(f) for f in session_dir.glob("*.md")] if session_dir.exists() else []
             sessions.append({
                 "session_id": sid,
                 "created_at": _from_iso(row[1]) if row[1] else _utcnow(),
                 "expires_at": _from_iso(row[2]) if row[2] else _utcnow(),
                 "mappings_count": map_row[0] if map_row else 0,
+                "review_files": review_files,
             })
         return sessions
 

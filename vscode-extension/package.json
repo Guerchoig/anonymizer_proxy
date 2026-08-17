@@ -1,8 +1,8 @@
 {
   "name": "anonymizer-proxy",
-  "displayName": "Anonymizer Proxy — Ручное ревью",
-  "description": "Панель ручного ревью анонимизированных промптов Anonymizer Proxy: просмотр, правка и одобрение/отклонение перед отправкой в облако.",
-  "version": "0.1.0",
+  "displayName": "Anonymizer Proxy — Пульт управления",
+  "description": "Пульт управления Anonymizer Proxy: просмотр активных сессий, отправка анонимизированных промптов, де-анонимизация файлов.",
+  "version": "0.2.0",
   "publisher": "local",
   "private": true,
   "license": "Apache-2.0",
@@ -13,7 +13,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onView:anonymizerProxy.reviewView"
+    "onView:anonymizerProxy.sessionsView"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -29,68 +29,26 @@
     "views": {
       "anonymizerProxy": [
         {
-          "id": "anonymizerProxy.reviewView",
-          "name": "Ручное ревью",
+          "id": "anonymizerProxy.sessionsView",
+          "name": "Сессии",
           "type": "tree"
         }
       ]
     },
     "commands": [
-      {
-        "command": "anonymizerProxy.refreshReviews",
-        "title": "Anonymizer Proxy: Обновить список ревью",
-        "icon": "$(refresh)"
-      },
-      {
-        "command": "anonymizerProxy.openFile",
-        "title": "Открыть .md",
-        "icon": "$(open-preview)"
-      },
-      {
-        "command": "anonymizerProxy.approveWithEdits",
-        "title": "Одобрить (с правками из файла)",
-        "icon": "$(check)"
-      },
-      {
-        "command": "anonymizerProxy.approveNoEdits",
-        "title": "Одобрить (без правок)",
-        "icon": "$(check-all)"
-      },
-      {
-        "command": "anonymizerProxy.reject",
-        "title": "Отклонить",
-        "icon": "$(close)"
-      }
+      { "command": "anonymizerProxy.refreshSessions", "title": "Anonymizer Proxy: Обновить сессии", "icon": "$(refresh)" },
+      { "command": "anonymizerProxy.openMd", "title": "Открыть .md", "icon": "$(open-preview)" },
+      { "command": "anonymizerProxy.send", "title": "Отправить в облако", "icon": "$(send)" },
+      { "command": "anonymizerProxy.deanonymizeFile", "title": "Де-анонимизировать файл", "icon": "$(file-binary)" }
     ],
     "menus": {
       "view/title": [
-        {
-          "command": "anonymizerProxy.refreshReviews",
-          "when": "view == anonymizerProxy.reviewView",
-          "group": "navigation"
-        }
+        { "command": "anonymizerProxy.refreshSessions", "when": "view == anonymizerProxy.sessionsView", "group": "navigation" }
       ],
       "view/item/context": [
-        {
-          "command": "anonymizerProxy.openFile",
-          "when": "view == anonymizerProxy.reviewView && viewItem == pendingReview",
-          "group": "inline@1"
-        },
-        {
-          "command": "anonymizerProxy.approveWithEdits",
-          "when": "view == anonymizerProxy.reviewView && viewItem == pendingReview",
-          "group": "inline@2"
-        },
-        {
-          "command": "anonymizerProxy.approveNoEdits",
-          "when": "view == anonymizerProxy.reviewView && viewItem == pendingReview",
-          "group": "inline@3"
-        },
-        {
-          "command": "anonymizerProxy.reject",
-          "when": "view == anonymizerProxy.reviewView && viewItem == pendingReview",
-          "group": "inline@4"
-        }
+        { "command": "anonymizerProxy.openMd", "when": "view == anonymizerProxy.sessionsView && viewItem == session", "group": "inline@1" },
+        { "command": "anonymizerProxy.send", "when": "view == anonymizerProxy.sessionsView && viewItem == session", "group": "inline@2" },
+        { "command": "anonymizerProxy.deanonymizeFile", "when": "view == anonymizerProxy.sessionsView && viewItem == session", "group": "inline@3" }
       ]
     },
     "configuration": {
@@ -110,7 +68,7 @@
           "type": "number",
           "default": 2000,
           "minimum": 500,
-          "description": "Интервал опроса очереди ревью (мс)."
+          "description": "Интервал опроса списка сессий (мс)."
         }
       }
     }

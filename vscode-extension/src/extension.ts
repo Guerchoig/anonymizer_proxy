@@ -1,12 +1,11 @@
-import * as vscode from 'vscode';
-import { promises as fs } from 'fs';
-import { ReviewClient, PendingReview } from './reviewClient';
-import { ReviewTreeDataProvider, ReviewTreeItem } from './reviewTree';
+import * as vscode from "vscode";
+import { promises as fs } from "fs";
+import { ProxyClient, SessionInfo } from "./proxyClient";
+import { SessionTreeDataProvider, SessionTreeItem } from "./sessionTree";
 
-let client: ReviewClient;
-let treeProvider: ReviewTreeDataProvider;
+let client: ProxyClient;
+let treeProvider: SessionTreeDataProvider;
 let statusBar: vscode.StatusBarItem;
-let view: vscode.TreeView<ReviewTreeItem>;
 let pollTimer: NodeJS.Timeout | undefined;
 
 interface ExtensionConfig {
@@ -26,186 +25,130 @@ function getConfig(): ExtensionConfig {
 
 export function activate(context: vscode.ExtensionContext): void {
   const config = getConfig();
-  client = new ReviewClient(config.baseUrl, config.apiToken);
-  treeProvider = new ReviewTreeDataProvider();
+  client = new ProxyClient(config.baseUrl, config.apiToken);
+  treeProvider = new SessionTreeDataProvider();
 
-  statusBar = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Left,
-    100,
-  );
-  statusBar.command = 'anonymizerProxy.refreshReviews';
-  statusBar.text = '$(shield) Ревью: …';
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBar.command = "anonymizerProxy.refreshSessions";
+  statusBar.text = "$(database) Сессий: …";
   statusBar.show();
   context.subscriptions.push(statusBar);
 
-  view = vscode.window.createTreeView('anonymizerProxy.reviewView', {
+  const treeView = vscode.window.createTreeView("anonymizerProxy.sessionsView", {
     treeDataProvider: treeProvider,
     showCollapseAll: false,
   });
-  view.message = 'Нет запросов на ручное ревью';
-  context.subscriptions.push(view);
+  context.subscriptions.push(treeView);
 
   registerCommands(context);
 
-  void refreshReviews();
+  void refreshSessions();
   pollTimer = setInterval(() => {
-    void refreshReviews({ silent: true });
+    void refreshSessions({ silent: true });
   }, config.pollIntervalMs);
   context.subscriptions.push({
     dispose: () => {
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
+      if (pollTimer) clearInterval(pollTimer);
     },
   });
 }
 
 function registerCommands(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      'anonymizerProxy.refreshReviews',
-      () => refreshReviews(),
-    ),
-    vscode.commands.registerCommand(
-      'anonymizerProxy.openFile',
-      async (item?: ReviewTreeItem) => {
-        const review = resolveItem(item);
-        if (review) {
-          await openFile(review);
-        }
-      },
-    ),
-    vscode.commands.registerCommand(
-      'anonymizerProxy.approveWithEdits',
-      async (item?: ReviewTreeItem) => {
-        const review = resolveItem(item);
-        if (review) {
-          await approveWithEdits(review);
-        }
-      },
-    ),
-    vscode.commands.registerCommand(
-      'anonymizerProxy.approveNoEdits',
-      async (item?: ReviewTreeItem) => {
-        const review = resolveItem(item);
-        if (review) {
-          await approveNoEdits(review);
-        }
-      },
-    ),
-    vscode.commands.registerCommand(
-      'anonymizerProxy.reject',
-      async (item?: ReviewTreeItem) => {
-        const review = resolveItem(item);
-        if (review) {
-          await rejectReview(review);
-        }
-      },
-    ),
+    vscode.commands.registerCommand("anonymizerProxy.refreshSessions", () => refreshSessions()),
+    vscode.commands.registerCommand("anonymizerProxy.openMd", async (item?: SessionTreeItem) => {
+      const session = resolveItem(item);
+      if (session) await openMd(session);
+    }),
+    vscode.commands.registerCommand("anonymizerProxy.send", async (item?: SessionTreeItem) => {
+      const session = resolveItem(item);
+      if (session) await sendPrompt(session);
+    }),
+    vscode.commands.registerCommand("anonymizerProxy.deanonymizeFile", async (item?: SessionTreeItem) => {
+      const session = resolveItem(item);
+      if (session) await deanonymizeFile(session);
+    }),
   );
 }
 
-function resolveItem(item?: ReviewTreeItem): PendingReview | undefined {
-  if (item?.review) {
-    return item.review;
-  }
-  // Команда вызвана из палитры — берём первый ожидающий запрос.
-  return treeProvider.getAllReviews()[0];
+function resolveItem(item?: SessionTreeItem): SessionInfo | undefined {
+  if (item?.session) return item.session;
+  return treeProvider.getAllSessions()[0];
 }
 
-async function refreshReviews(
-  options: { silent?: boolean } = {},
-): Promise<void> {
+async function refreshSessions(options: { silent?: boolean } = {}): Promise<void> {
   try {
-    const pending = await client.getPending();
-    treeProvider.setReviews(pending);
-    view.message = pending.length
-      ? undefined
-      : 'Нет запросов на ручное ревью. Отправьте запрос в Cline с mode="review".';
-    statusBar.text = pending.length
-      ? `$(shield) Ревью: ${pending.length}`
-      : '$(shield) Ревью: нет';
-    statusBar.tooltip = pending.length
-      ? 'Запросы, ожидающие ручного ревью'
-      : 'Очередь ревью пуста';
+    const sessions = await client.getSessions();
+    treeProvider.setSessions(sessions);
+    statusBar.text = sessions.length
+      ? `$(database) Сессий: ${sessions.length}`
+      : "$(database) Сессий: нет";
   } catch (e) {
-    view.message =
-      'Прокси недоступен. Проверьте, что Anonymizer Proxy запущен (anonymizerProxy.baseUrl).';
     if (!options.silent) {
-      void vscode.window.showErrorMessage(
-        `Anonymizer Proxy: ${(e as Error).message}`,
-      );
+      void vscode.window.showErrorMessage(`Anonymizer Proxy: ${(e as Error).message}`);
     }
-    statusBar.text = '$(shield) Ревью: офлайн';
+    statusBar.text = "$(database) Сессий: офлайн";
   }
 }
 
-async function openFile(review: PendingReview): Promise<void> {
-  const uri = vscode.Uri.file(review.anonymized_file_path);
+async function openMd(session: SessionInfo): Promise<void> {
+  const files = session.review_files;
+  if (!files || files.length === 0) {
+    void vscode.window.showInformationMessage("У сессии нет файлов ревью (.md).");
+    return;
+  }
+  let filePath: string;
+  if (files.length === 1) {
+    filePath = files[0];
+  } else {
+    const picked = await vscode.window.showQuickPick(files, { placeHolder: "Выберите файл ревью" });
+    if (!picked) return;
+    filePath = picked;
+  }
   try {
-    const doc = await vscode.workspace.openTextDocument(uri);
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
     await vscode.window.showTextDocument(doc);
   } catch (e) {
-    void vscode.window.showErrorMessage(
-      `Не удалось открыть файл: ${(e as Error).message}`,
-    );
+    void vscode.window.showErrorMessage(`Не удалось открыть файл: ${(e as Error).message}`);
   }
 }
 
-async function approveWithEdits(review: PendingReview): Promise<void> {
+async function sendPrompt(session: SessionInfo): Promise<void> {
+  let content: string | undefined;
+  if (session.review_files && session.review_files.length > 0) {
+    try {
+      content = await fs.readFile(session.review_files[0], "utf-8");
+    } catch { /* файл не читается */ }
+  }
+  if (!content) {
+    content = await vscode.window.showInputBox({
+      prompt: "Введите анонимизированный контент для отправки (markdown или текст)",
+    });
+    if (!content) return;
+  }
   try {
-    const content = await fs.readFile(review.anonymized_file_path, 'utf-8');
-    await client.approve(review.request_id, content);
-    void vscode.window.showInformationMessage(
-      `Запрос ${review.request_id} одобрен с правками`,
-    );
-    void refreshReviews({ silent: true });
+    const result = await client.send(content, session.session_id);
+    void vscode.window.showInformationMessage(`Запрос отправлен (сессия ${session.session_id}).`);
+    void refreshSessions({ silent: true });
   } catch (e) {
-    void vscode.window.showErrorMessage(
-      `Не удалось одобрить: ${(e as Error).message}`,
-    );
+    void vscode.window.showErrorMessage(`Не удалось отправить: ${(e as Error).message}`);
   }
 }
 
-async function approveNoEdits(review: PendingReview): Promise<void> {
-  try {
-    await client.approve(review.request_id);
-    void vscode.window.showInformationMessage(
-      `Запрос ${review.request_id} одобрен без правок`,
-    );
-    void refreshReviews({ silent: true });
-  } catch (e) {
-    void vscode.window.showErrorMessage(
-      `Не удалось одобрить: ${(e as Error).message}`,
-    );
-  }
-}
-
-async function rejectReview(review: PendingReview): Promise<void> {
-  const reason = await vscode.window.showInputBox({
-    prompt: 'Причина отклонения (необязательно)',
-    placeHolder: 'например: содержит лишние данные',
+async function deanonymizeFile(session: SessionInfo): Promise<void> {
+  const filePath = await vscode.window.showInputBox({
+    prompt: "Путь к файлу с плейсхолдерами (абсолютный)",
+    placeHolder: "C:\\...\\file.docx",
   });
-  if (reason === undefined) {
-    return; // пользователь отменил
-  }
+  if (!filePath) return;
   try {
-    await client.reject(review.request_id, reason || undefined);
-    void vscode.window.showInformationMessage(
-      `Запрос ${review.request_id} отклонён`,
-    );
-    void refreshReviews({ silent: true });
+    const result = await client.deanonymizeFile(session.session_id, filePath);
+    void vscode.window.showInformationMessage(`Файл де-анонимизирован (сессия ${session.session_id}).`);
   } catch (e) {
-    void vscode.window.showErrorMessage(
-      `Не удалось отклонить: ${(e as Error).message}`,
-    );
+    void vscode.window.showErrorMessage(`Не удалось де-анонимизировать: ${(e as Error).message}`);
   }
 }
 
 export function deactivate(): void {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = undefined;
-  }
+  if (pollTimer) clearInterval(pollTimer);
 }

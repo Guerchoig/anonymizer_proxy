@@ -229,6 +229,7 @@ class SessionInfo(BaseModel):
     expires_at: datetime = Field(...)
     mappings_count: int = Field(default=0)
     files_processed: list[FileInfo] = Field(default_factory=list)
+    review_files: list[str] = Field(default_factory=list)  # пути к .md файлам ревью
 
 
 class SessionsResponse(BaseModel):
