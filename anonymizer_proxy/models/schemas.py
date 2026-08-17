@@ -81,9 +81,9 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[dict] = None
     # Дополнительные поля для управления анонимизацией
     anonymize: bool = Field(default=True, description="Включить анонимизацию")
-    mode: Literal["full", "anonymize_only", "review"] = Field(
+    mode: Literal["full", "anonymize_only", "passthrough"] = Field(
         default=CURRENT_MODE, 
-        description="Режим: full - полная обработка, anonymize_only - только анонимизация, review - ручное ревью перед отправкой (по умолчанию из .env)"
+        description="Режим: full - полная обработка, anonymize_only - только анонимизация, passthrough - без анонимизации (явное управление)"
     )
 
 
@@ -231,30 +231,7 @@ class SessionInfo(BaseModel):
     files_processed: list[FileInfo] = Field(default_factory=list)
 
 
-class ReviewApproveRequest(BaseModel):
-    """Запрос на одобрение запроса из очереди ревью"""
-    request_id: str = Field(..., description="ID запроса из очереди ревью")
-    edited_content: Optional[str] = Field(
-        None,
-        description="Отредактированный контент (если None — использовать оригинальный .md)"
-    )
-
-
-class ReviewRejectRequest(BaseModel):
-    """Запрос на отклонение запроса из очереди ревью"""
-    request_id: str = Field(..., description="ID запроса из очереди ревью")
-    reason: Optional[str] = Field(None, description="Причина отклонения")
-
-
-class PendingReviewItem(BaseModel):
-    """Элемент списка запросов, ожидающих ревью"""
-    request_id: str = Field(...)
-    session_id: str = Field(...)
-    anonymized_file_path: str = Field(...)
-    created_at: str = Field(...)
-
-
-class PendingReviewsResponse(BaseModel):
-    """Ответ со списком запросов, ожидающих ревью"""
-    pending: list[PendingReviewItem] = Field(default_factory=list)
+class SessionsResponse(BaseModel):
+    """Ответ со списком активных сессий"""
+    sessions: list[SessionInfo] = Field(default_factory=list)
     count: int = Field(default=0)

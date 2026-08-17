@@ -395,6 +395,30 @@ class MappingStore:
         path.write_text(text, encoding="utf-8")
         return path
 
+    async def get_all_sessions(self) -> list[dict]:
+        """Возвращает список активных сессий с количеством маппингов."""
+        await self.initialize()
+        db = await self._get_db()
+        cursor = await db.execute(
+            "SELECT session_id, created_at, expires_at FROM sessions "
+            "WHERE expires_at > ? ORDER BY created_at DESC",
+            (_to_iso(_utcnow()),),
+        )
+        sessions = []
+        async for row in cursor:
+            sid = row[0]
+            map_cursor = await db.execute(
+                "SELECT COUNT(*) FROM mappings WHERE session_id = ?", (sid,)
+            )
+            map_row = await map_cursor.fetchone()
+            sessions.append({
+                "session_id": sid,
+                "created_at": _from_iso(row[1]) if row[1] else _utcnow(),
+                "expires_at": _from_iso(row[2]) if row[2] else _utcnow(),
+                "mappings_count": map_row[0] if map_row else 0,
+            })
+        return sessions
+
     async def close(self):
         """Закрыть соединения"""
         self._memory_cache.clear()

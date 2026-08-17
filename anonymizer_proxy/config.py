@@ -107,9 +107,9 @@ STORAGE = {
 class Mode:
     FULL = "full"                      # Полная обработка: анонимизация → облако → де-анонимизация
     ANONYMIZE_ONLY = "anonymize_only"  # Только анонимизация без отправки в облако
-    REVIEW = "review"                  # Ручное ревью: анонимизация → ожидание ревью → облако → де-анонимизация
+    PASSTHROUGH = "passthrough"        # Passthrough (без анонимизации): явная схема управления
     
-CURRENT_MODE = os.getenv("ANONYMIZER_MODE", Mode.FULL)
+CURRENT_MODE = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
 
 # Категории PII для детекции
 PII_CATEGORIES = {
@@ -128,10 +128,6 @@ PII_CATEGORIES = {
 
 # TTL для маппингов (в секундах)
 MAPPING_TTL_SECONDS = 24 * 60 * 60  # 24 часа
-
-# Таймаут ожидания решения пользователя на ручном ревью (секунды).
-# Если решение не принято за это время — запрос прерывается с ошибкой.
-REVIEW_TIMEOUT_SECONDS = float(os.getenv("REVIEW_TIMEOUT_SECONDS", "3600"))
 
 # Маркеры выделения канонического анонимизированного результата в ответе.
 # Результат между RESULT_BEGIN и RESULT_END идентичен содержимому файла

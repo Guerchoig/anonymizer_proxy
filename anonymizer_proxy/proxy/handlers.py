@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 from urllib.parse import unquote, urlparse
@@ -21,7 +20,7 @@ from ..anonymizer.replacer import (
     StreamDeAnonymizer,
     split_entities_by_segments,
 )
-from ..config import Mode, STORAGE, RESULT_BEGIN, RESULT_END, BASE_DIR, REVIEW_TIMEOUT_SECONDS
+from ..config import Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, BASE_DIR
 from ..models.schemas import (
     Entity,
     ChatCompletionRequest,
@@ -34,7 +33,6 @@ from ..models.schemas import (
     SendAnonymizedRequest,
 )
 from .openrouter_client import OpenRouterClient
-from .review_queue import ReviewQueue, ReviewRejectedError
 
 logger = logging.getLogger("anonymizer_proxy.handlers")
 
@@ -166,12 +164,10 @@ class RequestHandler:
         ner_service: NERService,
         mapping_store: MappingStore,
         openrouter_client: OpenRouterClient,
-        review_queue: Optional[ReviewQueue] = None,
     ):
         self.ner = ner_service
         self.store = mapping_store
         self.openrouter = openrouter_client
-        self.review_queue = review_queue
         self.file_parser = FileParser()
         self.file_assembler = FileAssembler()
         self.text_replacer = TextReplacer()
@@ -445,62 +441,6 @@ class RequestHandler:
             logger.error("Не удалось сохранить анонимизированный файл: %s", e)
             return None
 
-    async def _wait_for_review(
-        self,
-        request: ChatCompletionRequest,
-        prepared: PreparedRequest,
-        saved_path: Optional[Path],
-    ) -> list[dict]:
-        """
-        Для режима review: поставить запрос в очередь и ждать решения пользователя.
-
-        Returns:
-            Финальные сообщения для отправки в облако:
-            - без правок — prepared.anonymized_messages (как в full-режиме);
-            - с правками — единственное user-сообщение с отредактированным контентом.
-
-        Raises:
-            ReviewRejectedError: если пользователь отклонил запрос.
-        """
-        if self.review_queue is None:
-            raise RuntimeError(
-                "ReviewQueue не инициализирована — режим review недоступен"
-            )
-
-        request_id = uuid.uuid4().hex
-        # Если сохранение .md отключено, у пользователя нет файла для ревью —
-        # передаём заглушку, чтобы очередь всё равно отработала корректно.
-        file_path = saved_path if saved_path else Path(".")
-        await self.review_queue.add_pending(
-            prepared.session_id, request_id, file_path
-        )
-
-        logger.info(
-            "Запрос %s ожидает ручного ревью (session=%s)",
-            request_id, prepared.session_id,
-        )
-
-        decision = await self.review_queue.wait_for_decision(
-            request_id, timeout=REVIEW_TIMEOUT_SECONDS
-        )
-
-        if not decision.approved:
-            raise ReviewRejectedError(decision.rejection_reason)
-
-        if decision.edited_content is not None:
-            # Пользователь отредактировал контент — отправляем его как единое
-            # user-сообщение. ВАЖНО: новые сущности, вставленные вручную,
-            # НЕ анонимизируются повторно — это осознанное решение пользователя,
-            # который сам контролирует, что именно уходит в облако.
-            logger.info(
-                "Запрос %s: отправляем отредактированный контент (%d символов)",
-                request_id, len(decision.edited_content),
-            )
-            return [{"role": "user", "content": decision.edited_content}]
-
-        # Без правок — отправляем анонимизированные сообщения как обычно
-        return prepared.anonymized_messages
-
     def _build_summary_line(
         self,
         mode: str,
@@ -558,9 +498,8 @@ class RequestHandler:
         """
         start_time = time.time()
 
-        # Passthrough: anonymize=False — отправляем в облако без
-        # анонимизации и де-анонимизации (обычный прокси).
-        if not request.anonymize:
+        # Passthrough: anonymize=False или режим passthrough по умолчанию
+        if not request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
             return await self._handle_passthrough(request, session_id)
 
         # Переиспользуем prepare_chat_request (нет дублирования логики)
@@ -638,14 +577,9 @@ class RequestHandler:
 
             return response, session_id
 
-        # Режим "review" — ждём решения пользователя перед отправкой в облако
+        # Отправляем анонимизированные сообщения в OpenRouter
         final_messages = anonymized_messages
-        if request.mode == Mode.REVIEW:
-            final_messages = await self._wait_for_review(
-                request, prepared, saved_path
-            )
 
-        # Режим "full"/"review" — отправляем в OpenRouter
         # model=None → openrouter_client использует OPENROUTER["model"] из .env
         try:
             cloud_response = await self.openrouter.chat_completion(
@@ -860,13 +794,7 @@ class RequestHandler:
             prepared.session_id, prepared.canonical_result
         )
         try:
-            # Режим "review" — ждём решения пользователя перед отправкой в облако
             final_messages = prepared.anonymized_messages
-            if request.mode == Mode.REVIEW:
-                final_messages = await self._wait_for_review(
-                    request, prepared, saved_path
-                )
-
             collected_content = ""
             deano = StreamDeAnonymizer(self.text_replacer, prepared.mappings_dict)
             # Отдельные буферы де-анонимизации для аргументов каждого tool_call
@@ -1471,6 +1399,10 @@ class RequestHandler:
             "entities_found": len(entities),
             "mappings_count": len(mappings),
         }
+
+    async def handle_get_sessions(self) -> list[dict]:
+        """Получить список активных сессий."""
+        return await self.store.get_all_sessions()
 
     async def get_session_logs(
         self,
