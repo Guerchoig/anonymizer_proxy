@@ -3,12 +3,13 @@
 в passthrough-режиме («деанонимизируй упомянутые файлы»).
 
 Проверяют, что когда в истории диалога есть маркер анонимизации
-([anonymizer:copy:<путь>] + session_id), а пользователь просит
+([anonymizer:result:<путь>] + session_id), а пользователь просит
 де-анонимизировать файлы:
-1. Прокси де-анонимизирует файл (плейсхолдеры → реальные значения),
-   облако НЕ вызывается.
+1. Де-анонимизируется ФАЙЛ РЕЗУЛЬТАТА (плейсхолдеры → реальные значения),
+   облако НЕ вызывается; анонимизированная копия остаётся нетронутой.
 2. Без команды де-анонимизации — обычный passthrough.
 3. anonymize=false отключает перехват.
+4. Если файл результата не создан — информационное сообщение, без падения.
 
 Запуск: python anonymizer_proxy\\tests\\test_deanonymize_intercept.py
 """
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
-from anonymizer_proxy.proxy.handlers import RequestHandler
+from anonymizer_proxy.proxy.handlers import RequestHandler, _result_path_for
 from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore, FakeOpenRouter
 
 handlers_module.CURRENT_MODE = "passthrough"
@@ -47,7 +48,7 @@ def make_handler(mappings=None):
     )
 
 
-def make_history(copy_path: Path, command: str, anonymize=True) -> ChatCompletionRequest:
+def make_history(copy_path, result_path, command, anonymize=True) -> ChatCompletionRequest:
     messages = [
         ChatMessage(role="user", content="Анонимизируй приложенный файл"),
         ChatMessage(role="assistant", content=(
@@ -57,7 +58,8 @@ def make_history(copy_path: Path, command: str, anonymize=True) -> ChatCompletio
             "Файлы:\n"
             f"- C:/orig.docx → {copy_path} (сущностей: 1)\n"
             "  [anonymizer:done:C:/orig.docx]\n"
-            f"  [anonymizer:copy:{copy_path}]"
+            f"  [anonymizer:copy:{copy_path}]\n"
+            f"  [anonymizer:result:{result_path}]"
         )),
         ChatMessage(role="user", content=command),
     ]
@@ -66,74 +68,119 @@ def make_history(copy_path: Path, command: str, anonymize=True) -> ChatCompletio
     )
 
 
-async def test_deanonymize_intercept():
-    """Команда «деанонимизируй файлы» → файл де-анонимизирован, облако не вызвано"""
+def make_copy_file():
+    """Создать анонимизированную копию с плейсхолдером, вернуть путь."""
     tmp = tempfile.NamedTemporaryFile(
         suffix=".anonymized.txt", delete=False, mode="w", encoding="utf-8"
     )
     tmp.write("Подписант: [PERSON_1]")
     tmp.close()
-    path = Path(tmp.name)
+    return Path(tmp.name)
+
+
+def make_result_file(copy_path: Path):
+    """Создать файл результата с плейсхолдером рядом с копией."""
+    result_path = Path(_result_path_for(str(copy_path)))
+    result_path.write_text("Подписант: [PERSON_1]", encoding="utf-8")
+    return result_path
+
+
+async def test_deanonymize_result_file():
+    """Де-анонимизируется файл результата, копия остаётся нетронутой"""
+    copy_path = make_copy_file()
+    result_path = make_result_file(copy_path)
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(path, "Деанонимизируй упомянутые файлы")
+            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
         )
         assert not handler.openrouter.captured, "облако вызвано"
-        assert path.read_text(encoding="utf-8") == "Подписант: Иван Петров"
+        assert result_path.read_text(encoding="utf-8") == "Подписант: Иван Петров"
+        assert copy_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]", "копия изменена"
         assert resp.anonymization_metadata["mode"] == "files_deanonymization"
-        assert "Иван Петров" not in resp.choices[0].message.content  # ответ-подтверждение без PII
-        print("TEST 1 OK: деанонимизируй файлы — файл восстановлен, облако не вызвано")
+        print("TEST 1 OK: де-анонимизирован файл результата, копия не тронута")
     finally:
-        path.unlink(missing_ok=True)
+        copy_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
 
 
 async def test_no_command_passthrough():
     """Без команды де-анонимизации — обычный passthrough в облако"""
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".anonymized.txt", delete=False, mode="w", encoding="utf-8"
-    )
-    tmp.write("[PERSON_1]")
-    tmp.close()
-    path = Path(tmp.name)
+    copy_path = make_copy_file()
+    result_path = make_result_file(copy_path)
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(path, "Составь резюме")
+            make_history(copy_path, result_path, "Составь резюме")
         )
         assert handler.openrouter.captured, "облако не вызвано"
         assert resp.anonymization_metadata["mode"] == "passthrough_deanonymized"
-        assert path.read_text(encoding="utf-8") == "[PERSON_1]"  # файл не тронут
-        print("TEST 2 OK: без команды — passthrough, файл не де-анонимизирован")
+        assert result_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]"
+        print("TEST 2 OK: без команды — passthrough, файл результата не де-анонимизирован")
     finally:
-        path.unlink(missing_ok=True)
+        copy_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
 
 
 async def test_anonymize_false_disables():
     """anonymize=false отключает перехват де-анонимизации"""
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".anonymized.txt", delete=False, mode="w", encoding="utf-8"
-    )
-    tmp.write("[PERSON_1]")
-    tmp.close()
-    path = Path(tmp.name)
+    copy_path = make_copy_file()
+    result_path = make_result_file(copy_path)
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(path, "Деанонимизируй файлы", anonymize=False)
+            make_history(copy_path, result_path, "Деанонимизируй файлы", anonymize=False)
         )
         assert handler.openrouter.captured, "облако не вызвано"
         assert resp.anonymization_metadata["mode"] == "passthrough"
-        assert path.read_text(encoding="utf-8") == "[PERSON_1]"
+        assert result_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]"
         print("TEST 3 OK: anonymize=false — перехват де-анонимизации отключён")
     finally:
-        path.unlink(missing_ok=True)
+        copy_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+
+async def test_fallback_to_copy():
+    """Файл результата не создан, но копия есть → де-анонимизируется копия"""
+    copy_path = make_copy_file()
+    result_path = Path(_result_path_for(str(copy_path)))
+    try:
+        handler = make_handler()
+        resp, _ = await handler.handle_chat_completion(
+            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
+        )
+        assert not handler.openrouter.captured, "облако вызвано"
+        # fallback: копия де-анонимизирована
+        assert copy_path.read_text(encoding="utf-8") == "Подписант: Иван Петров"
+        assert "де-анонимизирована анонимизированная копия" in resp.choices[0].message.content
+        print("TEST 4 OK: файл результата отсутствует — де-анонимизирована копия (fallback)")
+    finally:
+        copy_path.unlink(missing_ok=True)
+
+
+async def test_both_missing_note():
+    """Нет ни файла результата, ни копии — информационное сообщение"""
+    copy_path = make_copy_file()
+    result_path = Path(_result_path_for(str(copy_path)))
+    copy_path.unlink()  # удаляем копию тоже
+    try:
+        handler = make_handler()
+        resp, _ = await handler.handle_chat_completion(
+            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
+        )
+        assert not handler.openrouter.captured, "облако вызвано"
+        assert "файл результата не найден" in resp.choices[0].message.content
+        print("TEST 5 OK: нет ни результата, ни копии — корректное сообщение")
+    finally:
+        copy_path.unlink(missing_ok=True)
 
 
 async def main():
-    await test_deanonymize_intercept()
+    await test_deanonymize_result_file()
     await test_no_command_passthrough()
     await test_anonymize_false_disables()
+    await test_fallback_to_copy()
+    await test_both_missing_note()
     print("\nALL DEANONYMIZE INTERCEPT TESTS PASSED")
 
 

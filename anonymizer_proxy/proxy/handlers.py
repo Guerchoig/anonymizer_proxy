@@ -63,6 +63,8 @@ SESSION_ID_LINE_RE = re.compile(r"session_id:\s*([A-Za-z0-9_-]{1,64})")
 DEANONYMIZE_INTENT_RE = re.compile(r"де.?анонимиз|deanonymi[sz]", re.IGNORECASE)
 # Машиночитаемый маркер пути анонимизированной копии в ответе перехвата
 ANONYMIZER_COPY_MARKER_RE = re.compile(r"\[anonymizer:copy:(?P<path>[^\]]+)\]")
+# Маркер пути «файла результата» — куда модель пишет правки, не изменяя копию
+ANONYMIZER_RESULT_MARKER_RE = re.compile(r"\[anonymizer:result:(?P<path>[^\]]+)\]")
 
 
 def _iter_content_texts(content) -> list[str]:
@@ -101,6 +103,17 @@ def _is_anonymized_copy_path(path_str: str) -> bool:
         return _resolve_local_path(path_str).stem.lower().endswith(".anonymized")
     except Exception:
         return False
+
+
+def _result_path_for(copy_path: str) -> str:
+    """
+    Путь к «файлу результата» для анонимизированной копии.
+    <name>.anonymized.<ext> -> <name>.result.<ext> (файл результата рядом
+    с копией; копия остаётся неизменным исходником для скриптов модели).
+    """
+    path = Path(copy_path)
+    new_stem = path.stem.replace(".anonymized", ".result")
+    return str(path.with_name(new_stem + path.suffix))
 
 
 class PreparedFilesAnonymization:
@@ -790,8 +803,9 @@ class RequestHandler:
         Машиночитаемые маркеры:
         - [anonymizer:done:<путь>] — файл уже анонимизирован (защита от
           повторного перехвата при следующих запросах агента);
-        - [anonymizer:copy:<путь>] — путь к анонимизированной копии (для
-          последующей де-анонимизации по естественной команде).
+        - [anonymizer:copy:<путь>] — путь к анонимизированной копии;
+        - [anonymizer:result:<путь>] — путь к файлу результата (куда модель
+          пишет правки; де-анонимизируется в конце).
         """
         lines = [
             "[ANONYMIZER] Приложенные файлы анонимизированы локальной "
@@ -805,20 +819,27 @@ class RequestHandler:
             if "error" in info:
                 lines.append(f"- {info['original_file']} — ОШИБКА: {info['error']}")
                 continue
+            result_file = _result_path_for(info["anonymized_file"])
             lines.append(
                 f"- {info['original_file']} → {info['anonymized_file']} "
                 f"(сущностей: {info['entities_found']})"
             )
             lines.append(f"  [anonymizer:done:{info['original_file']}]")
             lines.append(f"  [anonymizer:copy:{info['anonymized_file']}]")
+            lines.append(f"  [anonymizer:result:{result_file}]")
         lines += [
             "",
             "Дальнейшие шаги:",
-            "1. Проверьте/отредактируйте анонимизированную копию "
-            "(<name>.anonymized.<ext>) — PII заменены плейсхолдерами.",
-            "2. Продолжайте в этом чате: модель прочитает копию, а прокси "
-            "передаст её содержимое в облако.",
-            "3. В конце — де-анонимизация: напишите «деанонимизируй "
+            "1. Проверьте анонимизированную копию (<name>.anonymized.<ext>) — "
+            "PII заменены плейсхолдерами.",
+            "2. Чтобы обработать документ в облаке — просто напишите задачу "
+            "обычным сообщением (например, «добавь колонку в таблицы», "
+            "«составь резюме»). Отдельная команда отправки не нужна.",
+            "3. ОБЯЗАТЕЛЬНО при изменении документа: НЕ изменяйте "
+            "анонимизированную копию — она исходник. Все правки записывайте "
+            "в файл результата, путь к которому указан выше в маркере "
+            "[anonymizer:result:<путь>].",
+            "4. В конце — де-анонимизация: напишите «деанонимизируй "
             "упомянутые файлы».",
         ]
         return "\n".join(lines)
@@ -943,10 +964,12 @@ class RequestHandler:
         по естественной команде («деанонимизируй файлы…»).
 
         Условия: в user-сообщениях есть команда де-анонимизации, и в истории
-        диалога есть маркеры [anonymizer:copy:<путь>] с session_id.
+        диалога есть маркеры [anonymizer:result:<путь>] с session_id.
+        Основной источник — файл результата; если модель его не создала,
+        де-анонимизируется анонимизированная копия (fallback).
 
         Returns:
-            Список целей вида {"session_id": str, "file_path": str}
+            Список целей вида {"session_id", "result_path", "copy_path"}
             (пустой — запрос обрабатывается как обычно).
         """
         has_intent = any(
@@ -964,27 +987,38 @@ class RequestHandler:
         seen: set[str] = set()
         for msg in request.messages:
             for text in _iter_content_texts(msg.content):
-                if "[ANONYMIZER]" not in text and "[anonymizer:copy:" not in text:
+                if "[ANONYMIZER]" not in text and "[anonymizer:result:" not in text:
                     continue
                 sids = [m.group(1) for m in SESSION_ID_LINE_RE.finditer(text)]
                 if not sids:
                     continue
                 sid = sids[0]
-                for match in ANONYMIZER_COPY_MARKER_RE.finditer(text):
-                    copy_path = match.group("path").strip()
-                    key = f"{sid}|{copy_path}"
+                result_paths = [
+                    m.group("path").strip()
+                    for m in ANONYMIZER_RESULT_MARKER_RE.finditer(text)
+                ]
+                copy_paths = [
+                    m.group("path").strip()
+                    for m in ANONYMIZER_COPY_MARKER_RE.finditer(text)
+                ]
+                for i, result_path in enumerate(result_paths):
+                    key = f"{sid}|{result_path}"
                     if key in seen:
                         continue
                     seen.add(key)
-                    targets.append({"session_id": sid, "file_path": copy_path})
+                    targets.append({
+                        "session_id": sid,
+                        "result_path": result_path,
+                        "copy_path": copy_paths[i] if i < len(copy_paths) else None,
+                    })
         return targets
 
     @staticmethod
     def _build_deanonymize_text(files_info: list[dict]) -> str:
-        """Текст подтверждения после де-анонимизации файлов."""
+        """Текст подтверждения после де-анонимизации файлов результата."""
         lines = [
-            "[ANONYMIZER] Файлы де-анонимизированы: плейсхолдеры заменены "
-            "реальными значениями. Запрос в облако НЕ отправлялся.",
+            "[ANONYMIZER] Файлы результата де-анонимизированы: плейсхолдеры "
+            "заменены реальными значениями. Запрос в облако НЕ отправлялся.",
             "",
             "Файлы:",
         ]
@@ -992,10 +1026,21 @@ class RequestHandler:
             if "error" in info:
                 lines.append(f"- {info['file_path']} — ОШИБКА: {info['error']}")
                 continue
+            if "note" in info:
+                lines.append(f"- {info['file_path']} — {info['note']}")
+                continue
             lines.append(
                 f"- {info['file_path']} — ОК (маппингов: {info['mappings_count']})"
             )
-        lines += ["", "Исходные файлы не изменялись."]
+            if info.get("fallback"):
+                lines.append(
+                    "  (файл результата не был создан — де-анонимизирована "
+                    "анонимизированная копия)"
+                )
+        lines += [
+            "",
+            "Анонимизированная копия и исходный файл не изменялись.",
+        ]
         return "\n".join(lines)
 
     async def prepare_deanonymize_files(
@@ -1008,21 +1053,40 @@ class RequestHandler:
         files_info: list[dict] = []
         for target in targets:
             sid = target["session_id"]
-            file_path = target["file_path"]
+            result_path = target["result_path"]
+            copy_path = target.get("copy_path")
+
+            # Основной источник — файл результата. Если модель его не создала
+            # (например, правила копию на месте), де-анонимизируем копию.
+            path = None
+            fallback = False
+            if Path(result_path).is_file():
+                path = result_path
+            elif copy_path and Path(copy_path).is_file():
+                path = copy_path
+                fallback = True
+
+            if path is None:
+                files_info.append({
+                    "file_path": result_path,
+                    "note": "файл результата не найден (модель его не создала)",
+                })
+                continue
             try:
                 result = await self.handle_deanonymize_file(
-                    session_id=sid, file_path=file_path
+                    session_id=sid, file_path=path
                 )
                 files_info.append({
-                    "file_path": file_path,
+                    "file_path": path,
                     "mappings_count": result.get("mappings_count", 0),
+                    "fallback": fallback,
                 })
                 logger.info(
-                    "Файл %s де-анонимизирован (сессия %s)", file_path, sid
+                    "Файл %s де-анонимизирован (сессия %s)", path, sid
                 )
             except Exception as e:
-                logger.warning("Не удалось де-анонимизировать %s: %s", file_path, e)
-                files_info.append({"file_path": file_path, "error": str(e)})
+                logger.warning("Не удалось де-анонимизировать %s: %s", path, e)
+                files_info.append({"file_path": path, "error": str(e)})
 
         response_text = self._build_deanonymize_text(files_info)
         original_content = json.dumps(
