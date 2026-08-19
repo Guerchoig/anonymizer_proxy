@@ -17,9 +17,46 @@
 
 ## Установка
 
+Cline (расширение и CLI) обнаруживает плагины, сканируя каталоги:
+
+1. `<корень workspace>/.cline/plugins/<папка-плагина>/`
+2. `~/.cline/plugins/<папка-плагина>/` (глобально, для всех workspace)
+3. `~/Documents/Cline/Plugins/<папка-плагина>/`
+
+В каждой папке плагина ищется `package.json` с секцией `cline.plugins` (поле
+`paths`) либо `index.ts` / `index.js`.
+
+> **Важно:** Cline ищет плагины от **корня открытого workspace** (не обязательно
+> от папки проекта с прокси) и из глобального `~/.cline/plugins`. Каталог
+> `cline-plugin/` внутри репозитория **не** является путём поиска — сам по себе
+> он не подхватывается.
+
+### Вариант 1: глобально (рекомендуется)
+
+Скопируйте папку плагина в глобальный каталог (без `node_modules` — `@cline/core`
+разрешается из хоста Cline):
+
+```powershell
+robocopy .\cline-plugin "$env:USERPROFILE\.cline\plugins\anonymizer-proxy-plugin" /E /XD node_modules
+```
+
+### Вариант 2: только для текущего workspace
+
+```powershell
+robocopy .\cline-plugin <корень-workspace>\.cline\plugins\anonymizer-proxy-plugin /E /XD node_modules
+```
+
+### Вариант 3: CLI (если установлен `cline` и доступен npm)
+
 ```bash
 cline plugin install ./cline-plugin
 ```
+
+Команда копирует плагин в `<корень workspace>/.cline/plugins/_installed/local/<имя>-<hash>/`
+(при запуске из корня workspace) — обратите внимание, что это тоже привязка к workspace.
+
+После установки **перезапустите Cline** (перезагрузите окно VS Code) — плагины
+загружаются при старте сессии.
 
 ## Сценарий работы
 

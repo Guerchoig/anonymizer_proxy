@@ -49,6 +49,85 @@ FILE_CONTENT_ERROR_PREFIX = "Error fetching content"
 # (BASE_DIR — корень проекта, он же workspace; сервер запускается из него)
 WORKSPACE_ROOT = BASE_DIR
 
+# Намерение анонимизации в тексте запроса («Анонимизируй файл…»).
+# Триггер автоматической анонимизации приложенных файлов в passthrough-режиме
+ANONYMIZE_INTENT_RE = re.compile(r"анонимиз|anonymi[sz]", re.IGNORECASE)
+# Маркер «файл уже анонимизирован» в ответе прокси: защита от повторной
+# анонимизации при следующих запросах агента (история диалога накапливается,
+# исходный <file_content>-блок и команда «анонимизируй» остаются в ней)
+ANONYMIZER_DONE_MARKER_RE = re.compile(r"\[anonymizer:done:(?P<path>[^\]]+)\]")
+# session_id из ответа перехвата («session_id: <uuid>» внутри блока [ANONYMIZER])
+SESSION_ID_LINE_RE = re.compile(r"session_id:\s*([A-Za-z0-9_-]{1,64})")
+# Намерение де-анонимизации («деанонимизируй файлы…»). Проверяется ДО
+# анонимизации, т.к. слово «деанонимизируй» содержит «анонимизируй».
+DEANONYMIZE_INTENT_RE = re.compile(r"де.?анонимиз|deanonymi[sz]", re.IGNORECASE)
+# Машиночитаемый маркер пути анонимизированной копии в ответе перехвата
+ANONYMIZER_COPY_MARKER_RE = re.compile(r"\[anonymizer:copy:(?P<path>[^\]]+)\]")
+
+
+def _iter_content_texts(content) -> list[str]:
+    """Извлечь все текстовые части content сообщения (str | list[dict] | None)"""
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+    return []
+
+
+def _resolve_local_path(path_str: str) -> Path:
+    """
+    Разрешить путь из <file_content path="..."> в абсолютный путь на диске.
+    Поддерживаются file:// URI, абсолютные пути и относительные (от корня
+    workspace).
+    """
+    if path_str.lower().startswith("file://"):
+        path_str = unquote(urlparse(path_str).path)
+        # file:///C:/... -> C:/... (Windows)
+        if re.match(r"^/[A-Za-z]:/", path_str):
+            path_str = path_str[1:]
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = (WORKSPACE_ROOT / path).resolve()
+    return path
+
+
+def _is_anonymized_copy_path(path_str: str) -> bool:
+    """True, если путь указывает на анонимизированную копию (<name>.anonymized.<ext>)."""
+    try:
+        return _resolve_local_path(path_str).stem.lower().endswith(".anonymized")
+    except Exception:
+        return False
+
+
+class PreparedFilesAnonymization:
+    """
+    Результат автоматической анонимизации приложенных файлов
+    (passthrough-режим): файлы уже обработаны локальной NER-моделью,
+    осталось только отдать клиенту текстовый ответ (стримом или нет).
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        response_text: str,
+        files: list[dict],
+        entities_total: int,
+        mappings_count: int,
+        original_content: str,
+        start_time: float,
+    ):
+        self.session_id = session_id
+        self.response_text = response_text
+        self.files = files
+        self.entities_total = entities_total
+        self.mappings_count = mappings_count
+        self.original_content = original_content
+        self.start_time = start_time
+
 
 class PreparedRequest:
     """Подготовленные данные для стриминга (NER + анонимизация уже выполнены)"""
@@ -260,14 +339,7 @@ class RequestHandler:
             исходный блок остаётся без изменений).
         """
         try:
-            if path_str.lower().startswith("file://"):
-                path_str = unquote(urlparse(path_str).path)
-                # file:///C:/... -> C:/... (Windows)
-                if re.match(r"^/[A-Za-z]:/", path_str):
-                    path_str = path_str[1:]
-            path = Path(path_str)
-            if not path.is_absolute():
-                path = (WORKSPACE_ROOT / path).resolve()
+            path = _resolve_local_path(path_str)
             if not path.is_file():
                 logger.warning("Файл из <file_content> не найден: %s", path)
                 return None
@@ -293,6 +365,76 @@ class RequestHandler:
                 "Не удалось извлечь содержимое файла %s: %s", path_str, e
             )
             return None
+
+    async def _substitute_anonymized_file_blocks(self, text: str) -> str:
+        """
+        Заменить тела неудачно прочитанных клиентом <file_content>-блоков,
+        если путь указывает на анонимизированную копию (<name>.anonymized.<ext>),
+        текстом, извлечённым прокси из локального файла.
+
+        Обычные (не анонимизированные) файлы не трогаем — контракт passthrough:
+        их содержимое не должно самопроизвольно попадать в облако.
+        """
+        result: list[str] = []
+        last_end = 0
+        for match in FILE_CONTENT_BLOCK_RE.finditer(text):
+            raw_path = match.group("path").strip()
+            if not match.group("body").strip().startswith(FILE_CONTENT_ERROR_PREFIX):
+                continue
+            if not _is_anonymized_copy_path(raw_path):
+                continue
+            extracted = await self._extract_local_file_text(raw_path)
+            if extracted is None:
+                continue
+            result.append(text[last_end:match.start()])
+            result.append(
+                f'<file_content path="{raw_path}">\n'
+                f"{extracted}\n"
+                f"</file_content>"
+            )
+            last_end = match.end()
+        if not result:
+            return text
+        result.append(text[last_end:])
+        return "".join(result)
+
+    async def _resolve_anonymized_file_contents(
+        self,
+        messages: list[ChatMessage],
+    ) -> list[ChatMessage]:
+        """
+        Подменить тела блоков <file_content> для анонимизированных копий
+        (клиент не умеет читать бинарные DOCX/XLSX и присылает заглушку
+        «Error fetching content»). Облако получает извлечённый текст.
+        """
+        resolved: list[ChatMessage] = []
+        for msg in messages:
+            if isinstance(msg.content, str) and FILE_CONTENT_ERROR_PREFIX in msg.content:
+                msg = msg.model_copy(update={
+                    "content": await self._substitute_anonymized_file_blocks(msg.content)
+                })
+            elif isinstance(msg.content, list):
+                new_parts = []
+                changed = False
+                for part in msg.content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and FILE_CONTENT_ERROR_PREFIX in part.get("text", "")
+                    ):
+                        new_parts.append({
+                            **part,
+                            "text": await self._substitute_anonymized_file_blocks(
+                                part["text"]
+                            ),
+                        })
+                        changed = True
+                    else:
+                        new_parts.append(part)
+                if changed:
+                    msg = msg.model_copy(update={"content": new_parts})
+            resolved.append(msg)
+        return resolved
 
     async def _anonymize_messages(
         self,
@@ -480,6 +622,521 @@ class RequestHandler:
             result.append(tc)
         return result
 
+    # ==================== Авто-анонимизация приложенных файлов ====================
+
+    def detect_attached_files_anonymization(
+        self,
+        request: ChatCompletionRequest,
+    ) -> list[str]:
+        """
+        Определить, нужно ли перехватить запрос для автоматической анонимизации
+        приложенных файлов (только passthrough-режим).
+
+        Условия перехвата:
+        1. В тексте user-сообщений есть команда анонимизации («анонимиз…» /
+           «anonymis/z…»);
+        2. В сообщениях есть блоки <file_content path="..."> с путями к файлам,
+           которые ещё НЕ анонимизированы в этом диалоге (нет маркера
+           [anonymizer:done:<путь>] в истории) и не являются анонимизированными
+           копиями (<name>.anonymized.<ext>).
+
+        Returns:
+            Список абсолютных путей файлов для анонимизации
+            (пустой список — запрос обрабатывается как обычно).
+        """
+        has_intent = any(
+            msg.role == "user"
+            and any(
+                ANONYMIZE_INTENT_RE.search(text)
+                for text in _iter_content_texts(msg.content)
+            )
+            for msg in request.messages
+        )
+        if not has_intent:
+            return []
+
+        candidates: list[str] = []
+        done: set[str] = set()
+        for msg in request.messages:
+            for text in _iter_content_texts(msg.content):
+                for match in FILE_CONTENT_BLOCK_RE.finditer(text):
+                    raw_path = match.group("path").strip()
+                    if raw_path not in candidates:
+                        candidates.append(raw_path)
+                for match in ANONYMIZER_DONE_MARKER_RE.finditer(text):
+                    done.add(match.group("path").strip())
+
+        result: list[str] = []
+        for raw_path in candidates:
+            try:
+                resolved = _resolve_local_path(raw_path)
+            except Exception:
+                continue
+            resolved_str = str(resolved)
+            # Анонимизированная копия (<name>.anonymized.<ext>) повторно
+            # не обрабатывается
+            if resolved.stem.lower().endswith(".anonymized"):
+                continue
+            if resolved_str in done or raw_path in done:
+                continue
+            if resolved_str in result:
+                continue
+            result.append(resolved_str)
+        return result
+
+    async def _history_anonymization_mappings(
+        self,
+        request: ChatCompletionRequest,
+    ) -> tuple[dict[str, str], list[str]]:
+        """
+        Собрать маппинги (token -> original_value) сессий анонимизации,
+        упомянутых в истории диалога.
+
+        Ищет маркеры [ANONYMIZER] / [anonymizer:done:...] в сообщениях и
+        извлекает session_id из строки «session_id: <uuid>» рядом с ними.
+        Возвращает объединённый словарь маппингов (при конфликте токенов
+        побеждает более поздняя сессия) и список найденных session_id.
+        Пустой словарь — анонимизация в диалоге не выполнялась.
+        """
+        session_ids: list[str] = []
+        for msg in request.messages:
+            for text in _iter_content_texts(msg.content):
+                if "[ANONYMIZER]" not in text and "[anonymizer:done:" not in text:
+                    continue
+                for match in SESSION_ID_LINE_RE.finditer(text):
+                    sid = match.group(1)
+                    if sid not in session_ids:
+                        session_ids.append(sid)
+
+        if not session_ids:
+            return {}, []
+
+        merged: dict[str, str] = {}
+        for sid in session_ids:
+            try:
+                mappings = await self.store.get_all_mappings(sid)
+            except Exception:
+                continue
+            if mappings:
+                merged.update(mappings)
+        return merged, session_ids
+
+    async def prepare_files_anonymization(
+        self,
+        request: ChatCompletionRequest,
+        file_paths: list[str],
+        session_id: Optional[str] = None,
+    ) -> PreparedFilesAnonymization:
+        """
+        Анонимизировать приложенные файлы локальной NER-моделью (без облака).
+
+        Для каждого файла создаётся анонимизированная копия
+        <name>.anonymized.<ext> рядом с оригиналом (пользователь правит именно
+        её). Все файлы одного запроса используют ОДНУ сессию — одна и та же PII
+        получает один и тот же плейсхолдер во всех файлах.
+        """
+        start_time = time.time()
+        session_id = await self.store.get_or_create_session(session_id)
+
+        files_info: list[dict] = []
+        entities_total = 0
+        for file_path in file_paths:
+            try:
+                result = await self.handle_anonymize_file(
+                    file_path, session_id=session_id, create_review_md=False
+                )
+                files_info.append({
+                    "original_file": result["original_file"],
+                    "anonymized_file": result["anonymized_file"],
+                    "entities_found": result["entities_found"],
+                })
+                entities_total += result["entities_found"]
+                logger.info(
+                    "Файл %s анонимизирован → %s (сущностей: %d)",
+                    file_path, result["anonymized_file"], result["entities_found"],
+                )
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning(
+                    "Не удалось анонимизировать файл %s: %s", file_path, e
+                )
+                files_info.append({"original_file": file_path, "error": str(e)})
+
+        mappings_dict = await self.store.get_all_mappings(session_id)
+        response_text = self._build_files_anonymization_text(
+            session_id, files_info
+        )
+        original_content = json.dumps(
+            [m.model_dump(exclude_none=True) for m in request.messages],
+            ensure_ascii=False,
+        )
+        return PreparedFilesAnonymization(
+            session_id=session_id,
+            response_text=response_text,
+            files=files_info,
+            entities_total=entities_total,
+            mappings_count=len(mappings_dict),
+            original_content=original_content,
+            start_time=start_time,
+        )
+
+    @staticmethod
+    def _build_files_anonymization_text(
+        session_id: str,
+        files_info: list[dict],
+    ) -> str:
+        """
+        Текст ответа клиенту после автоматической анонимизации файлов.
+
+        Машиночитаемые маркеры:
+        - [anonymizer:done:<путь>] — файл уже анонимизирован (защита от
+          повторного перехвата при следующих запросах агента);
+        - [anonymizer:copy:<путь>] — путь к анонимизированной копии (для
+          последующей де-анонимизации по естественной команде).
+        """
+        lines = [
+            "[ANONYMIZER] Приложенные файлы анонимизированы локальной "
+            "NER-моделью. Запрос в облако НЕ отправлялся (режим passthrough).",
+            "",
+            f"session_id: {session_id}",
+            "",
+            "Файлы:",
+        ]
+        for info in files_info:
+            if "error" in info:
+                lines.append(f"- {info['original_file']} — ОШИБКА: {info['error']}")
+                continue
+            lines.append(
+                f"- {info['original_file']} → {info['anonymized_file']} "
+                f"(сущностей: {info['entities_found']})"
+            )
+            lines.append(f"  [anonymizer:done:{info['original_file']}]")
+            lines.append(f"  [anonymizer:copy:{info['anonymized_file']}]")
+        lines += [
+            "",
+            "Дальнейшие шаги:",
+            "1. Проверьте/отредактируйте анонимизированную копию "
+            "(<name>.anonymized.<ext>) — PII заменены плейсхолдерами.",
+            "2. Продолжайте в этом чате: модель прочитает копию, а прокси "
+            "передаст её содержимое в облако.",
+            "3. В конце — де-анонимизация: напишите «деанонимизируй "
+            "упомянутые файлы».",
+        ]
+        return "\n".join(lines)
+
+    async def handle_files_anonymization(
+        self,
+        request: ChatCompletionRequest,
+        file_paths: list[str],
+        session_id: Optional[str] = None,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Не-стриминговый ответ после автоматической анонимизации файлов"""
+        prepared = await self.prepare_files_anonymization(
+            request, file_paths, session_id
+        )
+        processing_time = (time.time() - prepared.start_time) * 1000
+        response = ChatCompletionResponse(
+            id=f"files-anonymized-{prepared.session_id}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=prepared.response_text,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(),
+            anonymization_metadata={
+                "mode": "files_anonymization",
+                "session_id": prepared.session_id,
+                "files": prepared.files,
+                "entities_found": prepared.entities_total,
+                "mappings_count": prepared.mappings_count,
+                "processing_time_ms": processing_time,
+            },
+        )
+        await self.store.log_request(
+            session_id=prepared.session_id,
+            request_type="files_anonymization",
+            original_content=prepared.original_content,
+            anonymized_content=prepared.response_text,
+            response_content=None,
+            entities_found=[],
+            processing_time_ms=processing_time,
+        )
+        return response, prepared.session_id
+
+    async def stream_files_anonymization(
+        self,
+        request: ChatCompletionRequest,
+        prepared: PreparedFilesAnonymization,
+    ) -> AsyncIterator[str]:
+        """SSE-поток с результатом автоматической анонимизации файлов"""
+        session_id = prepared.session_id
+        response_id = f"files-anonymized-{session_id}"
+        created = int(time.time())
+
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        text = prepared.response_text
+        chunk_size = 50
+        for i in range(0, len(text), chunk_size):
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text[i:i + chunk_size]},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "anonymization_metadata": {
+                "mode": "files_anonymization",
+                "session_id": session_id,
+                "files": prepared.files,
+                "entities_found": prepared.entities_total,
+                "mappings_count": prepared.mappings_count,
+            },
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+        await self.store.log_request(
+            session_id=session_id,
+            request_type="files_anonymization_stream",
+            original_content=prepared.original_content,
+            anonymized_content=prepared.response_text,
+            response_content=None,
+            entities_found=[],
+            processing_time_ms=(time.time() - prepared.start_time) * 1000,
+        )
+
+
+    # ==================== Авто-де-анонимизация файлов ====================
+
+    def detect_deanonymize_request(
+        self,
+        request: ChatCompletionRequest,
+    ) -> list[dict]:
+        """
+        Определить, нужно ли перехватить запрос для де-анонимизации файлов
+        по естественной команде («деанонимизируй файлы…»).
+
+        Условия: в user-сообщениях есть команда де-анонимизации, и в истории
+        диалога есть маркеры [anonymizer:copy:<путь>] с session_id.
+
+        Returns:
+            Список целей вида {"session_id": str, "file_path": str}
+            (пустой — запрос обрабатывается как обычно).
+        """
+        has_intent = any(
+            msg.role == "user"
+            and any(
+                DEANONYMIZE_INTENT_RE.search(text)
+                for text in _iter_content_texts(msg.content)
+            )
+            for msg in request.messages
+        )
+        if not has_intent:
+            return []
+
+        targets: list[dict] = []
+        seen: set[str] = set()
+        for msg in request.messages:
+            for text in _iter_content_texts(msg.content):
+                if "[ANONYMIZER]" not in text and "[anonymizer:copy:" not in text:
+                    continue
+                sids = [m.group(1) for m in SESSION_ID_LINE_RE.finditer(text)]
+                if not sids:
+                    continue
+                sid = sids[0]
+                for match in ANONYMIZER_COPY_MARKER_RE.finditer(text):
+                    copy_path = match.group("path").strip()
+                    key = f"{sid}|{copy_path}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    targets.append({"session_id": sid, "file_path": copy_path})
+        return targets
+
+    @staticmethod
+    def _build_deanonymize_text(files_info: list[dict]) -> str:
+        """Текст подтверждения после де-анонимизации файлов."""
+        lines = [
+            "[ANONYMIZER] Файлы де-анонимизированы: плейсхолдеры заменены "
+            "реальными значениями. Запрос в облако НЕ отправлялся.",
+            "",
+            "Файлы:",
+        ]
+        for info in files_info:
+            if "error" in info:
+                lines.append(f"- {info['file_path']} — ОШИБКА: {info['error']}")
+                continue
+            lines.append(
+                f"- {info['file_path']} — ОК (маппингов: {info['mappings_count']})"
+            )
+        lines += ["", "Исходные файлы не изменялись."]
+        return "\n".join(lines)
+
+    async def prepare_deanonymize_files(
+        self,
+        request: ChatCompletionRequest,
+        targets: list[dict],
+    ) -> PreparedFilesAnonymization:
+        """Де-анонимизировать файлы (без облака) и подготовить ответ."""
+        start_time = time.time()
+        files_info: list[dict] = []
+        for target in targets:
+            sid = target["session_id"]
+            file_path = target["file_path"]
+            try:
+                result = await self.handle_deanonymize_file(
+                    session_id=sid, file_path=file_path
+                )
+                files_info.append({
+                    "file_path": file_path,
+                    "mappings_count": result.get("mappings_count", 0),
+                })
+                logger.info(
+                    "Файл %s де-анонимизирован (сессия %s)", file_path, sid
+                )
+            except Exception as e:
+                logger.warning("Не удалось де-анонимизировать %s: %s", file_path, e)
+                files_info.append({"file_path": file_path, "error": str(e)})
+
+        response_text = self._build_deanonymize_text(files_info)
+        original_content = json.dumps(
+            [m.model_dump(exclude_none=True) for m in request.messages],
+            ensure_ascii=False,
+        )
+        return PreparedFilesAnonymization(
+            session_id=(targets[0]["session_id"] if targets else ""),
+            response_text=response_text,
+            files=files_info,
+            entities_total=0,
+            mappings_count=len(targets),
+            original_content=original_content,
+            start_time=start_time,
+        )
+
+    async def handle_deanonymize_files(
+        self,
+        request: ChatCompletionRequest,
+        targets: list[dict],
+        session_id: Optional[str] = None,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Не-стриминговый ответ после де-анонимизации файлов."""
+        prepared = await self.prepare_deanonymize_files(request, targets)
+        processing_time = (time.time() - prepared.start_time) * 1000
+        response = ChatCompletionResponse(
+            id=f"files-deanonymized-{int(time.time())}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=prepared.response_text,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(),
+            anonymization_metadata={
+                "mode": "files_deanonymization",
+                "files": prepared.files,
+                "processing_time_ms": processing_time,
+            },
+        )
+        await self.store.log_request(
+            session_id=prepared.session_id or "deanonymize",
+            request_type="files_deanonymization",
+            original_content=prepared.original_content,
+            anonymized_content=prepared.response_text,
+            response_content=None,
+            entities_found=[],
+            processing_time_ms=processing_time,
+        )
+        return response, prepared.session_id or (session_id or "deanonymize")
+
+    async def stream_deanonymize_files(
+        self,
+        request: ChatCompletionRequest,
+        prepared: PreparedFilesAnonymization,
+    ) -> AsyncIterator[str]:
+        """SSE-поток с результатом де-анонимизации файлов."""
+        response_id = f"files-deanonymized-{int(time.time())}"
+        created = int(time.time())
+
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        text = prepared.response_text
+        for i in range(0, len(text), 50):
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text[i:i + 50]},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "anonymization_metadata": {
+                "mode": "files_deanonymization",
+                "files": prepared.files,
+            },
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+        await self.store.log_request(
+            session_id=prepared.session_id or "deanonymize",
+            request_type="files_deanonymization_stream",
+            original_content=prepared.original_content,
+            anonymized_content=prepared.response_text,
+            response_content=None,
+            entities_found=[],
+            processing_time_ms=(time.time() - prepared.start_time) * 1000,
+        )
+
     async def handle_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -500,6 +1157,23 @@ class RequestHandler:
 
         # Passthrough: anonymize=False или режим passthrough по умолчанию
         if not request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
+            if request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+                # Авто-де-анонимизация файлов по естественной команде
+                # («деанонимизируй файлы…»). Проверяем ДО анонимизации, т.к.
+                # слово «деанонимизируй» содержит «анонимизируй».
+                deanon_targets = self.detect_deanonymize_request(request)
+                if deanon_targets:
+                    return await self.handle_deanonymize_files(
+                        request, deanon_targets, session_id
+                    )
+                # Автоматическая анонимизация приложенных файлов по явной команде
+                # («Анонимизируй файл…») — локальной NER-моделью, без облака.
+                # Явное anonymize=false отключает и перехват тоже.
+                file_paths = self.detect_attached_files_anonymization(request)
+                if file_paths:
+                    return await self.handle_files_anonymization(
+                        request, file_paths, session_id
+                    )
             return await self._handle_passthrough(request, session_id)
 
         # Переиспользуем prepare_chat_request (нет дублирования логики)
@@ -941,10 +1615,27 @@ class RequestHandler:
         """
         Passthrough-режим (anonymize=False): отправить запрос в OpenRouter
         БЕЗ анонимизации и де-анонимизации (обычный прокси).
+
+        Исключение (выборочная де-анонимизация): если в истории диалога есть
+        маркер [ANONYMIZER]/[anonymizer:done:...] с session_id (файл ранее был
+        анонимизирован локальной NER), то де-анонимизируется ТОЛЬКО текстовое
+        содержимое ответа (message.content). Аргументы tool_calls НЕ трогаются —
+        модель правит анонимизированную копию плейсхолдерами, а финальная
+        де-анонимизация файла выполняется отдельным шагом /api/deanonymize_file.
         """
+        messages = request.messages
+        if request.anonymize:
+            messages = await self._resolve_anonymized_file_contents(messages)
         messages_payload = [
-            m.model_dump(exclude_none=True) for m in request.messages
+            m.model_dump(exclude_none=True) for m in messages
         ]
+
+        mappings_dict: dict = {}
+        history_sessions: list[str] = []
+        if request.anonymize:
+            mappings_dict, history_sessions = await self._history_anonymization_mappings(
+                request
+            )
 
         cloud_response = await self.openrouter.chat_completion(
             messages=messages_payload,
@@ -964,9 +1655,15 @@ class RequestHandler:
         choices = []
         for choice in cloud_response.get("choices", []):
             message_data = choice.get("message", {})
+            content = message_data.get("content")
+            # Выборочная де-анонимизация: только текст, tool_calls не трогаем
+            if mappings_dict and isinstance(content, str):
+                content = await self.text_replacer.deanonymize(
+                    content, mappings_dict
+                )
             resp_message = ChatMessage(
                 role=message_data.get("role", "assistant"),
-                content=message_data.get("content"),
+                content=content,
             )
             if message_data.get("tool_calls"):
                 resp_message.tool_calls = message_data["tool_calls"]
@@ -982,13 +1679,21 @@ class RequestHandler:
                 )
             )
 
+        metadata: dict = {"mode": "passthrough"}
+        if mappings_dict:
+            metadata = {
+                "mode": "passthrough_deanonymized",
+                "sessions": history_sessions,
+                "mappings_count": len(mappings_dict),
+            }
+
         response = ChatCompletionResponse(
             id=cloud_response.get("id", f"passthrough-{int(time.time())}"),
             created=cloud_response.get("created", int(time.time())),
             model=cloud_response.get("model", request.model),
             choices=choices,
             usage=UsageInfo(**cloud_response.get("usage", {})),
-            anonymization_metadata={"mode": "passthrough"},
+            anonymization_metadata=metadata,
         )
         return response, session_id or "passthrough"
 
@@ -999,10 +1704,25 @@ class RequestHandler:
         """
         Стриминг passthrough (anonymize=False): без анонимизации и
         де-анонимизации (обычный прокси-стрим).
+
+        Исключение (выборочная де-анонимизация): если в истории диалога есть
+        маркер [ANONYMIZER]/[anonymizer:done:...] с session_id, то
+        де-анонимизируются ТОЛЬКО чанки delta.content. Аргументы tool_calls
+        не трогаются — модель правит анонимизированную копию плейсхолдерами.
         """
+        messages = request.messages
+        if request.anonymize:
+            messages = await self._resolve_anonymized_file_contents(messages)
         messages_payload = [
-            m.model_dump(exclude_none=True) for m in request.messages
+            m.model_dump(exclude_none=True) for m in messages
         ]
+
+        mappings_dict: dict = {}
+        if request.anonymize:
+            mappings_dict, _history_sessions = await self._history_anonymization_mappings(
+                request
+            )
+        deano = StreamDeAnonymizer(self.text_replacer, mappings_dict) if mappings_dict else None
 
         try:
             async for chunk in self.openrouter.chat_completion_stream(
@@ -1019,7 +1739,29 @@ class RequestHandler:
                 tool_choice=request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
             ):
+                if deano is not None:
+                    for choice in chunk.get("choices", []) or []:
+                        delta = choice.get("delta", {})
+                        if delta.get("content"):
+                            delta["content"] = await deano.feed(delta["content"]) or ""
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+            if deano is not None:
+                tail = await deano.flush()
+                if tail:
+                    tail_chunk = {
+                        "id": f"passthrough-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": tail},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(tail_chunk, ensure_ascii=False)}\n\n"
+
             yield "data: [DONE]\n\n"
         except Exception as e:
             error_chunk = {"error": {"message": str(e), "type": "server_error"}}
@@ -1330,13 +2072,14 @@ class RequestHandler:
         file_path: str,
         session_id: Optional[str] = None,
         output_path: Optional[str] = None,
+        create_review_md: bool = True,
     ) -> dict:
         """
         Анонимизировать локальный файл: создать анонимизированную копию
         (структура/таблицы сохраняются) рядом с оригиналом.
 
-        Возвращает путь к анонимизированной копии — модель (Cline) редактирует
-        именно её, а в конце де-анонимизация через /api/deanonymize_file.
+        create_review_md=False — не сохранять .md-предпросмотр (перехват в
+        passthrough-режиме: пользователь правит копию в исходном формате).
         """
         session_id = await self.store.get_or_create_session(session_id)
         path = Path(file_path)
@@ -1381,7 +2124,7 @@ class RequestHandler:
 
         # Сохраняем review-файл (.md) с форматированным анонимизированным видом
         review_path = None
-        if anon_markdown and STORAGE["save_anonymized_files"]:
+        if create_review_md and anon_markdown and STORAGE["save_anonymized_files"]:
             try:
                 review_path = await self.store.save_anonymized_text(
                     session_id, anon_markdown, prefix="review"

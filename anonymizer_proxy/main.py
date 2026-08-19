@@ -203,6 +203,62 @@ async def chat_completions(
         if chat_request.stream:
             # Passthrough: anonymize=False или режим passthrough по умолчанию
             if not chat_request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
+                # Автоматическая анонимизация приложенных файлов по явной
+                # команде («Анонимизируй файл…») — локальной NER-моделью,
+                # без облака. Явное anonymize=false отключает и перехват.
+                if chat_request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+                    deanon_targets = request_handler.detect_deanonymize_request(
+                        chat_request
+                    )
+                    if deanon_targets:
+                        try:
+                            prepared_deanon = await request_handler.prepare_deanonymize_files(
+                                chat_request, deanon_targets
+                            )
+                        except Exception as prep_error:
+                            return _make_openai_error(
+                                500, str(prep_error), "server_error"
+                            )
+                        return StreamingResponse(
+                            request_handler.stream_deanonymize_files(
+                                chat_request, prepared_deanon
+                            ),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",  # Для nginx
+                            }
+                        )
+                    file_paths = request_handler.detect_attached_files_anonymization(
+                        chat_request
+                    )
+                    if file_paths:
+                        # Анонимизация ДО создания StreamingResponse — ошибки
+                        # возвращаются нормальным JSON error
+                        try:
+                            prepared_files = await request_handler.prepare_files_anonymization(
+                                chat_request, file_paths, session_id=x_session_id
+                            )
+                        except Exception as prep_error:
+                            error_msg = str(prep_error)
+                            logger.error(
+                                "Ошибка анонимизации приложенных файлов: %s",
+                                error_msg,
+                            )
+                            return _make_openai_error(500, error_msg, "server_error")
+                        return StreamingResponse(
+                            request_handler.stream_files_anonymization(
+                                chat_request, prepared_files
+                            ),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",  # Для nginx
+                                "X-Session-Id": prepared_files.session_id,
+                            }
+                        )
                 return StreamingResponse(
                     request_handler.stream_passthrough(chat_request),
                     media_type="text/event-stream",
