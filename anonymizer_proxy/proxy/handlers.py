@@ -2103,7 +2103,7 @@ class RequestHandler:
         )
         if llm_failed:
             raise NERUnavailableError(
-                "NER-модель (LM Studio) недоступна или не вернула результат — "
+                "NER-модель не загрузилась или не вернула результат — "
                 "анонимизация файла не выполнена"
             )
 

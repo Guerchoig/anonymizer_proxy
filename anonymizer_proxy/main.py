@@ -21,7 +21,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anonymizer_proxy.config import (
-    Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, ensure_directories, logger
+    Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, NER_ENGINE,
+    ensure_directories, logger
 )
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
@@ -61,7 +62,7 @@ async def lifespan(app: FastAPI):
     logger.info("  Прокси-сервер анонимизации")
     logger.info("=" * 60)
     logger.info("  Режим: %s", CURRENT_MODE)
-    logger.info("  LM Studio: %s", os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1"))
+    logger.info("  NER-движок: %s (device=%s)", NER_ENGINE["model"], NER_ENGINE["device"])
     logger.info("  OpenRouter: %s", OPENROUTER["base_url"])
     logger.info("  Модель: %s", OPENROUTER["model"])
     logger.info("  Логи: %s", LOGS_DIR)
@@ -95,12 +96,12 @@ async def lifespan(app: FastAPI):
         openrouter_client=openrouter_client,
     )
 
-    # Проверяем доступность LM Studio
-    lm_available = await ner_service.check_lm_studio()
-    if lm_available:
-        logger.info("  [OK] LM Studio доступен")
-    else:
-        logger.warning("  [FAIL] LM Studio недоступен (будет использоваться только regex)")
+    # Прогреваем локальную NER-модель (загрузка весов при первом запуске)
+    try:
+        await ner_service.warmup()
+        logger.info("  [OK] NER-движок загружен")
+    except Exception as exc:
+        logger.warning("  [WARN] NER-движок не загрузился (будет только regex): %s", exc)
 
     logger.info("=" * 60)
 
@@ -576,11 +577,9 @@ async def get_sessions():
 @app.get("/health")
 async def health_check():
     """Проверка работоспособности сервиса"""
-    lm_available = await ner_service.check_lm_studio()
-
     return {
         "status": "healthy",
-        "lm_studio_available": lm_available,
+        "ner_available": ner_service.is_available(),
         "mode": CURRENT_MODE,
         "timestamp": datetime.now().isoformat(),
     }
@@ -589,13 +588,12 @@ async def health_check():
 @app.get("/api/status", dependencies=[Depends(require_api_token)])
 async def get_status():
     """Получить статус сервиса"""
-    lm_available = await ner_service.check_lm_studio()
-
     return {
         "mode": CURRENT_MODE,
-        "lm_studio": {
-            "available": lm_available,
-            "url": os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1"),
+        "ner_engine": {
+            "available": ner_service.is_available(),
+            "model": NER_ENGINE["model"],
+            "device": NER_ENGINE["device"],
         },
         "openrouter": {
             "url": OPENROUTER["base_url"],

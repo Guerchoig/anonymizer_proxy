@@ -43,31 +43,20 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-# LM Studio (локальная NER-модель)
-LM_STUDIO = {
-    "base_url": os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1"),
-    "model": os.getenv("LM_STUDIO_MODEL", "qwen/qwen3.5-9b"),
-    # Таймаут NER-запроса: большие документы обрабатываются локальной
-    # моделью заметно дольше, чем короткие сообщения
-    "timeout": float(os.getenv("NER_TIMEOUT_SECONDS", "600")),
-    "temperature": 0.1,
-    # Лимит токенов ответа NER: список сущностей большого документа
-    # не помещается в 4096 токенов, хвост теряется
-    "max_tokens": int(os.getenv("NER_MAX_TOKENS", "16384")),
-    # Максимальный размер текста (символы), отдаваемый NER-модели за один
-    # вызов. Задаётся по вместимости VRAM/контекста модели; оставляйте
-    # запас на системный промпт и генерацию ответа.
-    # Текст длиннее режется на чанки с перекрытием (chunk_overlap_chars).
-    "max_input_chars": int(os.getenv("NER_MAX_INPUT_CHARS", "128000")),
+# NER-движок (GLiNER) — локальная анонимизация
+NER_ENGINE = {
+    "model": os.getenv("NER_MODEL", "knowledgator/gliner-pii-large-v1.0"),
+    "threshold": float(os.getenv("NER_THRESHOLD", "0.5")),
+    "device": os.getenv("NER_DEVICE", "cpu"),  # cpu | directml
+    # Максимальный размер текста (символы), отдаваемый модели за один
+    # вызов. Для энкодер-моделей (окно ~512 токенов) безопасно ~2000 символов;
+    # текст длиннее режется на чанки с перекрытием.
+    "max_input_chars": int(os.getenv("NER_MAX_INPUT_CHARS", "2000")),
     # Перекрытие соседних чанков (символы) при нарезке длинного текста:
     # защищает сущности, попавшие на границу чанков
-    "chunk_overlap_chars": 500,
-    # Число одновременно обрабатываемых NER-чанков (параллелизм). По умолчанию 1
-    # (последовательно): конкурентные запросы к LM Studio (0.4.x) могут приводить
-    # к зависанию модели («Channel Error» после обрыва) — не повышайте без нужды.
-    "ner_parallel": int(os.getenv("NER_PARALLEL", "1")),
-    # Кэш результата проверки доступности LM Studio (секунды)
-    "availability_cache_seconds": 10.0,
+    "chunk_overlap_chars": 200,
+    # Таймаут NER-вызова (страховочный)
+    "timeout": float(os.getenv("NER_TIMEOUT_SECONDS", "300")),
 }
 
 # OpenRouter (облачная модель)

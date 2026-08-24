@@ -13,8 +13,8 @@ python-docx>=1.1.0      # DOCX (Word)
 openpyxl>=3.1.0         # XLSX (Excel)
 # XML парсинг через встроенный xml.etree.ElementTree
 
-# NLP (fallback для regex)
-# spacy>=3.8.0  # Опционально, требует компиляции
+# NLP (NER-движок)
+gliner>=0.2.28          # GLiNER: компактная локальная NER-модель (тянет torch, transformers)
 
 # Схемы данных
 pydantic>=2.0.0

@@ -4,7 +4,7 @@ Anonymizer Proxy - Прокси-сервер для анонимизации з�
 Архитектура:
     Cline → [Прокси localhost:8081] → OpenRouter → Qwen3.7-Max
                   ↓ ↑
-            [LM Studio NER]
+            [GLiNER NER]
                   ↓ ↑
             [SQLite маппинги]
 
