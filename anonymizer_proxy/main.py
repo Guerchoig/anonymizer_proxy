@@ -2,6 +2,7 @@
 Прокси-сервер для анонимизации запросов к облачным LLM
 FastAPI приложение с OpenAI-совместимым API
 """
+import asyncio
 import json
 import os
 import sys
@@ -20,7 +21,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anonymizer_proxy.config import (
-    Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, logger
+    Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, ensure_directories, logger
 )
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
@@ -78,6 +79,9 @@ async def lifespan(app: FastAPI):
             "PROXY_API_TOKEN не задан — /api/* эндпоинты доступны без токена "
             "(допустимо только для localhost)"
         )
+
+    # Создаём рабочие каталоги (data/, logs/, anonymized_files/, mappings/)
+    ensure_directories()
 
     # Инициализируем сервисы
     ner_service = NERService()
@@ -158,6 +162,37 @@ async def require_api_token(
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 
+async def require_v1_token(
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """Защита /v1/* эндпоинтов при не-localhost биндинге.
+
+    На localhost доступ открыт (клиент Cline шлёт свой ключ, прокси его
+    игнорирует). При прослушивании 0.0.0.0 обязателен PROXY_API_TOKEN —
+    иначе любой в сети сможет расходовать кредиты OpenRouter и читать
+    локальные файлы через <file_content>-блоки.
+    """
+    if _is_local_bind():
+        return
+
+    configured_token = PROXY["api_token"]
+    if not configured_token:
+        # lifespan не даст стартовать на не-localhost без токена; это страховка
+        raise HTTPException(status_code=401, detail="API token not configured")
+
+    provided = x_api_key
+    if authorization:
+        auth = authorization
+        if auth.lower().startswith("bearer "):
+            auth = auth[7:]
+        if auth:
+            provided = provided or auth
+
+    if not provided or provided != configured_token:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
 # ==================== OpenAI-совместимые эндпоинты ====================
 
 def _make_openai_error(status_code: int, message: str, error_type: str = "server_error") -> JSONResponse:
@@ -174,7 +209,58 @@ def _make_openai_error(status_code: int, message: str, error_type: str = "server
     )
 
 
-@app.post("/v1/chat/completions")
+# ==================== Keep-alive во время подготовки (NER) ====================
+# Раньше прокси не отдавал клиенту ни байта, пока NER + анонимизация не
+# завершатся, поэтому Cline мог считать запрос зависшим и таймаутить.
+# Теперь подготовка выполняется в фоне, а клиенту периодически отдаются
+# нейтральные SSE-комментарии (": keep-alive") — они не попадают в текст
+# ответа, но держат HTTP-соединение «живым».
+
+KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL_SECONDS", "3"))
+
+
+async def _stream_with_keepalive(prepare_factory, stream_factory):
+    """
+    Запустить подготовку запроса (NER + анонимизация) в фоне и параллельно
+    отдавать keep-alive SSE-чанки.
+
+    prepare_factory: async-колбэк без аргументов -> подготовленный объект.
+    stream_factory: async-колбэк (подготовленный объект) -> AsyncIterator[str]
+    (строки SSE-чанков, уже отформатированные).
+    """
+    prepare_task = asyncio.create_task(prepare_factory())
+    try:
+        # Первый байт отдаём сразу — клиент не должен упираться в таймаут
+        # до первого токена, пока идёт подготовка.
+        if KEEPALIVE_ENABLED:
+            yield ": keep-alive\n\n"
+        while True:
+            done, _pending = await asyncio.wait(
+                {prepare_task}, timeout=KEEPALIVE_INTERVAL
+            )
+            if prepare_task in done:
+                break
+            if KEEPALIVE_ENABLED:
+                yield ": keep-alive\n\n"
+        prepared = prepare_task.result()  # поднимает исключение при ошибке подготовки
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ошибка подготовки запроса: %s", exc)
+        error_chunk = {"error": {"message": str(exc), "type": "server_error"}}
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    finally:
+        if not prepare_task.done():
+            prepare_task.cancel()
+
+    async for event in stream_factory(prepared):
+        yield event
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(require_v1_token)])
 async def chat_completions(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -211,18 +297,19 @@ async def chat_completions(
                         chat_request
                     )
                     if deanon_targets:
-                        try:
-                            prepared_deanon = await request_handler.prepare_deanonymize_files(
+                        async def _prepare_deanon():
+                            return await request_handler.prepare_deanonymize_files(
                                 chat_request, deanon_targets
                             )
-                        except Exception as prep_error:
-                            return _make_openai_error(
-                                500, str(prep_error), "server_error"
-                            )
-                        return StreamingResponse(
-                            request_handler.stream_deanonymize_files(
+
+                        async def _stream_deanon(prepared_deanon):
+                            async for event in request_handler.stream_deanonymize_files(
                                 chat_request, prepared_deanon
-                            ),
+                            ):
+                                yield event
+
+                        return StreamingResponse(
+                            _stream_with_keepalive(_prepare_deanon, _stream_deanon),
                             media_type="text/event-stream",
                             headers={
                                 "Cache-Control": "no-cache",
@@ -234,29 +321,31 @@ async def chat_completions(
                         chat_request
                     )
                     if file_paths:
-                        # Анонимизация ДО создания StreamingResponse — ошибки
-                        # возвращаются нормальным JSON error
-                        try:
-                            prepared_files = await request_handler.prepare_files_anonymization(
-                                chat_request, file_paths, session_id=x_session_id
+                        # Сессию создаём заранее, чтобы проставить X-Session-Id
+                        # в заголовке (сама подготовка теперь идёт в фоне).
+                        files_session_id = await mapping_store.get_or_create_session(
+                            x_session_id
+                        )
+
+                        async def _prepare_files():
+                            return await request_handler.prepare_files_anonymization(
+                                chat_request, file_paths, session_id=files_session_id
                             )
-                        except Exception as prep_error:
-                            error_msg = str(prep_error)
-                            logger.error(
-                                "Ошибка анонимизации приложенных файлов: %s",
-                                error_msg,
-                            )
-                            return _make_openai_error(500, error_msg, "server_error")
-                        return StreamingResponse(
-                            request_handler.stream_files_anonymization(
+
+                        async def _stream_files(prepared_files):
+                            async for event in request_handler.stream_files_anonymization(
                                 chat_request, prepared_files
-                            ),
+                            ):
+                                yield event
+
+                        return StreamingResponse(
+                            _stream_with_keepalive(_prepare_files, _stream_files),
                             media_type="text/event-stream",
                             headers={
                                 "Cache-Control": "no-cache",
                                 "Connection": "keep-alive",
                                 "X-Accel-Buffering": "no",  # Для nginx
-                                "X-Session-Id": prepared_files.session_id,
+                                "X-Session-Id": files_session_id,
                             }
                         )
                 return StreamingResponse(
@@ -269,23 +358,23 @@ async def chat_completions(
                     }
                 )
 
-            # Сначала выполняем NER + анонимизацию ДО создания StreamingResponse
-            # Это позволяет вернуть нормальный JSON error при ошибке
-            try:
-                prepared = await request_handler.prepare_chat_request(
+            # NER + анонимизация выполняются в фоне, а клиенту во время
+            # подготовки отдаются keep-alive SSE-чанки (см. _stream_with_keepalive).
+            async def _prepare():
+                return await request_handler.prepare_chat_request(
                     chat_request,
                     session_id=x_session_id
                 )
-            except Exception as prep_error:
-                error_msg = str(prep_error)
-                logger.error("Ошибка подготовки запроса: %s", error_msg)
-                return _make_openai_error(500, error_msg, "server_error")
 
-            return StreamingResponse(
-                request_handler.stream_from_prepared(
+            async def _stream(prepared):
+                async for event in request_handler.stream_from_prepared(
                     chat_request,
                     prepared
-                ),
+                ):
+                    yield event
+
+            return StreamingResponse(
+                _stream_with_keepalive(_prepare, _stream),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -310,12 +399,12 @@ async def chat_completions(
         return _make_openai_error(400, "Invalid JSON in request body", "invalid_request_error")
     except OpenRouterError as e:
         return _make_openai_error(e.status_code, str(e), "upstream_error")
-    except Exception as e:
+    except Exception:
         logger.exception("Необработанная ошибка запроса")
-        return _make_openai_error(500, str(e), "server_error")
+        return _make_openai_error(500, "Internal server error", "server_error")
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(require_v1_token)])
 async def list_models():
     """Список доступных моделей (проксирует от OpenRouter)"""
     try:
@@ -347,8 +436,9 @@ async def anonymize(request: AnonymizeRequest):
     try:
         response = await request_handler.handle_anonymize_only(request)
         return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/api/anonymize_file", dependencies=[Depends(require_api_token)])
@@ -362,8 +452,9 @@ async def anonymize_file(request: AnonymizeFileRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/api/deanonymize", dependencies=[Depends(require_api_token)])
@@ -372,8 +463,9 @@ async def deanonymize(request: DeanonymizeRequest):
     try:
         result = await request_handler.handle_deanonymize(request.text, request.session_id)
         return {"deanonymized_text": result, "session_id": request.session_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/api/deanonymize_file", dependencies=[Depends(require_api_token)])
@@ -388,8 +480,9 @@ async def deanonymize_file(request: DeanonymizeFileRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/api/send", dependencies=[Depends(require_api_token)])
@@ -411,8 +504,9 @@ async def send_anonymized(request: SendAnonymizedRequest):
             content=response.model_dump(exclude_none=True),
             headers={"X-Session-Id": session_id}
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ==================== Эндпоинты для логирования ====================
@@ -430,8 +524,9 @@ async def get_logs(session_id: Optional[str] = None, limit: int = 100):
         else:
             logs = await request_handler.get_all_logs(limit)
         return {"logs": logs, "count": len(logs)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/logs/export", dependencies=[Depends(require_api_token)])
@@ -460,8 +555,9 @@ async def export_logs(session_id: Optional[str] = None):
             "filepath": str(filepath),
             "count": len(logs)
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/sessions", dependencies=[Depends(require_api_token)])
@@ -470,8 +566,9 @@ async def get_sessions():
     try:
         sessions = await request_handler.handle_get_sessions()
         return {"sessions": sessions, "count": len(sessions)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ==================== Сервисные эндпоинты ====================
@@ -517,8 +614,9 @@ async def cleanup_expired():
     try:
         await mapping_store.cleanup_expired()
         return {"message": "Истёкшие сессии очищены"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Внутренняя ошибка сервера")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ==================== Запуск сервера ====================

@@ -2,7 +2,7 @@
 Anonymizer Proxy - Прокси-сервер для анонимизации запросов к облачным LLM
 
 Архитектура:
-    Cline → [Прокси localhost:8080] → OpenRouter → Qwen3.7-Max
+    Cline → [Прокси localhost:8081] → OpenRouter → Qwen3.7-Max
                   ↓ ↑
             [LM Studio NER]
                   ↓ ↑
@@ -13,7 +13,9 @@ Anonymizer Proxy - Прокси-сервер для анонимизации з�
     - anonymize_only: Только анонимизация без отправки в облако
 
 Использование:
-    from anonymizer_proxy import main
+    python -m anonymizer_proxy.main
+    # или:
+    from anonymizer_proxy.main import main
     main()  # Запуск сервера
 """
 

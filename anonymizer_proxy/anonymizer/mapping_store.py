@@ -2,8 +2,11 @@
 Хранилище маппингов токенов и оригинальных значений
 Использует SQLite (WAL) для персистентности и in-memory cache для быстрого доступа
 """
+import asyncio
 import json
 import logging
+import shutil
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +39,14 @@ def _from_iso(value: str) -> datetime:
         return _utcnow().replace(tzinfo=None)
 
 
+def _token_counter(token: str) -> int:
+    """Числовой суффикс токена вида '[TYPE_12]' -> 12 (0, если не распознан)."""
+    try:
+        return int(token.rstrip("]").rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        return 0
+
+
 class MappingStore:
     """Хранилище маппингов для анонимизации/де-анонимизации"""
 
@@ -44,6 +55,7 @@ class MappingStore:
         self._memory_cache: dict[str, dict[str, MappingEntry]] = {}  # session_id -> {token -> entry}
         self._initialized = False
         self._db: Optional[aiosqlite.Connection] = None
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def _get_db(self) -> aiosqlite.Connection:
         """
@@ -51,6 +63,7 @@ class MappingStore:
         WAL-режим позволяет параллельные чтения при записи.
         """
         if self._db is None:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
             self._db = await aiosqlite.connect(self._db_path)
             await self._db.execute("PRAGMA journal_mode=WAL")
             await self._db.execute("PRAGMA synchronous=NORMAL")
@@ -171,6 +184,17 @@ class MappingStore:
         """Сгенерировать токен для замены"""
         return f"[{entity_type}_{counter}]"
 
+    def _next_counter(self, session_id: str) -> int:
+        """Максимальный числовой суффикс среди токенов сессии (0, если пусто).
+
+        Счётчик берётся от реальных токенов, а не от len(cache) — это
+        устойчиво к пропускам нумерации и исключает перезапись маппингов.
+        """
+        return max(
+            (_token_counter(t) for t in self._memory_cache.get(session_id, {})),
+            default=0,
+        )
+
     async def add_mapping(
         self,
         session_id: str,
@@ -178,45 +202,66 @@ class MappingStore:
         entity_type: str
     ) -> str:
         """
-        Добавить маппинг и вернуть токен
+        Добавить маппинг и вернуть токен.
 
-        Если значение уже есть в сессии, возвращает существующий токен
+        Если значение уже есть в сессии, возвращает существующий токен.
+        Генерация токена потокобезопасна для сессии и не перезаписывает
+        существующие маппинги: счётчик берётся от максимального числового
+        суффикса токенов, а при коллизии в БД используется INSERT с повторной
+        попыткой (вместо INSERT OR REPLACE).
         """
         await self.initialize()
 
-        # Проверяем, есть ли уже такое значение в сессии
-        if session_id in self._memory_cache:
-            for token, entry in self._memory_cache[session_id].items():
+        # Сериализуем обращения к одной сессии: генерация токена из счётчика
+        # не должна гоняться между конкурентными запросами с одним session_id.
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+
+        async with lock:
+            # Подгружаем маппинги сессии, если кэш ещё не заполнен (например,
+            # после рестарта), чтобы счётчик учитывал токены из БД.
+            if session_id not in self._memory_cache:
+                await self._load_session_to_cache(session_id)
+            cache = self._memory_cache[session_id]
+
+            # Идемпотентность: то же значение в сессии — тот же токен.
+            for token, entry in cache.items():
                 if entry.original_value == original_value:
                     return token
 
-        # Генерируем новый токен (счётчик с запасом против коллизий)
-        counter = len(self._memory_cache.get(session_id, {})) + 1
-        token = self._generate_token(entity_type, counter)
-        while session_id in self._memory_cache and token in self._memory_cache[session_id]:
-            counter += 1
+            counter = self._next_counter(session_id) + 1
             token = self._generate_token(entity_type, counter)
+            while token in cache:
+                counter += 1
+                token = self._generate_token(entity_type, counter)
 
-        # Сохраняем в БД
-        db = await self._get_db()
-        await db.execute(
-            "INSERT OR REPLACE INTO mappings (session_id, token, original_value, entity_type) VALUES (?, ?, ?, ?)",
-            (session_id, token, original_value, entity_type)
-        )
-        await db.commit()
+            # INSERT вместо OR REPLACE: при коллизии (например, гонка между
+            # процессами на одной БД) пробуем следующий номер, а не затираем.
+            db = await self._get_db()
+            while True:
+                try:
+                    await db.execute(
+                        "INSERT INTO mappings "
+                        "(session_id, token, original_value, entity_type) "
+                        "VALUES (?, ?, ?, ?)",
+                        (session_id, token, original_value, entity_type),
+                    )
+                    await db.commit()
+                    break
+                except sqlite3.IntegrityError:
+                    counter += 1
+                    token = self._generate_token(entity_type, counter)
+                    while token in cache:
+                        counter += 1
+                        token = self._generate_token(entity_type, counter)
 
-        # Сохраняем в cache
-        if session_id not in self._memory_cache:
-            self._memory_cache[session_id] = {}
+            cache[token] = MappingEntry(
+                token=token,
+                original_value=original_value,
+                entity_type=entity_type,
+                session_id=session_id,
+            )
 
-        self._memory_cache[session_id][token] = MappingEntry(
-            token=token,
-            original_value=original_value,
-            entity_type=entity_type,
-            session_id=session_id
-        )
-
-        return token
+            return token
 
     async def get_original_value(self, session_id: str, token: str) -> Optional[str]:
         """Получить оригинальное значение по токену"""
@@ -293,7 +338,6 @@ class MappingStore:
         await self.initialize()
 
         db = await self._get_db()
-        db.row_factory = aiosqlite.Row
 
         if session_id:
             cursor = await db.execute(
@@ -306,11 +350,14 @@ class MappingStore:
                 (limit,)
             )
 
+        # Собираем dict по описанию курсора, не трогая row_factory общего
+        # соединения (иначе состояние «протекает» в другие запросы).
+        columns = [desc[0] for desc in cursor.description]
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [dict(zip(columns, row)) for row in rows]
 
     async def cleanup_expired(self):
-        """Удалить истёкшие сессии и их маппинги"""
+        """Удалить истёкшие сессии: записи БД, кэш и файлы на диске."""
         await self.initialize()
 
         now_iso = _to_iso(_utcnow())
@@ -336,9 +383,15 @@ class MappingStore:
         )
         await db.commit()
 
-        # Очищаем memory cache
+        # Очищаем memory cache, лок-блоки и файлы на диске
         for sid in expired_ids:
             self._memory_cache.pop(sid, None)
+            self._session_locks.pop(sid, None)
+            # Анонимизированные копии и review-.md файлы на диске
+            for base_dir in (ANONYMIZED_FILES_DIR, MAPPINGS_DIR):
+                session_dir = base_dir / sid
+                if session_dir.is_dir():
+                    shutil.rmtree(session_dir, ignore_errors=True)
 
         if expired_ids:
             logger.info("Очищено истёкших сессий: %d", len(expired_ids))
@@ -426,6 +479,7 @@ class MappingStore:
     async def close(self):
         """Закрыть соединения"""
         self._memory_cache.clear()
+        self._session_locks.clear()
         if self._db is not None:
             try:
                 await self._db.close()

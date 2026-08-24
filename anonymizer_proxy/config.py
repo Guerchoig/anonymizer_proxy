@@ -17,9 +17,10 @@ ANONYMIZED_FILES_DIR = DATA_DIR / "anonymized_files"
 MAPPINGS_DIR = DATA_DIR / "mappings"
 DB_PATH = DATA_DIR / "anonymizer.db"
 
-# Создаём директории при импорте
-for dir_path in [DATA_DIR, LOGS_DIR, ANONYMIZED_FILES_DIR, MAPPINGS_DIR]:
-    dir_path.mkdir(parents=True, exist_ok=True)
+def ensure_directories() -> None:
+    """Создать рабочие каталоги (вызывается явно, а не при импорте)."""
+    for dir_path in [DATA_DIR, LOGS_DIR, ANONYMIZED_FILES_DIR, MAPPINGS_DIR]:
+        dir_path.mkdir(parents=True, exist_ok=True)
 
 
 # ==================== Логирование ====================
@@ -61,6 +62,10 @@ LM_STUDIO = {
     # Перекрытие соседних чанков (символы) при нарезке длинного текста:
     # защищает сущности, попавшие на границу чанков
     "chunk_overlap_chars": 500,
+    # Число одновременно обрабатываемых NER-чанков (параллелизм). По умолчанию 1
+    # (последовательно): конкурентные запросы к LM Studio (0.4.x) могут приводить
+    # к зависанию модели («Channel Error» после обрыва) — не повышайте без нужды.
+    "ner_parallel": int(os.getenv("NER_PARALLEL", "1")),
     # Кэш результата проверки доступности LM Studio (секунды)
     "availability_cache_seconds": 10.0,
 }
@@ -87,14 +92,8 @@ PROXY = {
     "api_token": os.getenv("PROXY_API_TOKEN", ""),
 }
 
-# Логирование
-LOGGING = {
-    "enabled": True,
-    "log_requests": True,      # Логировать входящие запросы
-    "log_responses": True,     # Логировать ответы от облака
-    "log_anonymization": True, # Логировать процесс анонимизации
-    "max_log_size_mb": 100,    # Максимальный размер лог-файла
-}
+# Логирование: консоль (StreamHandler в setup_logging) + таблица logs в SQLite.
+# Файловый экспорт логов — через /api/logs/export (пишет в LOGS_DIR).
 
 # Хранение анонимизированных файлов
 STORAGE = {

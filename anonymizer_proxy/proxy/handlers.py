@@ -5,13 +5,11 @@
 import base64
 import json
 import logging
-import re
 import time
 from pathlib import Path
 from typing import AsyncIterator, Optional
-from urllib.parse import unquote, urlparse
 
-from ..anonymizer.ner_service import NERService
+from ..anonymizer.ner_service import NERService, NERUnavailableError
 from ..anonymizer.file_parser import FileParser, FileAssembler
 from ..anonymizer.mapping_store import MappingStore
 from ..anonymizer.replacer import (
@@ -20,7 +18,7 @@ from ..anonymizer.replacer import (
     StreamDeAnonymizer,
     split_entities_by_segments,
 )
-from ..config import Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, BASE_DIR
+from ..config import Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END
 from ..models.schemas import (
     Entity,
     ChatCompletionRequest,
@@ -33,87 +31,23 @@ from ..models.schemas import (
     SendAnonymizedRequest,
 )
 from .openrouter_client import OpenRouterClient
+from .utils import (
+    FILE_CONTENT_BLOCK_RE,
+    FILE_CONTENT_ERROR_PREFIX,
+    WORKSPACE_ROOT,
+    ANONYMIZE_INTENT_RE,
+    ANONYMIZER_DONE_MARKER_RE,
+    SESSION_ID_LINE_RE,
+    DEANONYMIZE_INTENT_RE,
+    ANONYMIZER_COPY_MARKER_RE,
+    ANONYMIZER_RESULT_MARKER_RE,
+    _iter_content_texts,
+    _resolve_local_path,
+    _is_anonymized_copy_path,
+    _result_path_for,
+)
 
 logger = logging.getLogger("anonymizer_proxy.handlers")
-
-# Блоки <file_content path="...">...</file_content>, которые клиент (Cline)
-# вставляет в текст сообщения при прикладывании файлов
-FILE_CONTENT_BLOCK_RE = re.compile(
-    r'<file_content path="(?P<path>[^"]+)">(?P<body>.*?)</file_content>',
-    re.DOTALL,
-)
-# Префикс заглушки-ошибки: клиент не смог прочитать файл (обычно бинарный
-# документ вида DOCX/XLSX) и прислал вместо содержимого текст ошибки
-FILE_CONTENT_ERROR_PREFIX = "Error fetching content"
-# Корень рабочей области для относительных путей из <file_content path="...">
-# (BASE_DIR — корень проекта, он же workspace; сервер запускается из него)
-WORKSPACE_ROOT = BASE_DIR
-
-# Намерение анонимизации в тексте запроса («Анонимизируй файл…»).
-# Триггер автоматической анонимизации приложенных файлов в passthrough-режиме
-ANONYMIZE_INTENT_RE = re.compile(r"анонимиз|anonymi[sz]", re.IGNORECASE)
-# Маркер «файл уже анонимизирован» в ответе прокси: защита от повторной
-# анонимизации при следующих запросах агента (история диалога накапливается,
-# исходный <file_content>-блок и команда «анонимизируй» остаются в ней)
-ANONYMIZER_DONE_MARKER_RE = re.compile(r"\[anonymizer:done:(?P<path>[^\]]+)\]")
-# session_id из ответа перехвата («session_id: <uuid>» внутри блока [ANONYMIZER])
-SESSION_ID_LINE_RE = re.compile(r"session_id:\s*([A-Za-z0-9_-]{1,64})")
-# Намерение де-анонимизации («деанонимизируй файлы…»). Проверяется ДО
-# анонимизации, т.к. слово «деанонимизируй» содержит «анонимизируй».
-DEANONYMIZE_INTENT_RE = re.compile(r"де.?анонимиз|deanonymi[sz]", re.IGNORECASE)
-# Машиночитаемый маркер пути анонимизированной копии в ответе перехвата
-ANONYMIZER_COPY_MARKER_RE = re.compile(r"\[anonymizer:copy:(?P<path>[^\]]+)\]")
-# Маркер пути «файла результата» — куда модель пишет правки, не изменяя копию
-ANONYMIZER_RESULT_MARKER_RE = re.compile(r"\[anonymizer:result:(?P<path>[^\]]+)\]")
-
-
-def _iter_content_texts(content) -> list[str]:
-    """Извлечь все текстовые части content сообщения (str | list[dict] | None)"""
-    if isinstance(content, str):
-        return [content]
-    if isinstance(content, list):
-        return [
-            part["text"]
-            for part in content
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        ]
-    return []
-
-
-def _resolve_local_path(path_str: str) -> Path:
-    """
-    Разрешить путь из <file_content path="..."> в абсолютный путь на диске.
-    Поддерживаются file:// URI, абсолютные пути и относительные (от корня
-    workspace).
-    """
-    if path_str.lower().startswith("file://"):
-        path_str = unquote(urlparse(path_str).path)
-        # file:///C:/... -> C:/... (Windows)
-        if re.match(r"^/[A-Za-z]:/", path_str):
-            path_str = path_str[1:]
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = (WORKSPACE_ROOT / path).resolve()
-    return path
-
-
-def _is_anonymized_copy_path(path_str: str) -> bool:
-    """True, если путь указывает на анонимизированную копию (<name>.anonymized.<ext>)."""
-    try:
-        return _resolve_local_path(path_str).stem.lower().endswith(".anonymized")
-    except Exception:
-        return False
-
-
-def _result_path_for(copy_path: str) -> str:
-    """
-    Путь к «файлу результата» для анонимизированной копии.
-    <name>.anonymized.<ext> -> <name>.result.<ext> (файл результата рядом
-    с копией; копия остаётся неизменным исходником для скриптов модели).
-    """
-    path = Path(copy_path)
-    new_stem = path.stem.replace(".anonymized", ".result")
-    return str(path.with_name(new_stem + path.suffix))
 
 
 class PreparedFilesAnonymization:
@@ -1035,7 +969,7 @@ class RequestHandler:
             if info.get("fallback"):
                 lines.append(
                     "  (файл результата не был создан — де-анонимизирована "
-                    "анонимизированная копия)"
+                    "анонимизированная копия в отдельный файл результата)"
                 )
         lines += [
             "",
@@ -1057,13 +991,17 @@ class RequestHandler:
             copy_path = target.get("copy_path")
 
             # Основной источник — файл результата. Если модель его не создала
-            # (например, правила копию на месте), де-анонимизируем копию.
+            # (например, правила копию на месте), де-анонимизируем копию в
+            # отдельный <name>.result.<ext> — сама копия остаётся неизменным
+            # исходником (инвариант .clinerules).
             path = None
+            output_path = None
             fallback = False
             if Path(result_path).is_file():
                 path = result_path
             elif copy_path and Path(copy_path).is_file():
                 path = copy_path
+                output_path = _result_path_for(copy_path)
                 fallback = True
 
             if path is None:
@@ -1074,10 +1012,10 @@ class RequestHandler:
                 continue
             try:
                 result = await self.handle_deanonymize_file(
-                    session_id=sid, file_path=path
+                    session_id=sid, file_path=path, output_path=output_path
                 )
                 files_info.append({
-                    "file_path": path,
+                    "file_path": result.get("file_path", path),
                     "mappings_count": result.get("mappings_count", 0),
                     "fallback": fallback,
                 })
@@ -2160,20 +2098,25 @@ class RequestHandler:
                 session_id, original_value, entity_type
             )
 
-        entities, _ = await self.ner.extract_entities(parsed.text, use_llm=True)
+        entities, _, llm_failed = await self.ner.extract_entities_detailed(
+            parsed.text, use_llm=True
+        )
+        if llm_failed:
+            raise NERUnavailableError(
+                "NER-модель (LM Studio) недоступна или не вернула результат — "
+                "анонимизация файла не выполнена"
+            )
 
-        # Маппинг value -> token для анонимизации markdown-представления
-        value_to_token: dict[str, str] = {}
-        for e in entities:
-            if e.text not in value_to_token:
-                value_to_token[e.text] = await add_mapping(e.text, e.type)
-
-        anon_text, _ = await self.text_replacer.anonymize(
+        anon_text, mappings = await self.text_replacer.anonymize(
             parsed.text, entities, add_mapping
         )
         anon_content = await self.file_assembler.assemble(
             content, path.name, anon_text, parsed.structure
         )
+
+        # Маппинг value -> token берём из результата анонимизации (без
+        # повторного обхода add_mapping) — он нужен для markdown-представления.
+        value_to_token = {m.original_value: m.token for m in mappings}
 
         # Анонимизированный markdown (с таблицами) для review
         anon_markdown = self.text_replacer.replace_by_value(

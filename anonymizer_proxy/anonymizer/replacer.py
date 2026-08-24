@@ -41,8 +41,14 @@ class TextReplacer:
         if not valid_entities:
             return text, []
 
+        # Отбрасываем вложенные/пересекающиеся спанны: приоритет у более
+        # длинных сущностей (полное имя ценнее вложенной подстроки), иначе
+        # после замены внутреннего спанна оффсет внешнего «уезжает», и текст
+        # портится или замена пропускается.
+        non_overlapping = self._select_non_overlapping(valid_entities)
+
         # Сортируем сущности по позиции (от конца к началу для корректной замены)
-        sorted_entities = sorted(valid_entities, key=lambda e: e.start, reverse=True)
+        sorted_entities = sorted(non_overlapping, key=lambda e: e.start, reverse=True)
 
         anonymized_text = text
         mappings = []
@@ -73,6 +79,23 @@ class TextReplacer:
             )
 
         return anonymized_text, mappings
+
+    @staticmethod
+    def _select_non_overlapping(entities: list[Entity]) -> list[Entity]:
+        """Выбрать максимальный набор непересекающихся сущностей.
+
+        Приоритет — более длинные спанны (затем более ранние): вложенные
+        подстроки отбрасываются, чтобы замена по оффсетам была корректной.
+        """
+        ordered = sorted(entities, key=lambda e: (-(e.end - e.start), e.start))
+        selected: list[Entity] = []
+        occupied: list[tuple[int, int]] = []
+        for e in ordered:
+            if any(e.start < oend and e.end > ostart for ostart, oend in occupied):
+                continue
+            selected.append(e)
+            occupied.append((e.start, e.end))
+        return selected
 
     async def deanonymize(
         self,

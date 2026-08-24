@@ -141,7 +141,11 @@ async def test_anonymize_false_disables():
 
 
 async def test_fallback_to_copy():
-    """Файл результата не создан, но копия есть → де-анонимизируется копия"""
+    """Файл результата не создан, но копия есть → де-анонимизация в отдельный файл результата.
+
+    Копия остаётся нетронутым исходником (инвариант .clinerules), а
+    де-анонимизированный текст пишется в <name>.result.<ext>.
+    """
     copy_path = make_copy_file()
     result_path = Path(_result_path_for(str(copy_path)))
     try:
@@ -150,12 +154,14 @@ async def test_fallback_to_copy():
             make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
         )
         assert not handler.openrouter.captured, "облако вызвано"
-        # fallback: копия де-анонимизирована
-        assert copy_path.read_text(encoding="utf-8") == "Подписант: Иван Петров"
+        # fallback: копия НЕ тронута, результат — в отдельном файле
+        assert copy_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]", "копия изменена"
+        assert result_path.read_text(encoding="utf-8") == "Подписант: Иван Петров", "результат не де-анонимизирован"
         assert "де-анонимизирована анонимизированная копия" in resp.choices[0].message.content
-        print("TEST 4 OK: файл результата отсутствует — де-анонимизирована копия (fallback)")
+        print("TEST 4 OK: файл результата отсутствует — де-анонимизация в отдельный файл (fallback)")
     finally:
         copy_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
 
 
 async def test_both_missing_note():

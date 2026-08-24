@@ -8,6 +8,7 @@ reasoning_content) и regex-паттерны как быстрый fallback.
 вычисляются самим прокси (точное совпадение + поиск без учёта
 регистра и различия ё/е).
 """
+import asyncio
 import json
 import logging
 import re
@@ -18,6 +19,15 @@ import httpx
 from ..config import LM_STUDIO, PII_CATEGORIES
 
 logger = logging.getLogger("anonymizer_proxy.ner")
+
+
+class NERUnavailableError(ValueError):
+    """LM Studio недоступна или не вернула результат — LLM-детекция не выполнена.
+
+    Отличает «NER упал» от «NER отработал, но PII не нашёл»: в первом случае
+    анонимизацию нельзя считать выполненной, и поток обязан сообщить об ошибке,
+    а не молча выдать «0 сущностей».
+    """
 
 # Regex-паттерны для быстрого детекта структурированных данных
 REGEX_PATTERNS = {
@@ -104,8 +114,6 @@ NER_SYSTEM_PROMPT = """Ты — система распознавания име
 8. Даты, номера версий и этапов — НЕ MONEY; MONEY — только денежные суммы.
 9. Каждое уникальное значение достаточно указать ОДИН раз. Позицию (оффсеты)
    указывать НЕ нужно — точные позиции в тексте программа определит сама.
-10. Если перед ответом ты рассуждаешь (thinking) — рассуждай кратко, не
-    перечисляй символы текста по одному, и обязательно заверши итоговым JSON.
 11. Возвращай результат СТРОГО в JSON формате.
 
 Формат ответа:
@@ -210,20 +218,24 @@ class NERService:
 
         return None
 
-    async def _extract_llm_entities(self, text: str) -> list:
+    async def _extract_llm_entities(self, text: str) -> tuple[list, bool]:
         """
-        Извлечь сущности с помощью LM Studio (точный метод)
+        Извлечь сущности с помощью LM Studio (точный метод).
 
         Текст длиннее LM_STUDIO["max_input_chars"] разбивается на чанки
         с перекрытием (см. _split_into_chunks); результаты всех чанков
         переносятся в координаты исходного текста и дедуплицируются
         (зона перекрытия может дать одинаковые сущности).
+
+        Возвращает (сущности, llm_failed). llm_failed=True, если LM Studio
+        недоступна или хотя бы один чанк не дал результата (обрыв соединения,
+        таймаут, отсутствие JSON) — LLM-детекция считается невыполненной.
         """
         from ..models.schemas import Entity
 
         if not await self.check_lm_studio():
             logger.info("LM Studio недоступен, пропускаем LLM-извлечение")
-            return []
+            return [], True
 
         max_input = max(1000, LM_STUDIO["max_input_chars"])
         chunks = self._split_into_chunks(text, max_input)
@@ -233,10 +245,29 @@ class NERService:
                 len(text), max_input, len(chunks),
             )
 
+        # Обработка чанков с ограничением числа одновременных запросов
+        # (ner_parallel). По умолчанию 1 (последовательно): конкурентные запросы
+        # к LM Studio могут вешать модель. asyncio.gather сохраняет порядок
+        # результатов — дедупликация ниже остаётся детерминированной.
+        ner_parallel = max(1, int(LM_STUDIO.get("ner_parallel", 1)))
+        sem = asyncio.Semaphore(ner_parallel)
+
+        async def process(chunk_text: str):
+            async with sem:
+                return await self._llm_ner_once(chunk_text)
+
+        chunk_results = await asyncio.gather(
+            *(process(chunk_text) for chunk_text, _offset in chunks)
+        )
+
         all_entities: list = []
+        llm_failed = False
         seen: set = set()
-        for chunk_index, (chunk_text, chunk_offset) in enumerate(chunks):
-            chunk_entities = await self._llm_ner_once(chunk_text)
+        for chunk_index, (
+            (_chunk_text, chunk_offset), (chunk_entities, ok)
+        ) in enumerate(zip(chunks, chunk_results)):
+            if not ok:
+                llm_failed = True
             for ent in chunk_entities:
                 # Перенос оффсетов из координат чанка в координаты текста
                 shifted = Entity(
@@ -257,7 +288,7 @@ class NERService:
                     chunk_index + 1, len(chunks), len(chunk_entities),
                 )
 
-        return all_entities
+        return all_entities, llm_failed
 
     def _split_into_chunks(self, text: str, max_chars: int) -> list[tuple[str, int]]:
         """
@@ -389,18 +420,19 @@ class NERService:
 
         return None
 
-    async def _llm_ner_once(self, chunk_text: str) -> list:
+    async def _llm_ner_once(self, chunk_text: str) -> tuple[list, bool]:
         """
         Один NER-вызов к LM Studio по фрагменту текста.
 
         Поддерживает thinking-режим: если итоговый ответ в content пуст,
         JSON ищется в reasoning_content. Модель возвращает только text и
         type сущностей; оффсеты вычисляются прокси (_locate_entity).
-        Возвращает сущности с оффсетами относительно chunk_text.
+
+        Возвращает (сущности, ok) — сущности с оффсетами относительно
+        chunk_text и признак успеха LLM-вызова (False при обрыве соединения,
+        таймауте или отсутствии JSON).
         """
         from ..models.schemas import Entity
-
-        client = await self._get_client()
 
         logger.info("Отправляем запрос в LM Studio (%d символов)...", len(chunk_text))
 
@@ -415,17 +447,13 @@ class NERService:
                 "max_tokens": LM_STUDIO["max_tokens"],
             }
 
-            response = await client.post(
-                f"{LM_STUDIO['base_url']}/chat/completions",
-                json=payload
-            )
-
-            if response.status_code != 200:
-                logger.warning("LM Studio вернул ошибку %s: %s", response.status_code, response.text[:200])
-                return []
+            result = await self._request_ner(payload)
+            if result is None:
+                # Таймаут или ошибка соединения: соединение с LM Studio уже
+                # разорвано (см. _http_post_json), модель остановлена.
+                return [], False
 
             logger.info("LM Studio ответил успешно")
-            result = response.json()
             choice = result["choices"][0]
             message = choice.get("message") or {}
             content = message.get("content") or ""
@@ -446,7 +474,7 @@ class NERService:
                     "увеличьте Reasoning budget в LM Studio или NER_MAX_TOKENS",
                     choice.get("finish_reason"), not content, len(reasoning),
                 )
-                return []
+                return [], False
 
             logger.info("Разобран ответ модели из поля %s: %d сущностей",
                         source, len(entities_data))
@@ -486,11 +514,181 @@ class NERService:
             if skipped:
                 logger.warning("Отброшено сущностей (текст не найден): %d", skipped)
 
-            return entities
+            return entities, True
 
         except Exception as e:
             logger.error("Ошибка при вызове LM Studio: %s", e)
-            return []
+            return [], False
+
+    async def _request_ner(self, payload: dict) -> Optional[dict]:
+        """Отправить NER-запрос в LM Studio и вернуть распарсенный JSON-ответ.
+
+        Вынесено в отдельный метод для подмены в тестах. В продакшене запрос
+        выполняется через ``_http_post_json`` — сырой asyncio-сокет с жёстким
+        таймаутом, который при таймауте гарантированно разрывает соединение.
+        """
+        return await self._http_post_json(payload)
+
+    async def _http_post_json(self, payload: dict) -> Optional[dict]:
+        """POST JSON в LM Studio через сырой asyncio-сокет.
+
+        По истечении ``NER_TIMEOUT_SECONDS`` сокет закрывается, поэтому
+        LM Studio получает разрыв соединения и останавливает генерацию.
+        Возвращает распарсенный JSON-ответ (dict) при HTTP 200, иначе None.
+        """
+        from urllib.parse import urlsplit
+
+        base_url = LM_STUDIO["base_url"]
+        parts = urlsplit(base_url)
+        scheme = (parts.scheme or "http").lower()
+        if scheme != "http":
+            logger.warning("LM Studio поддерживает только http:// (получен %r)", scheme)
+            return None
+        host = parts.hostname
+        if not host:
+            logger.warning("Некорректный LM_STUDIO_URL: %r", base_url)
+            return None
+        port = parts.port or 80
+        base_path = parts.path.rstrip("/") or ""
+        path = f"{base_path}/chat/completions"
+        timeout = float(LM_STUDIO["timeout"])
+        connect_timeout = min(timeout, 15.0)
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request_bytes = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            "Accept: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("utf-8") + body
+
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=connect_timeout
+            )
+            writer.write(request_bytes)
+            await asyncio.wait_for(writer.drain(), timeout=connect_timeout)
+
+            status_code, body_bytes = await asyncio.wait_for(
+                self._read_http_response(reader), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "ТАЙМАУТ NER через %.0fс — разрываю соединение с LM Studio, "
+                "чтобы модель остановила генерацию", timeout,
+            )
+            await self._close_writer(writer)
+            return None
+        except Exception as e:
+            logger.error("Ошибка при обращении к LM Studio: %s", e)
+            await self._close_writer(writer)
+            return None
+
+        await self._close_writer(writer)
+
+        if status_code != 200:
+            logger.warning(
+                "LM Studio вернул ошибку %s: %.200s",
+                status_code, body_bytes.decode("utf-8", "replace"),
+            )
+            return None
+        try:
+            result = json.loads(body_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("LM Studio вернул некорректный JSON")
+            return None
+        if not isinstance(result, dict):
+            logger.warning("LM Studio вернул неожиданный JSON-ответ")
+            return None
+        return result
+
+    async def _read_http_response(self, reader) -> tuple[int, bytes]:
+        """Прочитать HTTP-ответ: (статус, тело).
+
+        Поддерживает Content-Length, chunked и ответ до закрытия соединения.
+        """
+        head = await self._read_until(reader, b"\r\n\r\n")
+        status_code = 0
+        headers: dict = {}
+        try:
+            lines = head.decode("latin-1", "replace").split("\r\n")
+        except Exception:
+            lines = []
+        if lines:
+            parts = lines[0].split(" ")
+            if len(parts) >= 2:
+                try:
+                    status_code = int(parts[1])
+                except ValueError:
+                    status_code = 0
+        for line in lines[1:]:
+            if ":" in line:
+                key, _, value = line.partition(":")
+                headers[key.strip().lower()] = value.strip()
+
+        transfer = headers.get("transfer-encoding", "").lower()
+        if "chunked" in transfer:
+            body = await self._read_chunked_body(reader)
+        else:
+            content_length = None
+            try:
+                content_length = int(headers.get("content-length", ""))
+            except (TypeError, ValueError):
+                content_length = None
+            if content_length is not None:
+                body = await reader.readexactly(content_length)
+            else:
+                body = await reader.read(-1)
+
+        return status_code, body
+
+    async def _read_chunked_body(self, reader) -> bytes:
+        """Прочитать тело ответа в chunked-кодировании."""
+        chunks = []
+        while True:
+            size_line = (await self._read_until(reader, b"\r\n")).strip()
+            try:
+                size = int(size_line.split(b";", 1)[0], 16)
+            except (ValueError, IndexError):
+                break
+            if size == 0:
+                # Хвост: trailer-заголовки + закрытие (Connection: close)
+                await reader.read(-1)
+                break
+            chunks.append(await reader.readexactly(size))
+            await reader.readexactly(2)  # CRLF после чанка
+        return b"".join(chunks)
+
+    @staticmethod
+    async def _read_until(reader, delimiter: bytes) -> bytes:
+        """Читать из потока до появления delimiter (включительно)."""
+        buffer = b""
+        while delimiter not in buffer:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            buffer += chunk
+        return buffer
+
+    @staticmethod
+    async def _close_writer(writer) -> None:
+        """Закрыть сокет; при сбое штатного закрытия — принудительный abort."""
+        if writer is None:
+            return
+        try:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except Exception:
+                transport = getattr(writer, "transport", None)
+                if transport is not None:
+                    transport.abort()
+        except Exception:
+            pass
 
     def _merge_entities(self, regex_entities: list, llm_entities: list) -> list:
         """Объединить результаты от regex и LLM, убирая дубликаты"""
@@ -656,15 +854,35 @@ class NERService:
         Returns:
             Кортеж (список сущностей, время обработки в мс)
         """
+        entities, processing_time, _ = await self.extract_entities_detailed(
+            text, use_llm
+        )
+        return entities, processing_time
+
+    async def extract_entities_detailed(
+        self,
+        text: str,
+        use_llm: bool = True
+    ) -> tuple[list, float, bool]:
+        """
+        Извлечь сущности из текста; дополнительно возвращает llm_failed.
+
+        Returns:
+            Кортеж (список сущностей, время обработки в мс, llm_failed).
+            llm_failed=True — LLM-детекция не выполнена (LM Studio недоступна,
+            обрыв соединения или нет JSON), значит результат неполон и его
+            нельзя считать «анонимизировано».
+        """
         start_time = time.time()
 
         # Уровень 1: Regex (всегда)
         regex_entities = self._extract_regex_entities(text)
 
         # Уровень 2: LLM (если включено и доступно)
-        llm_entities = []
+        llm_entities: list = []
+        llm_failed = False
         if use_llm:
-            llm_entities = await self._extract_llm_entities(text)
+            llm_entities, llm_failed = await self._extract_llm_entities(text)
 
         # Объединяем результаты
         merged_entities = self._merge_entities(regex_entities, llm_entities)
@@ -680,7 +898,7 @@ class NERService:
 
         processing_time = (time.time() - start_time) * 1000
 
-        return all_entities, processing_time
+        return all_entities, processing_time, llm_failed
 
     async def close(self):
         """Закрыть HTTP клиент"""

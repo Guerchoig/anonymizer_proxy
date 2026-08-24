@@ -25,37 +25,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from anonymizer_proxy.anonymizer.ner_service import NERService, NER_SYSTEM_PROMPT
 
 
-class FakeResponse:
-    def __init__(self, body, status_code=200):
-        self._body = body
-        self.status_code = status_code
-
-    def json(self):
-        return self._body
-
-
-class FakeLMClient:
-    """Замена httpx.AsyncClient: возвращает заготовленный ответ модели"""
-
-    def __init__(self, message):
-        self.message = message
-        self.is_closed = False
-        self.captured_payload = None
-
-    async def post(self, url, json=None, **kwargs):
-        self.captured_payload = json
-        return FakeResponse({
-            "choices": [{"message": self.message, "finish_reason": "stop"}]
-        })
-
-    async def aclose(self):
-        pass
-
-
 def make_ner(message):
+    """NERService с подменённым транспортом: возвращает заготовленный ответ."""
     ner = NERService()
-    ner._client = FakeLMClient(message)
-    # Пропускаем проверку доступности (иначе был бы реальный GET)
+
+    async def fake_request(payload):
+        return {"choices": [{"message": message, "finish_reason": "stop"}]}
+
+    ner._request_ner = fake_request
+    # Пропускаем проверку доступности (иначе был бы реальный сетевой вызов)
     ner._lm_available = True
     ner._lm_checked_at = time.monotonic()
     return ner
@@ -109,7 +87,8 @@ async def test_entities_from_content():
     ner = make_ner(message)
     text = "Заявление от Ивана Петрова в ООО Ромашка"
 
-    ents = await ner._llm_ner_once(text)
+    ents, ok = await ner._llm_ner_once(text)
+    assert ok, "LLM-вызов должен быть успешным"
     assert len(ents) == 2, ents
 
     person = [e for e in ents if e.type == "PERSON"][0]
@@ -135,7 +114,8 @@ async def test_entities_from_reasoning_content():
     ner = make_ner(message)
     text = "документ от Игнатовой Веры Анатольевны"
 
-    ents = await ner._llm_ner_once(text)
+    ents, ok = await ner._llm_ner_once(text)
+    assert ok, "LLM-вызов должен быть успешным"
     assert len(ents) == 1, ents
     assert ents[0].text == "Игнатовой Веры"
     assert text[ents[0].start:ents[0].end] == "Игнатовой Веры"
@@ -147,8 +127,9 @@ async def test_truncated_response_no_crash():
     message = {"role": "assistant", "content": "",
                "reasoning_content": "Thinking Process:\n1. Analyze... (обрезано"}
     ner = make_ner(message)
-    ents = await ner._llm_ner_once("Любой текст")
+    ents, ok = await ner._llm_ner_once("Любой текст")
     assert ents == [], ents
+    assert not ok, "обрезанный thinking — LLM-детекция должна считаться неуспешной"
     print("TEST 5 OK: обрезанный thinking — сущностей нет, без падения")
 
 

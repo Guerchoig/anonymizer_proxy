@@ -21,7 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage, Entity
+from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
+
+# Тесты проверяют полный цикл анонимизации — не зависеть от ANONYMIZER_MODE в .env
+handlers_module.CURRENT_MODE = "full"
 
 
 # ==================== Фейки (без LM Studio и сети) ====================
@@ -47,6 +51,10 @@ class FakeNER:
                 start = idx + len(value)
         entities.sort(key=lambda e: e.start)
         return entities, 0
+
+    async def extract_entities_detailed(self, text: str, use_llm: bool = True):
+        entities, dt = await self.extract_entities(text, use_llm)
+        return entities, dt, False
 
 
 class FakeStore:
