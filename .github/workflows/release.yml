@@ -1,0 +1,56 @@
+# Сборка релизного архива Anonymizer Proxy для GitHub Releases.
+#
+# Срабатывает на пуш тега вида v* (например, v1.0.0):
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# Результат: в релизе появляется anonymizer-proxy-<tag>-windows.zip —
+# чистый архив репозитория без данных, секретов, окружений и PII.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Собрать чистый архив (git archive)
+        # git archive берёт ТОЛЬКО отслеживаемые файлы — .env, data/, .venv,
+        # *.docx и прочее, исключённое .gitignore, в архив не попадут.
+        # .gitattributes с export-ignore (ниже) дополнительно вырезает
+        # служебные файлы, не нужные пользователю.
+        run: |
+          $tag = ${env:GITHUB_REF_NAME}
+          $zip = "anonymizer-proxy-$tag-windows.zip"
+          git archive --format=zip --output=$zip HEAD
+          Write-Output "Собран архив: $zip"
+          # Контроль: убедиться, что в архиве нет секретов/данных
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $entries = [System.IO.Compression.ZipFile]::OpenRead($zip).Entries
+          $bad = $entries | Where-Object {
+            $_.FullName -match '(^|/)(\.env$|data/|\.venv/)' -or
+            $_.FullName -match '\.(docx|xlsx)$' -or
+            $_.FullName -match '\.db$'
+          }
+          if ($bad) {
+            Write-Error "В архив попали запрещённые файлы:"
+            $bad | ForEach-Object { Write-Error "  $($_.FullName)" }
+            exit 1
+          }
+          Write-Output "Проверка чистоты архива: OK ($($entries.Count) файлов)"
+
+      - name: Опубликовать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          files: anonymizer-proxy-${{ github.ref_name }}-windows.zip
+          generate_release_notes: true

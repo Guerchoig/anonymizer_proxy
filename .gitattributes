@@ -1,0 +1,5 @@
+# Исключить из релизных архивов (git archive) служебные файлы,
+# не нужные конечному пользователю.
+.github/ export-ignore
+.gitattributes export-ignore
+_clinerules_export_check* export-ignore
