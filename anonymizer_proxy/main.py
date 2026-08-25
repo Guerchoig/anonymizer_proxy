@@ -62,6 +62,7 @@ async def lifespan(app: FastAPI):
     logger.info("  Прокси-сервер анонимизации")
     logger.info("=" * 60)
     logger.info("  Режим: %s", CURRENT_MODE)
+    logger.info("  Интерпретатор: %s", sys.executable)
     logger.info("  NER-движок: %s (device=%s)", NER_ENGINE["model"], NER_ENGINE["device"])
     logger.info("  OpenRouter: %s", OPENROUTER["base_url"])
     logger.info("  Модель: %s", OPENROUTER["model"])
@@ -99,9 +100,22 @@ async def lifespan(app: FastAPI):
     # Прогреваем локальную NER-модель (загрузка весов при первом запуске)
     try:
         await ner_service.warmup()
-        logger.info("  [OK] NER-движок загружен")
+        logger.info("  [OK] NER-движок загружен (%s)", ner_service.backend_info())
     except Exception as exc:
-        logger.warning("  [WARN] NER-движок не загрузился (будет только regex): %s", exc)
+        # НЕ понижаем до «будет только regex»: без NER анонимизация файлов и
+        # запросов вернёт ошибку NERUnavailableError, а не ограниченный результат.
+        # Самая частая причина — сервер запущен глобальным интерпретатором,
+        # в котором нет пакета gliner (он установлен только в .venv).
+        logger.error(
+            "  [ОШИБКА] NER-движок не загрузился: %s\n"
+            "  Анонимизация файлов/запросов будет возвращать ошибку, пока это "
+            "не исправлено.\n"
+            "  Проверьте путь к интерпретатору выше: если это не "
+            ".venv\\Scripts\\python.exe — перезапустите прокси скриптом "
+            "start_proxy.cmd из корня проекта или командой:\n"
+            "    .venv\\Scripts\\python.exe -m anonymizer_proxy.main",
+            exc,
+        )
 
     logger.info("=" * 60)
 
@@ -580,6 +594,7 @@ async def health_check():
     return {
         "status": "healthy",
         "ner_available": ner_service.is_available(),
+        "ner_backend": ner_service.backend_info(),
         "mode": CURRENT_MODE,
         "timestamp": datetime.now().isoformat(),
     }
@@ -593,6 +608,7 @@ async def get_status():
         "ner_engine": {
             "available": ner_service.is_available(),
             "model": NER_ENGINE["model"],
+            "backend": ner_service.backend_info(),
             "device": NER_ENGINE["device"],
         },
         "openrouter": {

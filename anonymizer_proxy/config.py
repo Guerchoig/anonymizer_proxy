@@ -46,17 +46,28 @@ logger = setup_logging()
 # NER-движок (GLiNER) — локальная анонимизация
 NER_ENGINE = {
     "model": os.getenv("NER_MODEL", "knowledgator/gliner-pii-large-v1.0"),
-    "threshold": float(os.getenv("NER_THRESHOLD", "0.5")),
-    "device": os.getenv("NER_DEVICE", "cpu"),  # cpu | directml
+    "threshold": float(os.getenv("NER_THRESHOLD", "0.3")),
+    # Бэкенд инференса: auto|onnx — ONNX Runtime с автовыбором провайдера
+    # (CUDA → DirectML → CPU); torch — PyTorch (аварийный фоллбек,
+    # если ONNX не загрузился). При деградации в лог уходит WARNING.
+    "backend": os.getenv("NER_BACKEND", "auto").strip().lower(),
+    # Устройство для PyTorch-фоллбэка: cpu | directml
+    "device": os.getenv("NER_DEVICE", "cpu"),
     # Максимальный размер текста (символы), отдаваемый модели за один
-    # вызов. Для энкодер-моделей (окно ~512 токенов) безопасно ~2000 символов;
-    # текст длиннее режется на чанки с перекрытием.
-    "max_input_chars": int(os.getenv("NER_MAX_INPUT_CHARS", "2000")),
+    # вызов. Окно модели — 768 токенов (~2.4 симв./токен для русского):
+    # 1500 символов гарантируют, что чанк не выходит за окно и хвост
+    # не усекается молча (при 2000 сущности в конце чанка терялись).
+    "max_input_chars": int(os.getenv("NER_MAX_INPUT_CHARS", "1500")),
     # Перекрытие соседних чанков (символы) при нарезке длинного текста:
     # защищает сущности, попавшие на границу чанков
-    "chunk_overlap_chars": 200,
-    # Таймаут NER-вызова (страховочный)
+    "chunk_overlap_chars": int(os.getenv("NER_CHUNK_OVERLAP_CHARS", "200")),
+    # Таймаут NER-вызова (страховочный, применяется в GlinerEngine.predict)
     "timeout": float(os.getenv("NER_TIMEOUT_SECONDS", "300")),
+    # Второй NER-контур — Natasha/Slovnet: русский NER (PER/ORG/LOC) +
+    # yargy-извлекатель ФИО. Отключить: NER_NATASHA=0
+    "natasha": os.getenv("NER_NATASHA", "1").strip().lower() in ("1", "true", "yes", "on"),
+    # Каталог для весов Natasha/Slovnet (скачиваются при первом запуске)
+    "models_dir": str(DATA_DIR / "models"),
 }
 
 # OpenRouter (облачная модель)
@@ -102,6 +113,7 @@ CURRENT_MODE = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
 # Категории PII для детекции
 PII_CATEGORIES = {
     "PERSON": "Имена и фамилии сотрудников",
+    "SURNAME": "Фамилии (в том числе с инициалами, без имени)",
     "POSITION": "Должности (ген. директор, гл. бухгалтер)",
     "DEPARTMENT": "Подразделения (отдел кадров, цех №5)",
     "ORG": "Названия компаний и юрлиц",

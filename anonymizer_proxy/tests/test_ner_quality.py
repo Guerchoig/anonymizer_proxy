@@ -14,30 +14,56 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.models.schemas import Entity
 from anonymizer_proxy.anonymizer.ner_service import NERService
+from anonymizer_proxy.anonymizer.gliner_engine import GlinerEngine
 from anonymizer_proxy.anonymizer.replacer import TextReplacer
+
+
+class _FakeGlinerModel:
+    """Фейковая модель GLiNER: возвращает заданные сущности"""
+
+    config = type("C", (), {"max_len": 512})
+
+    def __init__(self, found):
+        self.found = found  # {значение: тип}
+
+    def predict_entities(self, text, labels, flat_ner=True, threshold=0.5, **kw):
+        ents = []
+        for value, etype in self.found.items():
+            start = 0
+            while True:
+                idx = text.find(value, start)
+                if idx == -1:
+                    break
+                ents.append({
+                    "start": idx, "end": idx + len(value),
+                    "text": value, "label": etype, "score": 0.9,
+                })
+                start = idx + len(value)
+        return ents
 
 
 def test_split_into_chunks_short():
     """Текст короче лимита идёт одним чанком без изменений"""
-    ner = NERService()
+    eng = GlinerEngine(model_name="fake/model", chunk_overlap_chars=200)
+    eng._safe_chunk_chars = 1000
     text = "Короткий текст для NER"
-    chunks = ner._split_into_chunks(text, 1000)
+    chunks = eng._split_into_chunks(text)
     assert chunks == [(text, 0)], f"получено: {chunks}"
     print("TEST 1 OK: короткий текст — один чанк")
 
 
 def test_split_into_chunks_long():
     """Длинный текст режется на чанки с перекрытием и без потерь"""
-    ner = NERService()
+    eng = GlinerEngine(model_name="fake/model", chunk_overlap_chars=200)
+    eng._safe_chunk_chars = 1000
     # ~2000+ символов из коротких строк (как строки таблицы документа)
     text = "".join(f"строка {i:04d} тестовые данные\n" for i in range(80))
-    max_chars = 1000
 
-    chunks = ner._split_into_chunks(text, max_chars)
+    chunks = eng._split_into_chunks(text)
 
     assert len(chunks) > 1, "длинный текст должен быть разбит на чанки"
     for chunk_text, offset in chunks:
-        assert len(chunk_text) <= max_chars, "чанк длиннее лимита"
+        assert len(chunk_text) <= 1000, "чанк длиннее лимита"
         assert text[offset:offset + len(chunk_text)] == chunk_text, \
             "чанк не совпадает со срезом исходного текста"
     # Первый чанк начинается с нуля, последний заканчивается в конце текста
@@ -48,7 +74,7 @@ def test_split_into_chunks_long():
     # и идут только вперёд
     for (t1, o1), (t2, o2) in zip(chunks, chunks[1:]):
         assert o2 > o1, "чанки не продвигаются вперёд"
-        assert o1 + len(t1) - o2 <= 500, "перекрытие больше chunk_overlap_chars"
+        assert o1 + len(t1) - o2 <= 200, "перекрытие больше chunk_overlap_chars"
         assert o2 < o1 + len(t1), "дыра между чанками"
     # Границы выравниваются по переводам строк (кроме последнего чанка)
     for chunk_text, _ in chunks[:-1]:
@@ -236,6 +262,38 @@ def test_homoglyph_expansion():
     print("TEST 9 OK: омоглифы кириллица/латиница покрываются одним значением")
 
 
+async def test_entities_cache_hit():
+    """Повторный NER того же текста берётся из кэша, без инференса"""
+    from anonymizer_proxy.models.schemas import Entity as _Entity
+
+    class _CountingEngine:
+        """Движок-счётчик: фиксирует вызовы инференса"""
+
+        def __init__(self):
+            self.calls = 0
+
+        async def predict(self, text, categories):
+            self.calls += 1
+            idx = text.find("Иванов")
+            return [_Entity(text="Иванов", type="PERSON",
+                            start=idx, end=idx + 6, confidence=0.9)]
+
+    ner = NERService()
+    ner._engine = _CountingEngine()
+
+    text = "Документ подготовлен Ивановым для ООО «Ромашка»"
+    ents1, _, failed1 = await ner.extract_entities_detailed(text, use_llm=True)
+    ents2, _, failed2 = await ner.extract_entities_detailed(text, use_llm=True)
+
+    assert not failed1 and not failed2
+    assert ner._engine.calls == 1, f"инференс выполнен {ner._engine.calls} раз вместо 1"
+    assert len(ents1) > 0 and len(ents2) == len(ents1), "кэш вернул другой результат"
+    # Изменение текста — мимо кэша
+    await ner.extract_entities_detailed(text + " (версия 2)", use_llm=True)
+    assert ner._engine.calls == 2, "новый текст должен пройти мимо кэша"
+    print("TEST 10 OK: кэш результатов NER по тексту")
+
+
 async def main():
     test_split_into_chunks_short()
     test_split_into_chunks_long()
@@ -246,6 +304,7 @@ async def main():
     await test_full_pipeline_all_occurrences_replaced()
     test_quoted_core_expansion()
     test_homoglyph_expansion()
+    await test_entities_cache_hit()
     print("\nALL NER QUALITY TESTS PASSED")
 
 

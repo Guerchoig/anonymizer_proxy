@@ -2057,7 +2057,8 @@ class RequestHandler:
                 parsed.text, mappings_dict
             )
             assembled = await self.file_assembler.assemble(
-                original, path.name, deanonymized_text, parsed.structure
+                original, path.name, deanonymized_text, parsed.structure,
+                strip_hf_images=False, scrub_metadata=False,
             )
             target.write_bytes(assembled)
         else:

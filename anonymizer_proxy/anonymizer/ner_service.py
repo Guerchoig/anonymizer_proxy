@@ -6,6 +6,7 @@ NER-сервис для извлечения именованных сущнос
 GLiNER возвращает сам; для устойчивости сохранён поиск без учёта
 регистра и различия ё/е.
 """
+import hashlib
 import logging
 import re
 import time
@@ -13,6 +14,7 @@ from typing import Optional
 
 from ..config import NER_ENGINE, PII_CATEGORIES
 from .gliner_engine import GlinerEngine
+from .natasha_engine import NatashaEngine
 
 logger = logging.getLogger("anonymizer_proxy.ner")
 
@@ -37,6 +39,25 @@ REGEX_PATTERNS = {
         # Российские телефоны
         r"(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}",
         r"8\s*\d{3}\s*\d{3}\s*\d{2}\s*\d{2}",
+    ],
+    "PERSON": [
+        # Русские ФИО с инициалами — детерминированная страховка: модель
+        # пропускала «Фамилия И.О.» в подписях документов (скор ниже порога).
+        # Записи кортежем (паттерн, флаги): 0 = с учётом регистра, чтобы
+        # не ловить обычные слова и аббревиатуры.
+        # «Вдовин Д.В.» / «Вдовин Д. В.» (фамилия перед инициалами)
+        (
+            r"\b[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.",
+            0,
+        ),
+        # «Д.В. Вдовин» / «Д. В. Вдовин» (инициалы перед фамилией).
+        # Разделитель перед фамилией — только пробел/табуляция ([ \t]), не
+        # \s: иначе «Д.В.\nИсполнитель» матчится как «инициалы+фамилия» и
+        # длинным ложным спаном перебивает точное «Фамилия И.О.»
+        (
+            r"\b[А-ЯЁ]\.[ \t]?[А-ЯЁ]\.[ \t]+[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?",
+            0,
+        ),
     ],
     "EMAIL": [
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
@@ -76,16 +97,56 @@ REGEX_PATTERNS = {
 class NERService:
     """Сервис для извлечения именованных сущностей"""
 
+    # Верхняя граница кэша результатов NER (записей sha256(text) -> сущности)
+    ENTITIES_CACHE_LIMIT = 128
+
     def __init__(self):
+        # GlinerEngine сам читает настройки из NER_ENGINE (в т.ч. перекрытие
+        # NER_CHUNK_OVERLAP_CHARS и бэкенд NER_BACKEND)
         self._engine = GlinerEngine()
+        # Второй контур — Natasha/Slovnet: русский NER + yargy-ФИО.
+        # Отключается NER_NATASHA=0; сбои Natasha не роняют анонимизацию
+        # (GLiNER + regex остаются), а пишутся в WARNING.
+        self._natasha: Optional[NatashaEngine] = (
+            NatashaEngine() if NER_ENGINE.get("natasha") else None
+        )
+        # Кэш результатов NER: sha256(text) -> список сущностей.
+        # Повторная анонимизация того же файла (новый чат/повтор запроса) не
+        # должна снова гонять модель минуты: сущности детерминированы текстом,
+        # а плейсхолдеры всё равно пересоздаются в маппингах новой сессии.
+        # Кэш в памяти процесса — сбрасывается перезапуском прокси.
+        self._entities_cache: dict[str, list] = {}
 
     async def warmup(self):
-        """Прогреть локальную NER-модель (загрузить веса)."""
+        """Прогреть NER-движки (загрузить веса)."""
         await self._engine.warmup()
+        if self._natasha:
+            try:
+                await self._natasha.warmup()
+                logger.info("Natasha-контур загружен (%s)", self.natasha_info())
+            except Exception as exc:  # Natasha не критична: GLiNER + regex остаются
+                logger.warning(
+                    "Natasha-контур не загрузился (анонимизация продолжит "
+                    "работать на GLiNER + regex): %s", exc,
+                )
 
     def is_available(self) -> bool:
-        """Загружена ли локальная NER-модель."""
+        """Загружена ли основная локальная NER-модель."""
         return self._engine.is_available()
+
+    def backend_info(self) -> str:
+        """Бэкенды NER для /health и лога запуска."""
+        info = self._engine.describe()
+        if self._natasha:
+            info += f"; natasha: {self.natasha_info()}"
+        return info
+
+    def natasha_info(self) -> str:
+        """Статус Natasha-контура (для логов и /health)."""
+        if not self._natasha:
+            return "отключён"
+        return self._natasha.describe()
+
     def _extract_regex_entities(self, text: str) -> list:
         """Извлечь сущности с помощью regex-паттернов (быстрый метод)"""
         from ..models.schemas import Entity
@@ -149,38 +210,24 @@ class NERService:
         except Exception as exc:
             logger.error("NER-движок недоступен или упал: %s", exc)
             return [], True
+
+        # Второй контур (Natasha/Slovnet): русский NER + детерминированные
+        # ФИО. Сбой не делает NER «несостоявшимся» — GLiNER отработал.
+        if self._natasha:
+            try:
+                extra = await self._natasha.predict(text, categories)
+                if extra:
+                    logger.info(
+                        "Natasha-контур: %d доп. сущностей", len(extra)
+                    )
+                    entities = entities + extra
+            except Exception as exc:
+                logger.warning("Natasha-контур упал (пропускается): %s", exc)
+
         return entities, False
 
-    def _split_into_chunks(self, text: str, max_chars: int) -> list[tuple[str, int]]:
-        """
-        Разбить текст на чанки не длиннее max_chars символов каждый.
-
-        Возвращает список кортежей (кусок текста, смещение в исходном тексте).
-        Границы чанков по возможности выравниваются по переводам строк
-        (в пределах последних 20% чанка), соседние чанки перекрываются на
-        chunk_overlap_chars, чтобы сущности на границе не терялись.
-        """
-        if len(text) <= max_chars:
-            return [(text, 0)]
-
-        overlap = min(NER_ENGINE["chunk_overlap_chars"], max_chars // 2)
-        chunks: list[tuple[str, int]] = []
-        total = len(text)
-        start = 0
-        while start < total:
-            end = min(start + max_chars, total)
-            if end < total:
-                # Ищем ближайший перевод строки в последних 20% чанка,
-                # чтобы не резать посреди строки/таблицы
-                window_start = start + max_chars * 4 // 5
-                newline_pos = text.rfind("\n", window_start, end)
-                if newline_pos > start:
-                    end = newline_pos + 1
-            chunks.append((text[start:end], start))
-            if end >= total:
-                break
-            start = end - overlap
-        return chunks
+    # (Мёртвый _split_into_chunks эпохи LM Studio удалён: нарезкой чанков
+    # занимается GlinerEngine._split_into_chunks.)
 
     # Визуально неразличимые пары кириллица/латиница («1С» и «1C»,
     # «Роснефть» и «Pоснефть»): модель может вернуть вариант с другим
@@ -226,18 +273,25 @@ class NERService:
 
         for llm_ent in llm_entities:
             # Проверяем, нет ли пересечения с уже найденными
-            is_duplicate = False
-            for existing in list(all_entities):
-                # Если сущности пересекаются по позициям
-                if (llm_ent.start <= existing.end and llm_ent.end >= existing.start):
-                    # Оставляем ту, что длиннее (более полная)
-                    if len(llm_ent.text) > len(existing.text):
-                        all_entities.remove(existing)
-                    else:
-                        is_duplicate = True
-                    break
+            overlapping = [
+                existing
+                for existing in all_entities
+                if llm_ent.start <= existing.end and llm_ent.end >= existing.start
+            ]
+            if overlapping:
+                # LLM-спан, накрывающий НЕСКОЛЬКО точных сущностей (например,
+                # «Вдовин Д.В.\nИсполнитель\nНестеркин Ю.В.»), не заменяет их:
+                # он «съедает» промежуточные слова документа. Точные оставляем.
+                if len(overlapping) > 1:
+                    continue
+                existing = overlapping[0]
+                # Иначе оставляем ту, что длиннее (более полную)
+                if len(llm_ent.text) > len(existing.text):
+                    all_entities.remove(existing)
+                    all_entities.append(llm_ent)
+                # если существующая длиннее или равна — дубликат, пропускаем
 
-            if not is_duplicate:
+            else:
                 all_entities.append(llm_ent)
 
         # Сортируем по позиции в тексте
@@ -394,6 +448,19 @@ class NERService:
         """
         start_time = time.time()
 
+        # Кэш результатов NER по sha256(text): повторная анонимизация того же
+        # текста (файла) не должна снова гонять модель минуту+.
+        cache_key = None
+        if use_llm:
+            cache_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            cached = self._entities_cache.get(cache_key)
+            if cached is not None:
+                logger.info(
+                    "NER: кэш-попадание по тексту (%d сущностей) — инференс пропущен",
+                    len(cached),
+                )
+                return list(cached), 0.0, False
+
         # Уровень 1: Regex (всегда)
         regex_entities = self._extract_regex_entities(text)
 
@@ -417,11 +484,26 @@ class NERService:
 
         processing_time = (time.time() - start_time) * 1000
 
+        # Кэшируем только успешные прогоны (llm_failed=True — результат неполон)
+        if cache_key is not None and not llm_failed:
+            self._store_entities_cache(cache_key, all_entities)
+
         return all_entities, processing_time, llm_failed
+
+    def _store_entities_cache(self, key: str, entities: list) -> None:
+        """Сохранить результат NER в кэш (FIFO-ограничение размера)."""
+        if len(self._entities_cache) >= self.ENTITIES_CACHE_LIMIT:
+            self._entities_cache.pop(next(iter(self._entities_cache)), None)
+        self._entities_cache[key] = list(entities)
 
     async def close(self):
         """Освободить ресурсы"""
         await self._engine.close()
+        if self._natasha:
+            try:
+                await self._natasha.close()
+            except Exception:
+                pass
 
 
 
