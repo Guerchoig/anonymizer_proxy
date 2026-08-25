@@ -1,12 +1,12 @@
 # Сборка релизных архивов Anonymizer Proxy для GitHub Releases.
 #
-# Срабатывает на пуш тега вида v* (например, v1.0.0):
+# Срабатывает на пуш тега вида v* (например, v1.0.2):
 #   git tag v1.0.2
 #   git push origin v1.0.2
 #
 # Результат: в релизе появляются anonymizer-proxy-<tag>-windows.zip и
-# anonymizer-proxy-<tag>-macos.zip (содержимое архивов одинаковое — исходники
-# проекта; отдельные файлы для удобства пользователей каждой платформы).
+# anonymizer-proxy-<tag>-macos.zip. Содержимое архивов одинаковое (исходники
+# проекта); отдельные файлы — для удобства пользователей каждой платформы.
 # Архивы чистые: без данных, секретов, окружений и PII.
 
 name: Release
@@ -21,35 +21,32 @@ permissions:
 
 jobs:
   release:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            name: windows
-          - os: macos-latest
-            name: macos
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Собрать чистый архив (git archive)
+      - name: Собрать чистые архивы (git archive)
         # git archive берёт ТОЛЬКО отслеживаемые файлы — .env, data/, .venv,
         # *.docx и прочее, исключённое .gitignore, в архив не попадут.
         # .gitattributes с export-ignore дополнительно вырезает служебные
         # файлы, не нужные пользователю.
         shell: bash
         env:
-          ZIP_NAME: anonymizer-proxy-${{ github.ref_name }}-${{ matrix.name }}.zip
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          git archive --format=zip --output="$ZIP_NAME" HEAD
-          echo "Собран архив: $ZIP_NAME"
-          python3 scripts/release_check.py "$ZIP_NAME"
+          for platform in windows macos; do
+            zip_name="anonymizer-proxy-${TAG}-${platform}.zip"
+            git archive --format=zip --output="$zip_name" HEAD
+            echo "Собран архив: $zip_name"
+            python3 scripts/release_check.py "$zip_name"
+          done
 
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v3
         with:
-          files: anonymizer-proxy-${{ github.ref_name }}-${{ matrix.name }}.zip
+          files: |
+            anonymizer-proxy-${{ github.ref_name }}-windows.zip
+            anonymizer-proxy-${{ github.ref_name }}-macos.zip
           generate_release_notes: true
