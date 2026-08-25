@@ -1,0 +1,87 @@
+[project]
+name = "anonymizer-proxy"
+version = "1.0.0"
+description = "Локальный прокси-сервер анонимизации запросов к облачным LLM (OpenAI-совместимый API для Cline)"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # HTTP клиенты
+    "httpx>=0.28.0",
+    # Парсинг документов
+    "python-docx>=1.1.0",      # DOCX (Word)
+    "openpyxl>=3.1.0",         # XLSX (Excel)
+    # NLP (NER-движок)
+    "gliner>=0.2.28",          # GLiNER: компактная локальная NER-модель (тянет torch, transformers)
+    "natasha>=1.6.0",          # Natasha/Slovnet: русский NER (PER/ORG/LOC) + yargy-ФИО
+    "navec>=0.10.0",           # Компактные русские эмбеддинги для Slovnet
+    "setuptools>=75.0,<81",    # pkg_resources нужен pymorphy2 (в setuptools 81+ удалён)
+    # Схемы данных
+    "pydantic>=2.0.0",
+    # Async SQLite
+    "aiosqlite>=0.20.0",
+    # Загрузка файлов
+    "python-multipart>=0.0.18",
+    # Утилиты
+    "python-dotenv>=1.0.0",
+]
+
+# Инференс GLiNER — РОВНО ОДИН extra на машину (установщик выбирает сам,
+# код не меняется: провайдер подбирается автоматически CUDA → DirectML → CPU).
+# Установка: uv sync --locked --extra cpu | cuda | directml
+#
+# onnxruntime / onnxruntime-gpu / onnxruntime-directml — конфликтующие
+# дистрибутивы (все ставят пакет `onnxruntime`). gliner тянет голый
+# `onnxruntime` без ограничений, поэтому в cuda/directml-варианте его нужно
+# подменить соответствующей сборкой — это делает [tool.uv] ниже.
+[project.optional-dependencies]
+cpu = [
+    # Свежая версия: лучше на CPU и совместима с gliner (проверено на 1.29.0).
+    "onnxruntime>=1.24.4",
+]
+cuda = [
+    # ВАЖНО: onnxruntime-gpu 1.25+ собран под CUDA 13, DLL которого не
+    # распространяются через pip — держим пин 1.24.4.
+    "onnxruntime-gpu==1.24.4; sys_platform != 'darwin'",
+    "nvidia-cublas-cu12; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12; sys_platform != 'darwin'",
+    "nvidia-cufft-cu12; sys_platform != 'darwin'",
+    "nvidia-cuda-runtime-cu12; sys_platform != 'darwin'",
+]
+directml = [
+    # AMD/Intel GPU и NPU (только Windows)
+    "onnxruntime-directml>=1.24.4; sys_platform == 'win32'",
+]
+
+[tool.uv]
+# Проект НЕ устанавливается как пакет: скрипты запускаются из корня репозитория
+# (python -m anonymizer_proxy.main), uv управляет только зависимостями.
+package = false
+
+# extras cpu/cuda/directml взаимоисключающие: попытка включить два сразу —
+# ошибка резолва, а не молчаливая поломка.
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "directml" },
+    ],
+    [
+        { extra = "cuda" },
+        { extra = "directml" },
+    ],
+]
+
+# gliner тянет голый `onnxruntime` (CPU), а onnxruntime-gpu/directml с версии
+# 1.20+ НЕ объявляют Provides-Dist: onnxruntime — поэтому резолвер ставил бы
+# CPU-пакет поверх GPU-сборки и молча убивал ускорение. Убираем у gliner
+# требование onnxruntime (соответствующая сборка задаётся в extras ниже).
+exclude-dependencies = [
+    { package = { name = "gliner" }, dependencies = ["onnxruntime"] },
+]

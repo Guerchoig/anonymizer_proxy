@@ -1,5 +1,10 @@
 # Прокси-сервер анонимизации для облачных LLM
 # Зависимости Python
+#
+# ВНИМАНИЕ: канонический источник зависимостей — pyproject.toml (+ uv.lock).
+# Установка для пользователей выполняется через install.cmd / install.sh
+# (uv sync --locked --extra cpu|cuda|directml). Этот файл оставлен для
+# совместимости с ручной установкой через pip и отражает только CPU-вариант.
 
 # Web framework
 fastapi>=0.115.0
@@ -15,6 +20,19 @@ openpyxl>=3.1.0         # XLSX (Excel)
 
 # NLP (NER-движок)
 gliner>=0.2.28          # GLiNER: компактная локальная NER-модель (тянет torch, transformers)
+natasha>=1.6.0           # Natasha/Slovnet: русский NER (PER/ORG/LOC) + yargy-ФИО (2-й контур детекции)
+navec>=0.10.0            # Компактные русские эмбеддинги для Slovnet (весов ~50 МБ)
+setuptools>=75.0,<81     # pkg_resources нужен pymorphy2 (в setuptools 81+ удалён)
+
+# Инференс GLiNER — РОВНО ОДИН из вариантов (код не меняется, провайдер
+# подбирается автоматически: CUDA → DirectML → CPU):
+#   CPU (базовый):       onnxruntime
+#   NVIDIA GPU (CUDA):   pip uninstall onnxruntime
+#                        pip install onnxruntime-gpu==1.24.4 nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-cuda-runtime-cu12
+#                        (ВАЖНО: onnxruntime-gpu 1.25+ требует CUDA 13, DLL для которого
+#                         не распространяются через pip — держите пин 1.24.4)
+#   AMD/Intel GPU и NPU: onnxruntime-directml
+onnxruntime>=1.24.4
 
 # Схемы данных
 pydantic>=2.0.0
