@@ -1,11 +1,13 @@
-# Сборка релизного архива Anonymizer Proxy для GitHub Releases.
+# Сборка релизных архивов Anonymizer Proxy для GitHub Releases.
 #
 # Срабатывает на пуш тега вида v* (например, v1.0.0):
-#   git tag v1.0.0
-#   git push origin v1.0.0
+#   git tag v1.0.2
+#   git push origin v1.0.2
 #
-# Результат: в релизе появляется anonymizer-proxy-<tag>-windows.zip —
-# чистый архив репозитория без данных, секретов, окружений и PII.
+# Результат: в релизе появляются anonymizer-proxy-<tag>-windows.zip и
+# anonymizer-proxy-<tag>-macos.zip (содержимое архивов одинаковое — исходники
+# проекта; отдельные файлы для удобства пользователей каждой платформы).
+# Архивы чистые: без данных, секретов, окружений и PII.
 
 name: Release
 
@@ -19,38 +21,35 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Собрать чистый архив (git archive)
         # git archive берёт ТОЛЬКО отслеживаемые файлы — .env, data/, .venv,
         # *.docx и прочее, исключённое .gitignore, в архив не попадут.
-        # .gitattributes с export-ignore (ниже) дополнительно вырезает
-        # служебные файлы, не нужные пользователю.
+        # .gitattributes с export-ignore дополнительно вырезает служебные
+        # файлы, не нужные пользователю.
+        shell: bash
+        env:
+          ZIP_NAME: anonymizer-proxy-${{ github.ref_name }}-${{ matrix.name }}.zip
         run: |
-          $tag = ${env:GITHUB_REF_NAME}
-          $zip = "anonymizer-proxy-$tag-windows.zip"
-          git archive --format=zip --output=$zip HEAD
-          Write-Output "Собран архив: $zip"
-          # Контроль: убедиться, что в архиве нет секретов/данных
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $entries = [System.IO.Compression.ZipFile]::OpenRead($zip).Entries
-          $bad = $entries | Where-Object {
-            $_.FullName -match '(^|/)(\.env$|data/|\.venv/)' -or
-            $_.FullName -match '\.(docx|xlsx)$' -or
-            $_.FullName -match '\.db$'
-          }
-          if ($bad) {
-            Write-Error "В архив попали запрещённые файлы:"
-            $bad | ForEach-Object { Write-Error "  $($_.FullName)" }
-            exit 1
-          }
-          Write-Output "Проверка чистоты архива: OK ($($entries.Count) файлов)"
+          set -euo pipefail
+          git archive --format=zip --output="$ZIP_NAME" HEAD
+          echo "Собран архив: $ZIP_NAME"
+          python3 scripts/release_check.py "$ZIP_NAME"
 
       - name: Опубликовать релиз
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          files: anonymizer-proxy-${{ github.ref_name }}-windows.zip
+          files: anonymizer-proxy-${{ github.ref_name }}-${{ matrix.name }}.zip
           generate_release_notes: true
