@@ -115,12 +115,20 @@ if (Test-Path ".env") {
     $token = [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
     (Get-Content ".env" -Raw) -replace "PROXY_API_TOKEN=REPLACE_WITH_RANDOM_TOKEN", "PROXY_API_TOKEN=$token" | Set-Content ".env" -NoNewline -Encoding UTF8
     Write-Host "Создан .env, сгенерирован PROXY_API_TOKEN."
-    $key = Read-Host "Введите OPENROUTER_API_KEY (sk-or-v1-…) или Enter, чтобы задать позже"
-    if ($key) {
+    while ($true) {
+        $key = (Read-Host "Введите OPENROUTER_API_KEY (sk-or-v1-…), Enter — пропустить").Trim()
+        if (-not $key) {
+            Write-Host "[ВНИМАНИЕ] Ключ не задан: анонимизация работать будет, а вот запросы к облаку упадут с 401." -ForegroundColor Yellow
+            Write-Host "Впишите ключ с https://openrouter.ai/keys в .env и перезапустите прокси." -ForegroundColor Yellow
+            break
+        }
+        if ($key -notmatch '^sk-or-[A-Za-z0-9\-]{20,}$') {
+            Write-Host "Ключ должен начинаться с sk-or- и состоять из латиницы/цифр/дефисов. Проверьте вставку и попробуйте ещё раз." -ForegroundColor Yellow
+            continue
+        }
         (Get-Content ".env" -Raw) -replace "OPENROUTER_API_KEY=sk-or-v1-REPLACE_WITH_YOUR_KEY", "OPENROUTER_API_KEY=$key" | Set-Content ".env" -NoNewline -Encoding UTF8
         Write-Host "Ключ OpenRouter записан."
-    } else {
-        Write-Host "Ключ не задан — прокси запустится, но облачные запросы не пойдут (можно задать позже в .env)."
+        break
     }
 }
 

@@ -66,6 +66,18 @@ async def lifespan(app: FastAPI):
     logger.info("  NER-движок: %s (device=%s)", NER_ENGINE["model"], NER_ENGINE["device"])
     logger.info("  OpenRouter: %s", OPENROUTER["base_url"])
     logger.info("  Модель: %s", OPENROUTER["model"])
+
+    # Раннее предупреждение: без валидного ключа облако ответит 401 «User not found»
+    _api_key = OPENROUTER.get("api_key") or ""
+    if not _api_key or "REPLACE_WITH" in _api_key.upper():
+        logger.warning(
+            "  [ВНИМАНИЕ] OPENROUTER_API_KEY не задан (или остался плейсхолдером).\n"
+            "  Запросы к облаку будут падать с ошибкой 401 «User not found».\n"
+            "  Вставьте ключ с https://openrouter.ai/keys в файл .env\n"
+            "  и перезапустите прокси. Локальная анонимизация работает и без ключа\n"
+            "  (режим anonymize_only / passthrough с явными командами)."
+        )
+
     logger.info("  Логи: %s", LOGS_DIR)
     logger.info("=" * 60)
 

@@ -42,14 +42,25 @@ else
     # На M1–M4 torch-фоллбэк ускоряется через Metal (MPS)
     sed -i '' "s/NER_DEVICE=cpu/NER_DEVICE=mps/" .env
     echo "Создан .env, сгенерирован PROXY_API_TOKEN, NER_DEVICE=mps."
-    printf 'Введите OPENROUTER_API_KEY (sk-or-v1-…) или Enter, чтобы задать позже: '
-    read -r KEY
-    if [ -n "$KEY" ]; then
-        sed -i '' "s/OPENROUTER_API_KEY=sk-or-v1-REPLACE_WITH_YOUR_KEY/OPENROUTER_API_KEY=$KEY/" .env
-        echo "Ключ OpenRouter записан."
-    else
-        echo "Ключ не задан — можно задать позже в .env."
-    fi
+    while true; do
+        printf 'Введите OPENROUTER_API_KEY (sk-or-v1-…), Enter — пропустить: '
+        read -r KEY
+        if [ -z "$KEY" ]; then
+            echo "[ВНИМАНИЕ] Ключ не задан: анонимизация работать будет, а вот запросы"
+            echo "к облаку упадут с 401. Впишите ключ с https://openrouter.ai/keys в .env."
+            break
+        fi
+        case "$KEY" in
+            sk-or-[A-Za-z0-9-]*)
+                sed -i '' "s|OPENROUTER_API_KEY=sk-or-v1-REPLACE_WITH_YOUR_KEY|OPENROUTER_API_KEY=$KEY|" .env
+                echo "Ключ OpenRouter записан."
+                break
+                ;;
+            *)
+                echo "Ключ должен начинаться с sk-or-. Проверьте вставку и попробуйте ещё раз."
+                ;;
+        esac
+    done
 fi
 
 # ---------- 5. Прогрев моделей ----------

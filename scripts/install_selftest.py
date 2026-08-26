@@ -52,7 +52,7 @@ def check_imports() -> bool:
 
 
 def check_onnxruntime() -> bool:
-    print("==> Шаг 2/3: onnxruntime")
+    print("==> Шаг 2/4: onnxruntime")
     try:
         import onnxruntime as ort
     except ImportError as exc:
@@ -64,8 +64,59 @@ def check_onnxruntime() -> bool:
     return True
 
 
+# Предупреждения, не фейлящие установку (заполняется check_openrouter)
+WARNINGS: list[str] = []
+
+
+def check_openrouter() -> bool:
+    """Шаг 4/4: конфигурация OpenRouter.
+
+    Отсутствие/невалидность ключа НЕ фейлит установку (локальная анонимизация
+    самодостаточна), но печатается заметное предупреждение с инструкцией.
+    """
+    print("==> Шаг 4/4: OpenRouter")
+    import os
+
+    import httpx
+
+    from anonymizer_proxy.config import OPENROUTER
+
+    key = OPENROUTER.get("api_key") or ""
+    if not key or "REPLACE_WITH" in key.upper():
+        WARNINGS.append("OPENROUTER_API_KEY не задан")
+        print("    [ВНИМАНИЕ] OPENROUTER_API_KEY не задан (или остался плейсхолдером):")
+        print("    анонимизация работать будет, а вот запросы к облаку упадут с 401.")
+        print("    Вставьте ключ с https://openrouter.ai/keys в .env и перезапустите прокси.")
+        return True
+
+    # Ключ есть — пробуем живую проверку через OpenRouter (учитывая VPN-прокси)
+    proxy = os.getenv("OPENROUTER_PROXY") or None
+    try:
+        response = httpx.get(
+            "https://openrouter.ai/api/v1/auth/key",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=15,
+            proxy=proxy,
+        )
+    except Exception as exc:  # noqa: BLE001 — сеть может быть недоступна
+        WARNINGS.append("ключ не удалось проверить онлайн")
+        print(f"    [ВНИМАНИЕ] Не удалось проверить ключ онлайн ({exc}).")
+        print("    Если OpenRouter требует VPN — проверьте OPENROUTER_PROXY в .env.")
+        return True
+
+    if response.status_code == 200:
+        label = response.json().get("data", {}).get("label") or "(без имени)"
+        print(f"    OK: ключ действителен ({label})")
+        return True
+
+    WARNINGS.append(f"OpenRouter ответил {response.status_code}")
+    print(f"    [ВНИМАНИЕ] OpenRouter ответил {response.status_code}: {response.text[:120]}")
+    print("    Проверьте OPENROUTER_API_KEY в .env.")
+    return True
+
+
 def check_ner_engines() -> bool:
-    print("==> Шаг 3/3: загрузка NER-движков и пробный прогон")
+    print("==> Шаг 3/4: загрузка NER-движков и пробный прогон")
     from anonymizer_proxy.anonymizer.gliner_engine import GlinerEngine
     from anonymizer_proxy.anonymizer.natasha_engine import NatashaEngine
     from anonymizer_proxy.config import ensure_directories
@@ -106,13 +157,23 @@ def check_ner_engines() -> bool:
 
 def main() -> int:
     print("=== Самопроверка установки Anonymizer Proxy ===")
-    results = [check_imports(), check_onnxruntime(), check_ner_engines()]
+    results = [
+        check_imports(),
+        check_onnxruntime(),
+        check_ner_engines(),
+        check_openrouter(),
+    ]
     print()
-    if all(results):
-        print("ИТОГ: PASS — установка готова к работе.")
+    if not all(results):
+        print("ИТОГ: FAIL — см. сообщения выше.", file=sys.stderr)
+        return 1
+    if WARNINGS:
+        print("ИТОГ: PASS, но есть предупреждения:")
+        for warning in WARNINGS:
+            print(f"  - {warning}")
         return 0
-    print("ИТОГ: FAIL — см. сообщения выше.", file=sys.stderr)
-    return 1
+    print("ИТОГ: PASS — установка готова к работе.")
+    return 0
 
 
 if __name__ == "__main__":
