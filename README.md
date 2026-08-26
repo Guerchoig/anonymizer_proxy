@@ -80,6 +80,9 @@ Windows блокирует скрипты, скачанные из интерн�
 ./install.sh
 ```
 
+Если shell сообщит «Permission denied», выполните `bash install.sh` —
+скрипту не требуется бит исполнения.
+
 На macOS официальный пакет `onnxruntime` собран только под CPU, поэтому ставится
 CPU-вариант; ускорение на Apple Silicon даёт PyTorch-фоллбэк через Metal (MPS) —
 установщик прописывает `NER_DEVICE=mps` в `.env`.
