@@ -105,16 +105,26 @@ $py = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
 # ---------- 4. Конфигурация .env ----------
 Write-Step "Конфигурация .env"
+# Все правки .env — через [IO.File] с явной кодировкой UTF-8 БЕЗ BOM.
+# Get-Content/Set-Content в Windows PowerShell 5.1 читают файлы без BOM
+# в системной ANSI-кодировке (CP1251) и пишут UTF-8 с BOM — из-за этого
+# русский текст в .env превращался в кракозябры.
+$encNoBom = New-Object System.Text.UTF8Encoding($false)
+$envPath = Join-Path $PSScriptRoot ".env"
 if (Test-Path ".env") {
     Write-Host ".env уже существует — не трогаю (ваши настройки сохранены)."
 } else {
     Copy-Item ".env.example" ".env"
+    $content = [IO.File]::ReadAllText($envPath, $encNoBom)
+
     # PROXY_API_TOKEN — криптостойкий случайный токен
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $token = [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
-    (Get-Content ".env" -Raw) -replace "PROXY_API_TOKEN=REPLACE_WITH_RANDOM_TOKEN", "PROXY_API_TOKEN=$token" | Set-Content ".env" -NoNewline -Encoding UTF8
+    $content = $content.Replace("PROXY_API_TOKEN=REPLACE_WITH_RANDOM_TOKEN", "PROXY_API_TOKEN=$token")
+    [IO.File]::WriteAllText($envPath, $content, $encNoBom)
     Write-Host "Создан .env, сгенерирован PROXY_API_TOKEN."
+
     while ($true) {
         $key = (Read-Host "Введите OPENROUTER_API_KEY (sk-or-v1-…), Enter — пропустить").Trim()
         if (-not $key) {
@@ -126,7 +136,9 @@ if (Test-Path ".env") {
             Write-Host "Ключ должен начинаться с sk-or- и состоять из латиницы/цифр/дефисов. Проверьте вставку и попробуйте ещё раз." -ForegroundColor Yellow
             continue
         }
-        (Get-Content ".env" -Raw) -replace "OPENROUTER_API_KEY=sk-or-v1-REPLACE_WITH_YOUR_KEY", "OPENROUTER_API_KEY=$key" | Set-Content ".env" -NoNewline -Encoding UTF8
+        $content = [IO.File]::ReadAllText($envPath, $encNoBom)
+        $content = $content.Replace("OPENROUTER_API_KEY=sk-or-v1-REPLACE_WITH_YOUR_KEY", "OPENROUTER_API_KEY=$key")
+        [IO.File]::WriteAllText($envPath, $content, $encNoBom)
         Write-Host "Ключ OpenRouter записан."
         break
     }
