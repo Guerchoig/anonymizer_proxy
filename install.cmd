@@ -1,34 +1,42 @@
 @echo off
-chcp 65001 >nul
 rem ============================================================
-rem  Anonymizer Proxy — установщик Windows (обёртка install.ps1)
+rem  Anonymizer Proxy - Windows installer (wrapper for install.ps1)
 rem
-rem  Запускайте ЭТОТ файл (двойной клик), а не install.ps1:
-rem  1) он снимает пометку «скачано из интернета» (Mark of the Web),
-rem     из-за которой политика RemoteSigned требует цифровую подпись;
-rem  2) он вызывает PowerShell с -ExecutionPolicy Bypass — политика
-rem     выполнения скриптов не мешает установке.
+rem  Run THIS file (double-click), not install.ps1 directly:
+rem  1) it removes the Mark-of-the-Web flag that Windows adds to
+rem     files extracted from a downloaded ZIP (otherwise the
+rem     RemoteSigned policy demands a digital signature);
+rem  2) it invokes PowerShell with -ExecutionPolicy Bypass, so the
+rem     execution policy does not block the installation.
+rem
+rem  NOTE: keep this file ASCII-only. cmd.exe parses batch files
+rem  in the legacy OEM codepage, and UTF-8 Cyrillic text here
+rem  breaks parsing on Russian Windows.
 rem ============================================================
 cd /d "%~dp0"
 
-echo Снимаю блокировку скачанных файлов (Unblock-File)...
+echo Removing "downloaded from internet" block flags (Unblock-File)...
 powershell -NoProfile -Command "Get-ChildItem -LiteralPath '.' | Unblock-File" >nul 2>&1
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*
-if errorlevel 1 (
-    echo.
-    echo [ОШИБКА] Установка завершилась с ошибкой. Возможные причины:
-    echo.
-    echo  1^) Политика выполнения задана групповой политикой ^(AllSigned^):
-    echo     текст ошибки содержит «не может быть переопределена политикой,
-    echo     заданной на этом компьютере». Обратитесь в IT или выполните
-    echo     в PowerShell от администратора:
-    echo       Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-    echo       .\install.ps1
-    echo.
-    echo  2^) Нет доступа в интернет для скачивания uv/Python/моделей.
-    echo.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto :error
+goto :done
+
+:error
+echo.
+echo [ERROR] Installation failed. Common causes:
+echo.
+echo  1. Execution policy enforced by Group Policy (AllSigned):
+echo     the error text contains "cannot be overridden ... on this
+echo     computer". Ask your IT department, or run in PowerShell
+echo     as administrator:
+echo        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+echo        .\install.ps1
+echo.
+echo  2. No internet access for downloading uv / Python / models.
+echo.
+pause
+exit /b 1
+
+:done
 pause

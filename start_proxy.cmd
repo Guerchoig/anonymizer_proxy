@@ -1,15 +1,18 @@
 @echo off
 rem ============================================================
-rem  Запуск прокси-сервера анонимизации ТОЛЬКО через .venv.
-rem  Пакет gliner установлен только в виртуальном окружении:
-rem  запуск глобальным python.exe приводит к ошибке
-rem  «NER-модель не загрузилась» при анонимизации файлов.
+rem  Anonymizer Proxy proxy server launcher (Windows).
+rem  Runs ONLY through the project virtual environment (.venv):
+rem  dependencies (gliner, natasha, onnxruntime) are installed
+rem  there; launching with the system python.exe fails with
+rem  "NER model is not loaded".
+rem
+rem  NOTE: keep this file ASCII-only (see install.cmd).
 rem ============================================================
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [ОШИБКА] Не найдено .venv\Scripts\python.exe
-    echo Создайте окружение: python -m venv .venv ^&^& .venv\Scripts\python.exe -m pip install -r requirements.txt
+    echo [ERROR] .venv\Scripts\python.exe not found.
+    echo Run the installer first: install.cmd
     exit /b 1
 )
 
