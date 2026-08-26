@@ -2,4 +2,10 @@
 # не нужные конечному пользователю.
 .github/ export-ignore
 .gitattributes export-ignore
+
+# Переводы строк: shell-скрипты — строго LF (иначе bash падает на \r),
+# Windows batch — строго CRLF.
+*.sh text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
 _clinerules_export_check* export-ignore

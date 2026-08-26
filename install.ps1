@@ -17,6 +17,54 @@ function Write-Step([string]$msg) {
     Write-Host "==> $msg" -ForegroundColor Cyan
 }
 
+# ---------- 0. Системные требования ----------
+Write-Step "Проверка системных требований"
+
+# Архитектура и ОС: только 64-разрядная Windows 10+
+if (-not [Environment]::Is64BitOperatingSystem) {
+    Write-Host "[ОШИБКА] Требуется 64-разрядная Windows." -ForegroundColor Red
+    exit 1
+}
+$ver = [Environment]::OSVersion.Version
+if ($ver.Major -lt 10) {
+    Write-Host "[ОШИБКА] Требуется Windows 10 или новее (обнаружена $($ver.Major).$($ver.Minor))." -ForegroundColor Red
+    exit 1
+}
+Write-Host ("ОС: Windows {0}.{1}, x64" -f $ver.Major, $ver.Minor)
+
+# Оперативная память: минимум 8 ГБ (рекомендуется 16)
+$ramGb = [math]::Round((Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+if ($ramGb -lt 8) {
+    Write-Host "[ОШИБКА] Недостаточно оперативной памяти: ${ramGb} ГБ (минимум 8 ГБ)." -ForegroundColor Red
+    exit 1
+}
+elseif ($ramGb -lt 16) {
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] ОЗУ ${ramGb} ГБ — работать будет, но рекомендуется 16 ГБ." -ForegroundColor Yellow
+}
+else {
+    Write-Host "ОЗУ: ${ramGb} ГБ"
+}
+
+# Свободное место на диске проекта: минимум 10 ГБ (рекомендуется 20):
+# зависимости ~7 ГБ (torch и пр.) + CUDA-DLL до ~1,5 ГБ + модели ~1,5 ГБ
+try {
+    $drive = (Get-Item -LiteralPath $PSScriptRoot).PSDrive
+    $freeGb = [math]::Round($drive.Free / 1GB, 1)
+    if ($freeGb -lt 10) {
+        Write-Host "[ОШИБКА] Мало свободного места на диске $($drive.Name): ${freeGb} ГБ (минимум 10 ГБ)." -ForegroundColor Red
+        exit 1
+    }
+    elseif ($freeGb -lt 20) {
+        Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Свободно ${freeGb} ГБ на диске $($drive.Name) — рекомендуется 20 ГБ." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Свободное место: ${freeGb} ГБ"
+    }
+}
+catch {
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Не удалось определить свободное место на диске: $_" -ForegroundColor Yellow
+}
+
 # ---------- 1. uv ----------
 Write-Step "Проверка uv (менеджер окружения и Python)"
 $uv = Get-Command uv -ErrorAction SilentlyContinue
