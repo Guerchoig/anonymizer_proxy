@@ -72,6 +72,144 @@ def make_request(path: Path, text: str, anonymize=True) -> ChatCompletionRequest
     )
 
 
+def make_file_block(path: Path) -> str:
+    """Блок <file_content>, как его присылает клиент для бинарного документа"""
+    return (
+        f'<file_content path="{path}">\n'
+        f'Error fetching content: binary file\n'
+        f'</file_content>'
+    )
+
+
+async def test_no_reintercept_after_deanon_new_task():
+    """Регрессия багрепорта: новая задача после де-анонимизации идёт в облако.
+
+    Команда «анонимизируй» остаётся в истории диалога, а у файла результата
+    (<name>.result.<ext>) никогда не было маркера done. Прежний поиск интента
+    по ВСЕЙ истории ложно перехватывал запрос «Сравни два файла…» и повторно
+    анонимизировал файлы вместо отправки в облако.
+    """
+    orig = make_txt_file()
+    result = orig.with_name(f"{orig.stem}.result{orig.suffix}")
+    cloud_response = {
+        "id": "c-1", "created": 1, "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Отчёт в .md"},
+            "finish_reason": "stop",
+        }],
+        "usage": {},
+    }
+    try:
+        handler = make_handler(cloud_response=cloud_response)
+
+        # Шаг 1: «Анонимизируй файл» → перехват, копия создана
+        req1 = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(
+                role="user",
+                content=f"Анонимизируй приложенный файл\n\n{make_file_block(orig)}",
+            )],
+        )
+        resp1, _ = await handler.handle_chat_completion(req1)
+        answer1 = resp1.choices[0].message.content
+        assert "[anonymizer:done:" in answer1, answer1
+        assert "[anonymizer:result:" in answer1, answer1
+        copy_path = orig.with_name(f"{orig.stem}.anonymized{orig.suffix}")
+        assert copy_path.exists(), "анонимизированная копия не создана"
+        assert not handler.openrouter.captured, "первый запрос ушёл в облако"
+
+        # Модель «создала» файл результата с плейсхолдерами
+        result.write_text("Подписант: [PERSON_1]", encoding="utf-8")
+
+        # Шаг 2: де-анонимизация упомянутых файлов → перехват де-анонимизации
+        history2 = list(req1.messages) + [
+            ChatMessage(role="assistant", content=answer1),
+            ChatMessage(role="user", content="деанонимизируй упомянутые файлы"),
+        ]
+        req2 = ChatCompletionRequest(model="m", anonymize=True, stream=False,
+                                     messages=history2)
+        resp2, _ = await handler.handle_chat_completion(req2)
+        assert not handler.openrouter.captured, "де-анонимизация ушла в облако"
+        assert "де-анонимизированы" in resp2.choices[0].message.content
+
+        # Шаг 3 (багрепорт): НОВАЯ задача с обоими приложенными файлами —
+        # должна уйти в облако БЕЗ повторной локальной анонимизации
+        history3 = history2 + [
+            ChatMessage(role="assistant",
+                        content=resp2.choices[0].message.content),
+            ChatMessage(role="user", content=(
+                "Сравни два файла, отчет оформи в виде документа .md\n\n"
+                f"{make_file_block(orig)}\n\n{make_file_block(result)}"
+            )),
+        ]
+        req3 = ChatCompletionRequest(model="m", anonymize=True, stream=False,
+                                     messages=history3)
+        assert handler.detect_attached_files_anonymization(req3) == [], \
+            "новая задача ложно перехвачена для анонимизации файлов"
+
+        resp3, _ = await handler.handle_chat_completion(req3)
+        assert handler.openrouter.captured, "новая задача не отправлена в облако"
+        meta = resp3.anonymization_metadata
+        assert meta["mode"] == "passthrough_deanonymized", meta
+        # Файлы НЕ переанонимизированы: анонимизированная копия ровно одна
+        # (от шага 1), копии у файла результата не появилось
+        anon_copies = list(orig.parent.glob(f"{orig.stem}*.anonymized*"))
+        assert len(anon_copies) == 1 and anon_copies[0] == copy_path, anon_copies
+        # Файл результата остался де-анонимизированным после шага 2
+        assert result.read_text(encoding="utf-8") == "Подписант: Иван Петров"
+        print("TEST 7 OK: после де-анонимизации новая задача — в облако, без повторной анонимизации")
+    finally:
+        orig.unlink(missing_ok=True)
+        orig.with_name(f"{orig.stem}.anonymized{orig.suffix}").unlink(missing_ok=True)
+        result.unlink(missing_ok=True)
+
+
+async def test_done_marker_matches_other_path_spellings():
+    """Маркер done узнаёт тот же путь в другой записи (слэши, регистр, file://)"""
+    path = make_txt_file()
+    try:
+        fwd = str(path).replace("\\", "/")
+        variants = [fwd]
+        if fwd[0].isalpha():
+            variants.append(fwd[0].upper() + fwd[1:])
+        variants.append("file:///" + fwd)
+
+        def request_with_markers(markers_text: str) -> ChatCompletionRequest:
+            return ChatCompletionRequest(
+                model="m", anonymize=True, stream=False,
+                messages=[
+                    ChatMessage(role="assistant", content=markers_text),
+                    ChatMessage(role="user", content=(
+                        f"Анонимизируй этот файл ещё раз\n\n{make_file_block(path)}"
+                    )),
+                ],
+            )
+
+        markers_text = "\n".join(f"[anonymizer:done:{v}]" for v in variants)
+        cloud_response = {
+            "id": "c-1", "created": 1, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        }
+        handler = make_handler(cloud_response=cloud_response)
+
+        req_marked = request_with_markers(markers_text)
+        assert handler.detect_attached_files_anonymization(req_marked) == [], \
+            "маркер done должен блокировать путь и в другой записи"
+
+        # Контроль: без маркера явная команда работает как раньше
+        req_clean = request_with_markers("history without markers")
+        assert handler.detect_attached_files_anonymization(req_clean) == [str(path)], \
+            "явная команда должна перехватываться при отсутствии маркера"
+        print("TEST 8 OK: маркер done распознаёт путь в другой записи пути")
+    finally:
+        path.unlink(missing_ok=True)
+
 
 async def test_intercept_anonymizes_file_no_cloud():
     """Интент + файл → локальная анонимизация, облако НЕ вызывается"""
@@ -266,6 +404,8 @@ async def main():
     await test_done_marker_prevents_reinterception()
     await test_stream_variant()
     await test_anonymize_false_disables_intercept()
+    await test_no_reintercept_after_deanon_new_task()
+    await test_done_marker_matches_other_path_spellings()
     print("\nALL FILES AUTO-ANONYMIZE TESTS PASSED")
 
 

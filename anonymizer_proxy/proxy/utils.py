@@ -4,6 +4,7 @@
 Вынесено из handlers.py, чтобы уменьшить god-object и дать чистым функциям
 (без состояния) переиспользоваться в других модулях и тестах.
 """
+import os
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -88,3 +89,39 @@ def _result_path_for(copy_path: str) -> str:
     path = Path(copy_path)
     new_stem = path.stem.replace(".anonymized", ".result")
     return str(path.with_name(new_stem + path.suffix))
+
+
+def last_user_message_texts(messages) -> list[str]:
+    """
+    Текстовые части ПОСЛЕДНЕГО user-сообщения, содержащего текст.
+
+    Команда перехвата («анонимизируй…», «деанонимизируй…») должна искаться
+    только в текущем ходе пользователя: старые команды остаются в истории
+    диалога навсегда и иначе ложно перехватывают последующие запросы
+    («сравни два файла», «составь отчёт» и т.п.).
+
+    Служебные user-сообщения с результатами инструментов (tool_result)
+    текстовых частей не содержат и пропускаются — берётся последнее
+    содержательное сообщение пользователя.
+    """
+    for msg in reversed(list(messages)):
+        if getattr(msg, "role", None) != "user":
+            continue
+        texts = _iter_content_texts(getattr(msg, "content", None))
+        if texts:
+            return texts
+    return []
+
+
+def norm_fs_path(path_str: str) -> str:
+    """
+    Канонический вид пути файловой системы для строкового сравнения
+    (унификация слэшей и регистра диска в Windows). Пути вида
+    «C:/a/b.docx», «c:\\a\\b.docx» и «file:///C:/a/b.docx» дают одинаковый
+    результат.
+    """
+    try:
+        resolved = _resolve_local_path(path_str)
+    except Exception:
+        resolved = Path(path_str)
+    return os.path.normcase(os.path.normpath(str(resolved)))

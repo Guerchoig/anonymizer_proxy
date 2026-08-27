@@ -313,6 +313,66 @@ async def check_docx_headers_footers_result(fa, content, parsed, anon, out):
           "логотипы удалены, round-trip работает")
 
 
+async def test_hyperlink_targets_scrubbed():
+    """Анонимизирующая сборка вычищает внешние цели гиперссылок из .rels
+    (адрес сайта не утечёт из пакета); де-анонимизирующая не трогает пакет"""
+    import xml.etree.ElementTree as ET
+
+    url = "https://www.iris-retail.ru/tenders"
+    site = "www.iris-retail.ru"
+
+    def make(doc):
+        doc.add_paragraph(f"Контактный сайт: {site}")
+        doc.add_paragraph("Почта для заявок: info@iris-retail.ru")
+
+    content = make_docx(make)
+
+    # Вживляем внешнюю гиперссылку в rels (как её хранит Word)
+    with zipfile.ZipFile(io.BytesIO(content)) as zin:
+        infos = zin.infolist()
+        items = {i.filename: zin.read(i.filename) for i in infos}
+    rels_name = "word/_rels/document.xml.rels"
+    ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    root = ET.fromstring(items[rels_name])
+    rel = ET.SubElement(root, ns + "Relationship")
+    rel.set("Id", "rIdWeb999")
+    rel.set("Type", "http://schemas.openxmlformats.org/officeDocument"
+                    "/2006/relationships/hyperlink")
+    rel.set("Target", url)
+    rel.set("TargetMode", "External")
+    items[rels_name] = ET.tostring(
+        root, xml_declaration=True, encoding="UTF-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for info in infos:
+            z.writestr(info, items[info.filename])
+    content = buf.getvalue()
+
+    parser = FileParser()
+    fa = FileAssembler()
+    parsed = await parser.parse(content, "t.docx")
+    anon = parsed.text.replace(site, "[WEB_1]")
+
+    # Анонимизирующая сборка: цель гиперссылки нейтрализуется
+    out = await fa.assemble(content, "t.docx", anon, parsed.structure,
+                            scrub_metadata=True)
+    with zipfile.ZipFile(io.BytesIO(out)) as z:
+        rels_after = z.read(rels_name).decode("utf-8")
+    assert url not in rels_after, "URL гиперссылки остался в rels!"
+    assert 'Target="#"' in rels_after, rels_after
+    assert site not in rels_after
+    Document(io.BytesIO(out))  # пакет остаётся валидным DOCX
+
+    # Де-анонимизирующая сборка: пакет не трогается
+    out2 = await fa.assemble(content, "t.docx", anon, parsed.structure,
+                             scrub_metadata=False)
+    with zipfile.ZipFile(io.BytesIO(out2)) as z:
+        rels_kept = z.read(rels_name).decode("utf-8")
+    assert url in rels_kept, "де-анонимизация не должна трогать rels"
+    print("TEST 6 OK: гиперссылки — цели вычищаются при анонимизации, "
+          "сохраняются при де-анонимизации")
+
+
 async def main():
     await test_docx_table_structure()
     await test_docx_multiparagraph_cell()
@@ -321,6 +381,7 @@ async def main():
     fa2, content, parsed2, anon, out = (
         await test_docx_headers_footers_textboxes_images())
     await check_docx_headers_footers_result(fa2, content, parsed2, anon, out)
+    await test_hyperlink_targets_scrubbed()
     print("\nALL FILE PARSER TESTS PASSED")
 
 

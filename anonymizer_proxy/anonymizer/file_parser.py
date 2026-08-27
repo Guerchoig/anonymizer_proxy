@@ -1,4 +1,4 @@
-"""
+﻿"""
 Парсеры файлов для извлечения текста
 Поддерживаемые форматы: DOCX, XLSX, XML (MS Project)
 """
@@ -308,7 +308,7 @@ def _drop_orphan_media(docx_bytes: bytes) -> tuple[bytes, int]:
                 changed = True
         if changed:
             data[name] = ET.tostring(
-                root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                root, xml_declaration=True, encoding="UTF-8")
 
     # 3) Перезаписываем пакет без удалённых media
     buf = io.BytesIO()
@@ -318,6 +318,52 @@ def _drop_orphan_media(docx_bytes: bytes) -> tuple[bytes, int]:
                 continue
             zout.writestr(i, data[i.filename])
     return buf.getvalue(), len(dropped)
+
+
+def _scrub_hyperlink_targets(docx_bytes: bytes) -> tuple[bytes, int]:
+    """Заменить внешние цели гиперссылок в *.rels пакета на нейтральное «#».
+
+    Адрес сайта/почты может храниться не только в тексте (его маскирует
+    NER-слой), но и в Relationship-целях гиперссылок: тогда он утечёт из
+    анонимизированной копии даже при замаскированном тексте ссылки.
+    Возвращает (новые байты пакета, число обезличенных ссылок).
+    Вызывается только при АНОНИМИЗИРУЮЩЕЙ сборке (не при де-анонимизации).
+    """
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zin:
+        infos = zin.infolist()
+        data = {i.filename: zin.read(i.filename) for i in infos}
+
+    changed = 0
+    for name, blob in data.items():
+        if not name.endswith(".rels"):
+            continue
+        try:
+            root = ET.fromstring(blob)
+        except ET.ParseError:
+            continue
+        modified = False
+        for rel in root:
+            if (rel.get("TargetMode") or "Internal").lower() != "external":
+                continue
+            if "hyperlink" not in (rel.get("Type") or "").lower():
+                continue
+            target = rel.get("Target") or ""
+            if re.match(r"(?i)^(https?://|ftp://|mailto:|www\.)", target):
+                rel.set("Target", "#")
+                modified = True
+                changed += 1
+        if modified:
+            data[name] = ET.tostring(
+                root, xml_declaration=True, encoding="UTF-8")
+
+    if not changed:
+        return docx_bytes, 0
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for i in infos:
+            zout.writestr(i, data[i.filename])
+    return buf.getvalue(), changed
 
 
 class FileParser:
@@ -793,6 +839,16 @@ class FileAssembler:
         output = io.BytesIO()
         doc.save(output)
         result = output.getvalue()
+
+        if scrub_metadata:
+            # Внешние цели гиперссылок (адреса сайтов, mailto:) не должны
+            # оставаться в анонимизированной копии даже при замаскированном
+            # тексте ссылки
+            result, scrubbed_links = _scrub_hyperlink_targets(result)
+            if scrubbed_links:
+                logger.info(
+                    "Обезличено внешних гиперссылок в пакете: %d",
+                    scrubbed_links)
 
         if do_strip and removed_images:
             result, dropped = _drop_orphan_media(result)

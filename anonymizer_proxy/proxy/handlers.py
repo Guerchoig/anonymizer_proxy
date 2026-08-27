@@ -45,6 +45,8 @@ from .utils import (
     _resolve_local_path,
     _is_anonymized_copy_path,
     _result_path_for,
+    last_user_message_texts,
+    norm_fs_path,
 )
 
 logger = logging.getLogger("anonymizer_proxy.handlers")
@@ -580,8 +582,11 @@ class RequestHandler:
         приложенных файлов (только passthrough-режим).
 
         Условия перехвата:
-        1. В тексте user-сообщений есть команда анонимизации («анонимиз…» /
-           «anonymis/z…»);
+        1. В ТЕКУЩЕМ (последнем содержательном) user-сообщении есть команда
+           анонимизации («анонимиз…» / «anonymis/z…»). Команда из старых
+           сообщений истории не считается: она остаётся там навсегда и без
+           этого ограничения ложно перехватывает последующие запросы
+           («сравни два файла», «составь отчёт» и т.п.);
         2. В сообщениях есть блоки <file_content path="..."> с путями к файлам,
            которые ещё НЕ анонимизированы в этом диалоге (нет маркера
            [anonymizer:done:<путь>] в истории) и не являются анонимизированными
@@ -592,12 +597,8 @@ class RequestHandler:
             (пустой список — запрос обрабатывается как обычно).
         """
         has_intent = any(
-            msg.role == "user"
-            and any(
-                ANONYMIZE_INTENT_RE.search(text)
-                for text in _iter_content_texts(msg.content)
-            )
-            for msg in request.messages
+            ANONYMIZE_INTENT_RE.search(text)
+            for text in last_user_message_texts(request.messages)
         )
         if not has_intent:
             return []
@@ -611,7 +612,9 @@ class RequestHandler:
                     if raw_path not in candidates:
                         candidates.append(raw_path)
                 for match in ANONYMIZER_DONE_MARKER_RE.finditer(text):
-                    done.add(match.group("path").strip())
+                    # Сравнение путей — по канонической форме (слэши/регистр),
+                    # иначе маркер «не узнаёт» тот же путь в другой записи
+                    done.add(norm_fs_path(match.group("path").strip()))
 
         result: list[str] = []
         for raw_path in candidates:
@@ -624,7 +627,7 @@ class RequestHandler:
             # не обрабатывается
             if resolved.stem.lower().endswith(".anonymized"):
                 continue
-            if resolved_str in done or raw_path in done:
+            if norm_fs_path(raw_path) in done:
                 continue
             if resolved_str in result:
                 continue
@@ -897,7 +900,9 @@ class RequestHandler:
         Определить, нужно ли перехватить запрос для де-анонимизации файлов
         по естественной команде («деанонимизируй файлы…»).
 
-        Условия: в user-сообщениях есть команда де-анонимизации, и в истории
+        Условия: в ТЕКУЩЕМ (последнем содержательном) user-сообщении есть
+        команда де-анонимизации (команда из старых сообщений истории не
+        считается — см. detect_attached_files_anonymization), и в истории
         диалога есть маркеры [anonymizer:result:<путь>] с session_id.
         Основной источник — файл результата; если модель его не создала,
         де-анонимизируется анонимизированная копия (fallback).
@@ -907,12 +912,8 @@ class RequestHandler:
             (пустой — запрос обрабатывается как обычно).
         """
         has_intent = any(
-            msg.role == "user"
-            and any(
-                DEANONYMIZE_INTENT_RE.search(text)
-                for text in _iter_content_texts(msg.content)
-            )
-            for msg in request.messages
+            DEANONYMIZE_INTENT_RE.search(text)
+            for text in last_user_message_texts(request.messages)
         )
         if not has_intent:
             return []
@@ -1609,6 +1610,78 @@ class RequestHandler:
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
+    # ==================== Подсказка office_ops для облачной модели ====================
+
+    # Расширения файлов Office, при которых в запрос добавляется шпаргалка
+    OFFICE_FILE_EXTS = {".docx", ".xlsx"}
+
+    OFFICE_OPS_HINT = (
+        "[OFFICE-OPS] Для просмотра и правки файлов MS Office (.docx/.xlsx) "
+        "НЕ пишите скрипты на python-docx/openpyxl — используйте готовые "
+        "команды (запуск из корня проекта; правки пишите в файл результата "
+        "через --output, исходник не изменяйте):\n"
+        "python -m anonymizer_proxy.office_ops list-tables --file \"F.docx\" "
+        "# обзор таблиц/листов\n"
+        "python -m anonymizer_proxy.office_ops dump --file \"F.docx\" "
+        "# текст по сегментам (для apply)\n"
+        "python -m anonymizer_proxy.office_ops dump --file \"F.docx\" --format md "
+        "# markdown с таблицами\n"
+        "python -m anonymizer_proxy.office_ops replace-text --file F --find \"X\" "
+        "--replace \"Y\" --output OUT\n"
+        "python -m anonymizer_proxy.office_ops set-cell --file F --table N "
+        "--row R --col C --text \"...\" --output OUT  # индексы с 0\n"
+        "python -m anonymizer_proxy.office_ops add-row --file F --table N "
+        "--cell \"a\" --cell \"b\" --output OUT  # --position N — вставить по индексу\n"
+        "python -m anonymizer_proxy.office_ops add-column --file F "
+        "--table all --header \"H\" --output OUT  # во ВСЕ таблицы одной "
+        "командой (--table N + --cell v1 --cell v2 — в одну с значениями)\n"
+        "python -m anonymizer_proxy.office_ops set-value --file F.xlsx --cell B2 "
+        "--value 150000 [--sheet Имя] --output OUT\n"
+        "python -m anonymizer_proxy.office_ops append-row --file F.xlsx "
+        "--cell \"a\" --cell \"b\" [--sheet Имя] --output OUT\n"
+        "python -m anonymizer_proxy.office_ops apply --file F --from-text edit.txt "
+        "--output OUT  # применить отредактированный dump (строки 1:1)\n"
+        "Правки текста (replace-text/apply) сохраняют форматирование, числа, "
+        "даты и формулы. Команды выполняйте СТРОГО последовательно, одну за "
+        "другой (не параллельно и не через && в несколько потоков): "
+        "параллельные записи в один файл затирают изменения друг друга. "
+        "Для массовых правок используйте одну команду (--table all)."
+    )
+
+    @classmethod
+    def _inject_office_ops_hint(
+        cls, messages: list[ChatMessage],
+    ) -> list[ChatMessage]:
+        """
+        Если в запросе есть файлы Office (.docx/.xlsx), дополнить системный
+        промпт шпаргалкой office_ops: модель должна вызывать готовые команды
+        вместо написания python-скриптов.
+        """
+        has_office = any(
+            Path(m.group("path").strip()).suffix.lower() in cls.OFFICE_FILE_EXTS
+            for msg in messages
+            for text in _iter_content_texts(msg.content)
+            for m in FILE_CONTENT_BLOCK_RE.finditer(text)
+        )
+        if not has_office:
+            return messages
+        messages = list(messages)
+        if messages and messages[0].role == "system":
+            first = messages[0]
+            if isinstance(first.content, str):
+                updated = first.content.rstrip() + "\n\n" + cls.OFFICE_OPS_HINT
+            elif isinstance(first.content, list):
+                updated = list(first.content) + [
+                    {"type": "text", "text": "\n\n" + cls.OFFICE_OPS_HINT},
+                ]
+            else:
+                updated = cls.OFFICE_OPS_HINT
+            messages[0] = first.model_copy(update={"content": updated})
+        else:
+            messages.insert(0, ChatMessage(role="system",
+                                           content=cls.OFFICE_OPS_HINT))
+        return messages
+
     async def _handle_passthrough(
         self,
         request: ChatCompletionRequest,
@@ -1628,6 +1701,7 @@ class RequestHandler:
         messages = request.messages
         if request.anonymize:
             messages = await self._resolve_anonymized_file_contents(messages)
+        messages = self._inject_office_ops_hint(messages)
         messages_payload = [
             m.model_dump(exclude_none=True) for m in messages
         ]
@@ -1715,6 +1789,7 @@ class RequestHandler:
         messages = request.messages
         if request.anonymize:
             messages = await self._resolve_anonymized_file_contents(messages)
+        messages = self._inject_office_ops_hint(messages)
         messages_payload = [
             m.model_dump(exclude_none=True) for m in messages
         ]
