@@ -35,6 +35,7 @@ DEFAULT_LABEL_MAP: Dict[str, str] = {
     "PASSPORT":   "passport number",
     "PHONE":      "phone number",
     "EMAIL":      "email address",
+    "WEB":        "website address or URL",
     "INN":        "tax identification number",
     "MONEY":      "money amount",
 }

@@ -62,15 +62,42 @@ REGEX_PATTERNS = {
     "EMAIL": [
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
     ],
+    "WEB": [
+        # Полный URL с протоколом (путь и query входят в спан)
+        r"https?://[^\s<>\"')\]]+",
+        # www-домены с опциональным путём
+        r"\bwww\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:/[^\s<>\"')\]]*)?",
+        # «Голый» домен по белому списку TLD (включая кириллический .рф).
+        # (?<![\w@.-]) — не продолжение слова и не доменная часть email:
+        # адрес почты целиком ловит паттерн EMAIL, и его домен не должен
+        # маскироваться отдельным спаном WEB
+        (
+            r"(?<![\w@.-])(?:[\w-]+\.)+"
+            r"(?:ru|su|com|net|org|io|info|biz|online|site|shop|tech|cloud"
+            r"|pro|dev|app|рф|xn--p1ai)\b",
+            0,
+        ),
+    ],
     "INN": [
         # ИНН физлица (12 цифр) или юрлица (10 цифр) — только рядом со словом ИНН/ОГРН/КПП
         r"\b(?:ИНН|ОГРН|КПП)\s*[:\s]*\s*(\d{10,12})\b",
         r"\b(\d{10,12})\b(?=\s*(?:ИНН|ОГРН|КПП|инн))",
     ],
     "MONEY": [
-        # Суммы денег
-        r"\b\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{2})?\s*(?:руб|рубл|рублей|₽|RUB)\b",
-        r"\b\d+\s*(?:тыс|млн|млрд)\.?\s*(?:руб|₽)?\b",
+        # Сумма со словом валюты: "1 500 000,50 руб", "150000 руб"
+        r"\b\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{2})?\s*"
+        r"(?:руб\w*|₽|RUB|USD|EUR|долл\w*|евро)\b",
+        # Сумма БЕЗ валюты — только сгруппированные разряды (пробел/NBSP):
+        # в таблицах валюта стоит в заголовке колонки («Затраты, руб.»),
+        # а ячейки — "83 600,00", "7 432 480,00". Группировка обязательна:
+        # почтовые индексы (101000), годы и номера без пробелов не маскируются
+        r"\b\d{1,3}(?:[ \u00A0\u2009]\d{3})+(?:[.,]\d{2})?\b",
+        # Тысячи/миллионы с десятичной дробью: "1,5 млн рублей", "20 тыс. ₽"
+        r"\b\d+(?:[.,]\d+)?\s*(?:тыс|млн|млрд)\b\.?(?:\s*(?:руб\w*|₽))?",
+        # Валюты в обозначениях: "$1 500", "1 500 $", "1 000 евро"
+        r"\$\s?\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{2})?\b",
+        r"\b\d{1,3}(?:[ \u00A0]\d{3})+(?:[.,]\d{2})?\s?(?:\$|€)\b",
+        r"\b\d+(?:[.,]\d+)?\s?(?:долл\w*|евро|usd|eur)\b",
     ],
     "ORG": [
         # Организационно-правовая форма + название: "АО НПФ Благосостояние",
@@ -162,15 +189,59 @@ class NERService:
                 else:
                     pattern, flags = entry, re.IGNORECASE
                 for match in re.finditer(pattern, text, flags):
+                    start, end = match.start(), match.end()
+                    value = match.group(0).strip()
+                    if entity_type == "WEB":
+                        # Хвостовая пунктуация предложения — не часть адреса
+                        # («www.site.ru.» / «(www.site.ru)»)
+                        while end > start and text[end - 1] in ".,;:!?)]}»\"'…":
+                            end -= 1
+                        value = text[start:end].strip()
+                        if not value:
+                            continue
                     entities.append(Entity(
-                        text=match.group(0).strip(),
+                        text=value,
                         type=entity_type,
-                        start=match.start(),
-                        end=match.end(),
+                        start=start,
+                        end=end,
                         confidence=0.95
                     ))
 
-        return entities
+        # Пересечения между regex-сущностями разных типов (домен внутри
+        # URL/email) разрешаются в пользу более длинного/приоритетного спана
+        return self._resolve_regex_overlaps(entities)
+
+    # Приоритет типов при пересечении regex-спанов: меньшее число — выше
+    # приоритет (email маскируется целиком, домен внутри него не дробится)
+    _REGEX_TYPE_PRIORITY = {"EMAIL": 0, "WEB": 1}
+
+    def _resolve_regex_overlaps(self, entities: list) -> list:
+        """Убрать пересечения между regex-сущностями разных типов.
+
+        Из перекрывающихся спанов остаётся более длинный; при равной длине —
+        более приоритетный тип (_REGEX_TYPE_PRIORITY). Пример: домен внутри
+        URL/email должен маскироваться одним спаном URL/email, а не отдельным
+        [WEB_N] — иначе замена по оффсетам портит текст и round-trip.
+        """
+        if len(entities) < 2:
+            return entities
+        entities.sort(key=lambda e: (
+            e.start, -(e.end - e.start),
+            self._REGEX_TYPE_PRIORITY.get(e.type, 9),
+        ))
+        resolved: list = []
+        for ent in entities:
+            prev = resolved[-1] if resolved else None
+            if prev is not None and ent.start < prev.end:
+                cur_len = ent.end - ent.start
+                prev_len = prev.end - prev.start
+                cur_prio = self._REGEX_TYPE_PRIORITY.get(ent.type, 9)
+                prev_prio = self._REGEX_TYPE_PRIORITY.get(prev.type, 9)
+                if cur_len > prev_len or (cur_len == prev_len and cur_prio < prev_prio):
+                    resolved[-1] = ent
+                continue
+            resolved.append(ent)
+        return resolved
 
     def _validate_entity_offsets(self, text: str, ent_text: str, start: int, end: int) -> Optional[tuple[int, int]]:
         """
@@ -245,6 +316,26 @@ class NERService:
         визуально одинаковые буквы кириллицы/латиницы приравниваются"""
         return s.casefold().replace("ё", "е").translate(cls._HOMOGLYPH_TABLE)
 
+    @staticmethod
+    def _is_word_char(ch: str) -> bool:
+        """Словесный символ (буква/цифра/подчёркивание) для проверки границ.
+
+        Пустая строка (начало/конец текста) словесным символом не считается.
+        """
+        if not ch:
+            return False
+        return ch.isalnum() or ch == "_"
+
+    @staticmethod
+    def _is_acronym(value: str) -> bool:
+        """Акроним: значение состоит только из заглавных букв/цифр/символов
+        («ИС», «СЭД», «ГК», «АСУ ТП», «1С»). Для таких значений регистр
+        значим: строчное «ис» — обычное слово, а не организация.
+        """
+        letters = [ch for ch in value if ch.isalpha()]
+        return bool(letters) and all(ch.isupper() for ch in letters)
+
+
     def _locate_entity(self, text: str, ent_text: str) -> Optional[tuple[int, int, str]]:
         """
         Найти текст сущности в фрагменте; вернуть (start, end, текст как
@@ -306,12 +397,19 @@ class NERService:
         Если значение признано PII хотя бы один раз, все его точные
         совпадения тоже подлежат замене.
 
+        Вхождение признаётся только при соблюдении границ слова: значение
+        не должно быть «приклеено» к соседним буквам (иначе короткие
+        токены вроде «ИС» режут «рисками», «подпись», «система»).
+        Для акронимов («ИС», «СЭД», «ГК», «1С») принимаются только
+        вхождения, написанные заглавными буквами в оригинальном тексте.
+
         Приоритет у длинных значений: вхождения короткого значения,
         пересекающиеся с уже покрытым диапазоном, пропускаются.
 
         Returns:
             Новый отсортированный список сущностей (оффсеты в пределах text)
         """
+
         from ..models.schemas import Entity
 
         if not entities:
@@ -332,23 +430,49 @@ class NERService:
             if value not in unique:
                 unique[value] = ent
 
-        # Нормализованный поиск (регистр, ё/е, кириллица/латиница)
+        # Нормализованный поиск (регистр, ё/е, кириллица/латиница).
+        # Нормализация сохраняет длину строки, поэтому оффсеты совпадают
+        # с оригиналом и валидация границ выполняется по тем же индексам.
         norm_text = self._normalize_for_search(text)
         norm_ok = len(norm_text) == len(text)
 
         # Длинные значения обрабатываются раньше коротких
         for value in sorted(unique, key=len, reverse=True):
             ent = unique[value]
+            acronym = self._is_acronym(value)
             norm_value = self._normalize_for_search(value)
             use_norm = norm_ok and len(norm_value) == len(value)
             search_in = norm_text if use_norm else text
             search_for = norm_value if use_norm else value
+
+            head_is_word = self._is_word_char(value[:1])
+            tail_is_word = self._is_word_char(value[-1:])
+
             pos = 0
             while True:
                 idx = search_in.find(search_for, pos)
                 if idx == -1:
                     break
                 end = idx + len(value)
+
+                # Границы слова: значение не должно быть частью соседнего
+                # слова («ис» внутри «рисками», «ИС» внутри «ИСх№...»). Если
+                # край значения — словесный символ, соседний символ с той же
+                # стороны тоже должен быть несловесным (пробел, пунктуация,
+                # начало/конец текста).
+                prev_ch = search_in[idx - 1:idx]
+                next_ch = search_in[end:end + 1]
+                if ((head_is_word and self._is_word_char(prev_ch)) or
+                        (tail_is_word and self._is_word_char(next_ch))):
+                    pos = idx + 1  # кандидат отклонён — ищем дальше
+                    continue
+
+                # Акроним заменяем только написанный заглавными буквами:
+                # автономное строчное «ис» или «Ис» — другое слово
+                if acronym and any(ch.islower() for ch in text[idx:end]):
+                    pos = idx + 1
+                    continue
+
                 pos = end
                 # Пропускаем вхождения, пересекающиеся с уже покрытыми
                 if any(s < end and e > idx for s, e in covered):

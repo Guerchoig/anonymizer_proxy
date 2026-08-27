@@ -144,6 +144,61 @@ def test_expand_short_values_not_expanded():
     print("TEST 5 OK: короткие значения не расширяются")
 
 
+def test_expand_acronym_word_boundaries():
+    """Акроним расширяется только по границам слова и в исходном регистре.
+
+    Регрессия: значение «ИС» раньше подставлялось внутрь любых слов,
+    содержащих слог «ис» («рисками», «подпись», «система»), независимо
+    от регистра букв.
+    """
+    ner = NERService()
+    text = (
+        "Управление рисками требует сервиса и контроля.\n"
+        "Подпись исполнителя: система испытаний.\n"
+        "Диспетчеризация, регистрация, классификация.\n"
+        "Автономное строчное слово ис не акроним.\n"
+        "Целевая ИС построена на базе платформы.\n"
+        "См. раздел ИС: требования."
+    )
+    first = text.find("ИС построена")
+    ents = [Entity(text="ИС", type="ORG", start=first, end=first + 2)]
+
+    expanded = ner._expand_all_occurrences(text, ents)
+
+    assert len(expanded) == 2, \
+        f"ожидалось 2 автономных вхождения «ИС», получено {len(expanded)}: " \
+        f"{[text[e.start:e.end] for e in expanded]}"
+    for e in expanded:
+        assert text[e.start:e.end] == "ИС", \
+            f"внутрисловное/строчное вхождение заменено: {text[e.start:e.end]!r}"
+    # Буквы «ис» внутри слов остались нетронутыми
+    for word in ("рисками", "сервиса", "Подпись", "испытаний",
+                 "Диспетчеризация", "регистрация", "слово ис"):
+        idx = text.find(word)
+        assert idx != -1 and text[idx:idx + len(word)] == word
+        span_lo, span_hi = idx, idx + len(word)
+        assert not any(e.start < span_hi and e.end > span_lo for e in expanded), \
+            f"задето слово: {word}"
+    print("TEST 5.1 OK: акроним — только автономные вхождения в своём регистре")
+
+
+def test_expand_case_insensitive_names_still_work():
+    """Имена/названия (не акронимы) по-прежнему ищутся без учёта регистра."""
+    ner = NERService()
+    text = "Компания Иван Петров подписала акт. Исполнитель — иван петров."
+    first = text.find("Иван Петров")
+    ents = [Entity(text="Иван Петров", type="PERSON", start=first,
+                   end=first + len("Иван Петров"))]
+
+    expanded = ner._expand_all_occurrences(text, ents)
+
+    assert len(expanded) == 2, \
+        f"ожидалось 2 вхождения (регистр не важен), получено {len(expanded)}"
+    values = [text[e.start:e.end].lower() for e in expanded]
+    assert all(v == "иван петров" for v in values)
+    print("TEST 5.2 OK: неакронимы расширяются без учёта регистра")
+
+
 def test_regex_org_forms():
     """Regex-детектор оргформ: ловит юрлица, не ловит бытовые фразы"""
     ner = NERService()
@@ -294,17 +349,131 @@ async def test_entities_cache_hit():
     print("TEST 10 OK: кэш результатов NER по тексту")
 
 
+def test_regex_web_addresses():
+    """Regex-детектор WEB: URL, www, «голые» домены по TLD; email цел"""
+    ner = NERService()
+    text = (
+        "Подробнее на сайте www.iris-retail.ru, раздел поставок. "
+        "Портал: https://portal.example-iris.ru/docs?id=42&page=1. "
+        "Наш домен iris-retail.ru обслуживает клиентов. "
+        "Пишите на info@iris-retail.ru или sales@example.com. "
+        "Кириллический домен: пример.рф. "
+        "Отчёт report.docx и версия python 3.14 не адреса сайтов. "
+    )
+    entities = ner._extract_regex_entities(text)
+
+    def spans(etype):
+        return [text[e.start:e.end] for e in entities if e.type == etype]
+
+    web = spans("WEB")
+    emails = spans("EMAIL")
+
+    # Полный URL с путём и query — одним спаном
+    assert "https://portal.example-iris.ru/docs?id=42&page=1" in web, web
+    # www с хвостовой запятой — без пунктуации
+    assert "www.iris-retail.ru" in web, web
+    assert not any(v.endswith(",") or v.endswith(".") for v in web), web
+    # Голый домен по TLD
+    assert "iris-retail.ru" in web, web
+    # Кириллический .рф
+    assert "пример.рф" in web, web
+    # Email не разбит на домен+WEB: два целых адреса, и нет WEB-спанов внутри
+    assert "info@iris-retail.ru" in emails, emails
+    assert "sales@example.com" in emails, emails
+    for e in entities:
+        if e.type == "WEB":
+            frag = text[e.start:e.end]
+            assert "@" not in frag, f"WEB накрыл email: {frag}"
+
+    # Негативы: файлы, версии, «слово.слово» без TLD не адреса сайтов
+    joined = " ".join(web)
+    assert "report.docx" not in joined, web
+    assert "3.14" not in joined, web
+    print(f"TEST 11 OK: regex-детектор WEB ({len(web)} адресов, email целы)")
+
+
+async def test_web_roundtrip_replacement():
+    """Полный цикл: URL/домены маскируются [WEB_N] и восстанавливаются"""
+    ner = NERService()
+    text = (
+        "Сайт компании www.iris-retail.ru и портал "
+        "https://portal.example.ru/docs?id=1. Пишите на info@iris-retail.ru."
+    )
+    entities, _ = await ner.extract_entities(text, use_llm=False)
+
+    replacer = TextReplacer()
+    tokens: dict[str, str] = {}
+    counters: dict[str, int] = {}
+
+    async def add_map(value: str, etype: str) -> str:
+        if value in tokens:
+            return tokens[value]
+        counters[etype] = counters.get(etype, 0) + 1
+        token = f"[{etype}_{counters[etype]}]"
+        tokens[value] = token
+        return token
+
+    anon, _ = await replacer.anonymize(text, entities, add_map)
+    # deanonymize ждёт словарь {токен: значение}
+    mapping = {tok: val for val, tok in tokens.items()}
+    assert "www.iris-retail.ru" not in anon, anon
+    assert "portal.example.ru" not in anon, anon
+    assert "[WEB_1]" in anon and "[WEB_2]" in anon, anon
+    # Email остался целым плейсхолдером, не дробился на WEB
+    assert "[EMAIL_1]" in anon, anon
+    assert anon.count("[WEB_") + anon.count("[EMAIL_") >= 3, anon
+
+    # Round-trip: всё восстановлено дословно
+    deanon = await replacer.deanonymize(anon, mapping)
+    assert deanon == text, deanon
+    print("TEST 12 OK: WEB round-trip — маскировка и восстановление")
+
+
+def test_money_without_currency_keyword():
+    """Суммы без слова валюты (валюта в шапке таблицы) маскируются;
+    почтовые индексы и годы — нет"""
+    ner = NERService()
+    text = (
+        "Этапы работ и затраты, руб., без НДС:\n"
+        "Настройка модуля ⏎ 45 дней ⏎ 7 432 480,00\n"
+        "Доработка отчётов ⏎ 2 дней ⏎ 83 600,00\n"
+        "Поддержка ⏎ 39 дней ⏎ 5 186 720,00 руб\n"
+        "Бюджет проекта 1,5 млн рублей, НДС 20%.\n"
+        "Адрес: 101000, г. Москва, а/я 25, индекс 614087.\n"
+    )
+    entities = ner._extract_regex_entities(text)
+
+    def spans(etype):
+        return [text[e.start:e.end] for e in entities if e.type == etype]
+
+    money = spans("MONEY")
+    # Суммы в ячейках таблицы без слова валюты
+    for expected in ("7 432 480,00", "83 600,00",
+                     "5 186 720,00 руб", "1,5 млн рублей"):
+        assert expected in money, f"{expected!r} не найдено: {money}"
+    # Почтовые индексы и прочие не-суммы не замаскированы
+    for forbidden in ("101000", "614087"):
+        assert not any(forbidden in v for v in money), \
+            f"{forbidden} ложно замаскирован: {money}"
+    print(f"TEST 13 OK: MONEY без валюты — {len(money)} сумм, индексы целы")
+
+
 async def main():
     test_split_into_chunks_short()
     test_split_into_chunks_long()
     test_expand_all_occurrences()
     test_expand_long_value_priority()
     test_expand_short_values_not_expanded()
+    test_expand_acronym_word_boundaries()
+    test_expand_case_insensitive_names_still_work()
     test_regex_org_forms()
     await test_full_pipeline_all_occurrences_replaced()
     test_quoted_core_expansion()
     test_homoglyph_expansion()
     await test_entities_cache_hit()
+    test_regex_web_addresses()
+    await test_web_roundtrip_replacement()
+    test_money_without_currency_keyword()
     print("\nALL NER QUALITY TESTS PASSED")
 
 
