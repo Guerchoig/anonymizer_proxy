@@ -10,7 +10,7 @@
         {
             "label": "run-tests: прогон функциональных тестов",
             "type": "shell",
-            "command": "$failed = 0; foreach ($t in 'test_fixes','test_tools_passthrough','test_anonymize_only','test_file_parser','test_ner_quality') { Write-Host \"=== $t ===\"; & .\\.venv\\Scripts\\python.exe \"anonymizer_proxy\\tests\\$t.py\"; if ($LASTEXITCODE -ne 0) { $failed = 1; Write-Host \"FAILED: $t\" } }; if ($failed -ne 0) { exit 1 }",
+            "command": "$failed = 0; foreach ($t in 'test_fixes','test_tools_passthrough','test_anonymize_only','test_file_parser','test_ner_quality','test_files_auto_anonymize','test_deanonymize_intercept','test_passthrough','test_passthrough_selective_deanon','test_passthrough_anonymized_extract','test_manual_flow_roundtrip','test_office_ops') { Write-Host \"=== $t ===\"; & .\\.venv\\Scripts\\python.exe \"anonymizer_proxy\\tests\\$t.py\"; if ($LASTEXITCODE -ne 0) { $failed = 1; Write-Host \"FAILED: $t\" } }; if ($failed -ne 0) { exit 1 }",
             "problemMatcher": []
         }
     ]
