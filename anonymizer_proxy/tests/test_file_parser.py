@@ -373,6 +373,80 @@ async def test_hyperlink_targets_scrubbed():
           "сохраняются при де-анонимизации")
 
 
+async def test_page_number_fields():
+    """Футер с полями PAGE/NUMPAGES: в изменённом абзаце поля удаляются
+    (Word иначе дорисовывает номера страниц поверх маскировки —
+    «Страница 2 из 12» превращается в «[LOC_1]212»), в неизменённом
+    и восстановленном — сохраняются"""
+    import re
+    from docx.oxml import OxmlElement
+
+    def add_field(paragraph, instr: str, cached: str) -> None:
+        r1 = paragraph.add_run()
+        fld = OxmlElement("w:fldChar")
+        fld.set(qn("w:fldCharType"), "begin")
+        r1._r.append(fld)
+        r2 = paragraph.add_run()
+        it = OxmlElement("w:instrText")
+        it.set(qn("xml:space"), "preserve")
+        it.text = f" {instr}  \\* Arabic "
+        r2._r.append(it)
+        r3 = paragraph.add_run()
+        sep = OxmlElement("w:fldChar")
+        sep.set(qn("w:fldCharType"), "separate")
+        r3._r.append(sep)
+        paragraph.add_run(cached)  # кэш результата поля
+        r5 = paragraph.add_run()
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        r5._r.append(end)
+
+    def make(doc):
+        doc.add_paragraph("Договор с ООО «Ромашка»")
+        para = doc.sections[0].footer.paragraphs[0]
+        para.add_run("Страница ")
+        add_field(para, "PAGE", "2")
+        para.add_run(" из ")
+        add_field(para, "NUMPAGES", "12")
+
+    content = make_docx(make)
+    parser = FileParser()
+    fa = FileAssembler()
+
+    def footer_xml(docx_bytes: bytes) -> str:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            for n in z.namelist():
+                if re.match(r"word/footer\d+\.xml$", n):
+                    return z.read(n).decode("utf-8")
+        return ""
+
+    parsed = await parser.parse(content, "t.docx")
+    # Кэш результатов полей входит в извлечённый текст сегмента
+    assert "Страница 2 из 12" in parsed.text, parsed.text
+
+    # 1) Неизменённый футер — структура полей сохранена
+    out1 = await fa.assemble(content, "t.docx", parsed.text, parsed.structure)
+    xml1 = footer_xml(out1)
+    assert xml1.count("fldChar") >= 6, "поля исчезли в неизменённом футере"
+    assert "instrText" in xml1
+
+    # 2) Маскировка: текст абзаца точен, «призрачных» полей нет
+    anon = parsed.text.replace("Страница 2 из 12", "[LOC_1]")
+    out2 = await fa.assemble(content, "t.docx", anon, parsed.structure)
+    doc2 = Document(io.BytesIO(out2))
+    ftext = doc2.sections[0].footer.paragraphs[0].text
+    assert ftext == "[LOC_1]", f"рендер футера: {ftext!r}"
+    xml2 = footer_xml(out2)
+    assert "fldChar" not in xml2 and "instrText" not in xml2, \
+        "структура полей осталась в изменённом футере — Word дорисует номера"
+
+    # 3) Де-анонимизация возвращает исходный текст — поля оживают
+    out3 = await fa.assemble(content, "t.docx", parsed.text, parsed.structure)
+    assert footer_xml(out3).count("fldChar") >= 6
+    print("TEST 7 OK: поля PAGE/NUMPAGES — в изменённом футере удалены, "
+          "в неизменённом/восстановленном сохранены")
+
+
 async def main():
     await test_docx_table_structure()
     await test_docx_multiparagraph_cell()
@@ -382,6 +456,7 @@ async def main():
         await test_docx_headers_footers_textboxes_images())
     await check_docx_headers_footers_result(fa2, content, parsed2, anon, out)
     await test_hyperlink_targets_scrubbed()
+    await test_page_number_fields()
     print("\nALL FILE PARSER TESTS PASSED")
 
 

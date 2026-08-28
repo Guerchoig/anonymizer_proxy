@@ -2211,7 +2211,14 @@ class RequestHandler:
             target = Path(output_path)
         else:
             target = path.with_name(f"{path.stem}.anonymized{path.suffix}")
-        target.write_bytes(anon_content)
+        try:
+            target.write_bytes(anon_content)
+        except PermissionError as exc:
+            # Файл открыт в Word/LibreOffice — ОС запрещает запись
+            raise ValueError(
+                f"Не удалось записать {target}: файл занят (вероятно, открыт "
+                "в Word). Закройте его и повторите анонимизацию."
+            ) from exc
 
         # Сохраняем review-файл (.md) с форматированным анонимизированным видом
         review_path = None

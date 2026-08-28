@@ -132,6 +132,28 @@ def _set_paragraph_text(para, text: str) -> None:
     if _normalize_line(_p_element_text(p_el)) == text:
         return
     own_box = _nearest_txbx(p_el)
+
+    # Поля Word (PAGE, NUMPAGES, перекрёстные ссылки...): в изменённом
+    # абзаце структура полей удаляется. Word вычисляет значения полей при
+    # рендере и дорисовывает их поверх анонимизированного текста — футер
+    # «Страница 2 из 27» после маскировки превращается в «[LOC_11]227»
+    # (токен + «живые» номера страницы). Неизменённые абзацы не затрагиваются
+    # (ранний выход выше) — поля там работают как раньше, а де-анонимизация
+    # возвращает исходный текст, и поля оживают снова.
+    for r in list(p_el.iter(qn("w:r"))):
+        if _nearest_txbx(r) is not own_box:
+            continue
+        if (r.find(qn("w:fldChar")) is not None
+                or r.find(qn("w:instrText")) is not None):
+            parent = r.getparent()
+            if parent is not None:
+                parent.remove(r)
+    for fs in list(p_el.iter(qn("w:fldSimple"))):
+        if _nearest_txbx(fs) is own_box:
+            parent = fs.getparent()
+            if parent is not None:
+                parent.remove(fs)
+
     targets = [
         t for t in p_el.iter(qn("w:t"))
         if _nearest_txbx(t) is own_box
