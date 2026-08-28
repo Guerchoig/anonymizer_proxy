@@ -26,6 +26,35 @@ class OpenRouterError(Exception):
         super().__init__(f"OpenRouter API error ({status_code}): {message}")
 
 
+def _humanize_error(status_code: int, message: str) -> str:
+    """Дописать к сырой ошибке OpenRouter понятное объяснение и что делать.
+
+    Прокси ретранслирует ошибки облака в чат модели/пользователя — без
+    пояснения сырой текст вроде «User not found.» не подсказывает, что
+    ключ API на этой машине не работает.
+    """
+    low = (message or "").lower()
+    if status_code == 401 and "user not found" in low:
+        return (
+            f"{message}. OpenRouter не признал ключ API: проверьте в .env "
+            "OPENROUTER_API_KEY — должен начинаться с 'sk-or-v1-', быть без "
+            "кавычек и пробелов и быть действительным (создаётся и "
+            "проверяется на openrouter.ai/keys). Ключ подхватывается только "
+            "при старте прокси — после правки .env перезапустите сервер."
+        )
+    if status_code == 402:
+        return (
+            f"{message}. Недостаточно кредитов OpenRouter для этой модели — "
+            "пополните баланс или выберите бесплатную модель."
+        )
+    if status_code == 429:
+        return (
+            f"{message}. Лимит запросов OpenRouter исчерпан — повторите "
+            "позже или смените модель."
+        )
+    return message
+
+
 class OpenRouterClient:
     """HTTP клиент для OpenRouter API"""
 
@@ -119,7 +148,10 @@ class OpenRouterClient:
                 error_text = error_data.get("error", {}).get("message", error_text)
             except (json.JSONDecodeError, AttributeError, TypeError):
                 pass
-            raise OpenRouterError(response.status_code, error_text)
+            raise OpenRouterError(
+                response.status_code,
+                _humanize_error(response.status_code, error_text)
+            )
 
         return response.json()
 
@@ -181,7 +213,15 @@ class OpenRouterClient:
                     error_bytes = await response.aread()
                     error_text = error_bytes.decode(errors="replace")
                     logger.error("Ошибка: %s", error_text[:500])
-                    raise OpenRouterError(response.status_code, error_text)
+                    try:
+                        error_text = json.loads(error_text).get(
+                            "error", {}).get("message", error_text)
+                    except (json.JSONDecodeError, AttributeError, TypeError):
+                        pass
+                    raise OpenRouterError(
+                        response.status_code,
+                        _humanize_error(response.status_code, error_text)
+                    )
 
                 logger.info("Начинаем чтение chunk'ов...")
                 chunk_count = 0
