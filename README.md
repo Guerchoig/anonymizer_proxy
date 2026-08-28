@@ -93,9 +93,29 @@ Windows блокирует скрипты, скачанные из интерн�
 
 ### macOS (M1–M4)
 
-```bash
-./install.sh
-```
+1. Скачайте `anonymizer-proxy-<версия>-macos.zip` из релиза и распакуйте.
+2. Откройте **Терминал** (Terminal) и перейдите в распакованную папку:
+
+   ```bash
+   cd ~/Downloads/anonymizer-proxy-<версия>-macos   # путь к распакованной папке
+   ```
+
+3. Запустите установщик:
+
+   ```bash
+   ./install.sh
+   ```
+
+4. Скрипт автоматически:
+   - проверит системные требования (Apple Silicon, macOS 12+, ОЗУ, место на
+     диске) и остановится с понятным сообщением, если их выполнить нельзя;
+   - установит `uv` (если его нет — одной командой curl) и нужную версию
+     Python;
+   - поставит зависимости CPU-варианта (`uv sync --locked --extra cpu`);
+   - создаст `.env` из примера, сгенерирует `PROXY_API_TOKEN`, пропишет
+     `NER_DEVICE=mps` и предложит ввести `OPENROUTER_API_KEY` (с проверкой
+     формата; Enter — пропустить и вписать позже);
+   - скачает NER-модели (GLiNER + Natasha) и выполнит самопроверку.
 
 Если shell сообщит «Permission denied», выполните `bash install.sh` —
 скрипту не требуется бит исполнения.
@@ -104,12 +124,27 @@ Windows блокирует скрипты, скачанные из интерн�
 CPU-вариант; ускорение на Apple Silicon даёт PyTorch-фоллбэк через Metal (MPS) —
 установщик прописывает `NER_DEVICE=mps` в `.env`.
 
+#### Если установщик на macOS не запускается
+
+- **«Permission denied»** при `./install.sh` — запустите через интерпретатор:
+  `bash install.sh` (бит исполнения не нужен) либо дайте право один раз:
+  `chmod +x install.sh`.
+- **«cannot be opened because the developer cannot be verified»** — macOS
+  пометила скачанные файлы меткой quarantine. Снимите её из папки проекта:
+  `xattr -dr com.apple.quarantine .` — и повторите запуск.
+- **Ошибка preflight** («Требуется Apple Silicon», «Требуется macOS 12+»,
+  «Недостаточно оперативной памяти», «Мало свободного места») — условия
+  обязательные, см. таблицу «Системные требования» выше.
+- В отличие от Windows, установщик не создаёт ярлык — прокси запускается
+  командой из Терминала (см. ниже); при желании добавьте alias в `~/.zshrc`.
+
 ### Запуск и остановка прокси
 
 **Запуск** — в зависимости от ОС:
 
 - Windows: ярлык **«Anonymizer Proxy»** в меню Пуск или `start_proxy.cmd`;
-- macOS/Linux: `./start_proxy.sh`.
+- macOS/Linux: в Терминале перейдите в папку проекта и выполните
+  `./start_proxy.sh` (если «Permission denied» — `bash start_proxy.sh`).
 
 При старте в консоли появляется баннер с режимом и NER-бэкендом:
 
@@ -120,18 +155,28 @@ Uvicorn running on http://127.0.0.1:8081
 
 **Проверка работоспособности:**
 
+Windows (PowerShell):
+
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8081/health
 ```
 
+macOS/Linux (curl):
+
+```bash
+curl http://127.0.0.1:8081/health
+```
+
 Поле `ner_backend` показывает фактический бэкенд инференса:
 `onnx (CUDAExecutionProvider, ...)` — NVIDIA GPU; `onnx (CPUExecutionProvider)` —
-CPU; `torch (...)` — аварийный фоллбек (см. WARNING в логе запуска).
+CPU (в том числе весь macOS-вариант; ускорение на M1–M4 даёт `torch (mps)`);
+`torch (...)` — аварийный фоллбек (см. WARNING в логе запуска).
 
-**Остановка:** `Ctrl+C` в окне прокси (или просто закройте окно).
+**Остановка:** `Ctrl+C` в окне прокси (или просто закройте окно/вкладку
+Терминала).
 
 > Чрезвычайная мера, если прокси завис и не реагирует: `taskkill /f /im python.exe`
-> (Windows) или `pkill -f python` (Linux/macOS). Завершает ВСЕ python-процессы
+> (Windows) или `pkill -f python` (macOS/Linux). Завершает ВСЕ python-процессы
 > машины — используйте только когда иначе никак.
 
 ### Подключение Cline (расширение VS Code)
@@ -656,6 +701,20 @@ GLiNER — основной контур: инференс идёт через *
    не загрузился, движок видимо откатывается на PyTorch (WARNING в лог).
    Фактический бэкенд и версия прокси показываются в `/health` и `/api/status`
    (`ner_backend`).
+   **Локальная LLM через LM Studio** (для сценариев, где данные не должны
+   покидать машину — например, модель должна работать с конфиденциальными
+   суммами в Excel): запустите LM Studio, загрузите модель и заполните в
+   `.env` `LOCAL_LLM_BASE_URL` / `LOCAL_LLM_MODEL`, затем перезапустите
+   прокси. Переключение бэкендов — **без перезапуска прокси**, тремя
+   способами: команда в чате («работай через локальную модель» /
+   «работай через облако»), `POST /api/backend {"backend": "local"}`
+   (`GET /api/backend` — текущий статус) или имя модели в Cline с префиксом
+   `local/`. На локальном бэкенде авто-анонимизация приложенных файлов
+   отключена (данные не покидают машину); thinking-вывод модели
+   (`<think>…</think>`, `reasoning_content`) вырезается из ответов.
+   Там же, в чате, работает команда **«перезапусти прокси»**: сервер
+   корректно завершится и поднимется заново через `.venv` (лог —
+   `data/logs/restart.log`); полезно после правок кода или `.env`.
 4. **Порог**: `NER_THRESHOLD` (по умолчанию 0.3) отсекает слабоуверенные
    сущности: выше — меньше ложных срабатываний, ниже — выше recall. Для
    redaction-задач полнота важнее точности: русские «Фамилия И.О.» в подписях
@@ -734,10 +793,20 @@ Natasha/Slovnet (`anonymizer/natasha_engine.py`):
 
 Ручное создание окружения:
 
+Windows (PowerShell/cmd):
+
 ```powershell
 cd <папка проекта>
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+macOS/Linux:
+
+```bash
+cd <папка проекта>
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ### Ручной запуск
@@ -771,7 +840,15 @@ cd /d <папка проекта>
 .venv\Scripts\activate.bat
 ```
 
+**macOS/Linux (zsh/bash)**:
+
+```bash
+cd <папка проекта>
+source .venv/bin/activate
+```
+
 **VS Code**: просто откройте папку проекта — интерпретатор `.venv`
+(`.venv\Scripts\python.exe` на Windows, `.venv/bin/python` на macOS/Linux)
 подхватывается автоматически (`settings.json`),
 `python.terminal.activateEnvironment` активирует окружение в каждом новом
 терминале, а запуск по **F5** (конфигурация «Запуск прокси») использует его
@@ -793,6 +870,14 @@ python anonymizer_proxy\main.py
 uvicorn anonymizer_proxy.main:app --host 127.0.0.1 --port 8081
 ```
 
+macOS/Linux — те же команды, но разделитель пути `/` и интерпретатор
+`python3`/`.venv/bin/python`:
+
+```bash
+python3 -m anonymizer_proxy.main
+python3 anonymizer_proxy/main.py
+```
+
 > **Важно:** запускать нужно из корня проекта (папки, содержащей пакет
 > `anonymizer_proxy`), иначе Python не найдёт пакет и упадёт с
 > `ModuleNotFoundError`.
@@ -800,7 +885,13 @@ uvicorn anonymizer_proxy.main:app --host 127.0.0.1 --port 8081
 > Если окружение не активировано, используйте полный путь к интерпретатору:
 >
 > ```powershell
+> # Windows
 > .venv\Scripts\python.exe -m anonymizer_proxy.main
+> ```
+>
+> ```bash
+> # macOS/Linux
+> .venv/bin/python -m anonymizer_proxy.main
 > ```
 
 При старте в логе появится баннер с режимом и NER-бэкендом:
@@ -828,6 +919,10 @@ Uvicorn running on http://127.0.0.1:8081
 - **TTL маппингов**: 24 часа (автоматическая очистка)
 
 ## Тесты
+
+> На macOS/Linux команды те же, но разделитель пути — `/`, а интерпретатор —
+> `.venv/bin/python`: например
+> `.venv/bin/python anonymizer_proxy/tests/test_fixes.py`.
 
 Функциональные тесты ключевых механизмов (пересчёт оффсетов для нескольких
 сообщений, буферизация разорванных токенов при стриминге, безопасная
@@ -996,9 +1091,10 @@ python anonymizer_proxy\tests\test_deanonymize_intercept.py
   `.venv`; запуск глобальным `python.exe` (например, `C:\Python314\python.exe`)
   даёт мгновенный `ModuleNotFoundError: gliner`, и все файлы получают ошибку
   анонимизации за доли секунды. Признак: в логе старта строка
-  «Интерпретатор: …» указывает не на `.venv\Scripts\python.exe`. Запускайте
-  прокси скриптом `start_proxy.cmd` (или `start_proxy.ps1`) из корня проекта —
-  они гарантированно используют `.venv`.
+  «Интерпретатор: …» указывает не на `.venv\Scripts\python.exe` (Windows) или
+  `.venv/bin/python` (macOS/Linux). Запускайте прокси скриптом
+  `start_proxy.cmd` (Windows) или `./start_proxy.sh` (macOS/Linux) из корня
+  проекта — они гарантированно используют `.venv`.
 - **«Natasha: скачивание …» падает с HTTPError / сетевой ошибкой** — первый
   запуск Natasha-контура качает веса (~29 МБ) с `storage.yandexcloud.net`
   в `data/models/`. Без интернета положите файлы
