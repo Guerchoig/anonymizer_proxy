@@ -1,4 +1,4 @@
-"""
+﻿"""
 Конфигурация прокси-сервера анонимизации
 """
 import logging
@@ -110,11 +110,60 @@ class Mode:
     
 CURRENT_MODE = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
 
+# ==================== Локальная LLM (LM Studio) ====================
+# LM Studio поднимает OpenAI-совместимый сервер (по умолчанию
+# http://127.0.0.1:1234/v1). Локальный бэкенд используется для сценариев,
+# где анонимизация мешает работе (например, модель должна считать
+# конфиденциальные суммы в ячейках): данные не покидают машину.
+LOCAL_LLM = {
+    "base_url": os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1"),
+    "api_key": os.getenv("LOCAL_LLM_API_KEY", "lm-studio"),
+    # Имя модели, загруженной в LM Studio (например, qwen3.5-9b-instruct).
+    # Запросы с этим именем модели (или с префиксом "local/") роутер
+    # направляет локально независимо от выбранного бэкенда.
+    "model": os.getenv("LOCAL_LLM_MODEL", ""),
+    # Локальная thinking-модель отвечает медленнее — таймаут больше
+    "timeout": float(os.getenv("LOCAL_LLM_TIMEOUT", "600")),
+}
+
+# ==================== Рантайм-состояние (без перезапуска) ====================
+# Активный LLM-бэкенд переключается на лету (чат-команда, /api/backend,
+# заголовок X-LLM-Backend). Не берётся из .env, чтобы не требовать
+# перезапуска; выбор сохраняется в data/runtime_state.json.
+RUNTIME = {"backend": "openrouter"}
+RUNTIME_STATE_PATH = DATA_DIR / "runtime_state.json"
+
+
+def load_runtime_state() -> None:
+    """Восстановить рантайм-состояние (активный бэкенд) с диска."""
+    import json
+    try:
+        if RUNTIME_STATE_PATH.is_file():
+            state = json.loads(RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+            backend = state.get("backend")
+            if backend in ("openrouter", "local"):
+                RUNTIME["backend"] = backend
+    except Exception as exc:  # noqa: BLE001 — битый файл не должен ронять старт
+        logger.warning("Не удалось прочитать runtime_state.json: %s", exc)
+
+
+def save_runtime_state() -> None:
+    """Сохранить рантайм-состояние (активный бэкенд) на диск."""
+    import json
+    try:
+        RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RUNTIME_STATE_PATH.write_text(
+            json.dumps(RUNTIME, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Не удалось сохранить runtime_state.json: %s", exc)
+
+
 # Версия прокси — единый источник (выводится в /health, /api/status,
 # FastAPI-приложении и баннере при старте). Увеличивайте при изменениях
 # кода: Python не перезагружает код в работающем сервере, и по /health
 # можно понять, выполняет ли процесс актуальную версию.
-PROXY_VERSION = "1.2.0"
+PROXY_VERSION = "1.3.0"
 
 # Категории PII для детекции
 PII_CATEGORIES = {

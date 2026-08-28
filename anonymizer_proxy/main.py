@@ -22,11 +22,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anonymizer_proxy.config import (
     Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, NER_ENGINE,
-    PROXY_VERSION, ensure_directories, logger
+    PROXY_VERSION, BASE_DIR, ensure_directories, logger
 )
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
-from anonymizer_proxy.proxy.openrouter_client import OpenRouterClient, OpenRouterError
+from anonymizer_proxy.proxy.openrouter_client import OpenRouterError
+from anonymizer_proxy.proxy.llm_router import LLMRouter
 from anonymizer_proxy.proxy.handlers import RequestHandler
 from anonymizer_proxy.models.schemas import (
     ChatCompletionRequest,
@@ -40,12 +41,41 @@ from anonymizer_proxy.models.schemas import (
     validate_session_id,
 )
 
+import asyncio
+import os
+import subprocess
+
 
 # Глобальные сервисы
 ner_service: Optional[NERService] = None
 mapping_store: Optional[MappingStore] = None
-openrouter_client: Optional[OpenRouterClient] = None
+openrouter_client: Optional[LLMRouter] = None
 request_handler: Optional[RequestHandler] = None
+
+
+def _schedule_proxy_restart(delay: float = 2.0) -> None:
+    """Чат-команда «перезапусти прокси»: ответ уже отправлен клиенту —
+    через delay запускаем отвязанный хелпер перезапуска (он ждёт
+    освобождения порта, поднимает сервер и пишет результат в
+    data/logs/restart.log) и завершаем этот процесс.
+    """
+    async def _job():
+        await asyncio.sleep(delay)
+        helper = BASE_DIR / "data" / "restart_helper.py"
+        subprocess.Popen(
+            [sys.executable, str(helper)],
+            cwd=str(BASE_DIR),
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.warning("Прокси завершается для перезапуска (чат-команда)")
+        await asyncio.sleep(0.2)
+        os._exit(0)
+    asyncio.get_event_loop().create_task(_job())
+
 
 
 def _is_local_bind() -> bool:
@@ -103,7 +133,7 @@ async def lifespan(app: FastAPI):
     mapping_store = MappingStore()
     await mapping_store.initialize()
 
-    openrouter_client = OpenRouterClient()
+    openrouter_client = LLMRouter()
     request_handler = RequestHandler(
         ner_service=ner_service,
         mapping_store=mapping_store,
@@ -321,6 +351,53 @@ async def chat_completions(
                 # команде («Анонимизируй файл…») — локальной NER-моделью,
                 # без облака. Явное anonymize=false отключает и перехват.
                 if chat_request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+                    # Чат-команды управления (только текущее сообщение
+                    # пользователя) — проверяются ПЕРВЫМИ
+                    if request_handler.detect_restart_request(chat_request):
+                        restart_text = request_handler._build_restart_text()
+
+                        async def _stream_restart():
+                            async for event in (
+                                request_handler.stream_text_response(
+                                    chat_request, restart_text)
+                            ):
+                                yield event
+                            _schedule_proxy_restart()
+
+                        return StreamingResponse(
+                            _stream_restart(),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",  # Для nginx
+                            }
+                        )
+                    backend_switch = request_handler.detect_backend_switch(
+                        chat_request
+                    )
+                    if backend_switch:
+                        request_handler.openrouter.set_backend(backend_switch)
+                        backend_text = (
+                            request_handler._build_backend_switch_text(
+                                backend_switch))
+
+                        async def _stream_backend():
+                            async for event in (
+                                request_handler.stream_text_response(
+                                    chat_request, backend_text)
+                            ):
+                                yield event
+
+                        return StreamingResponse(
+                            _stream_backend(),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",  # Для nginx
+                            }
+                        )
                     deanon_targets = request_handler.detect_deanonymize_request(
                         chat_request
                     )
@@ -348,7 +425,9 @@ async def chat_completions(
                     file_paths = request_handler.detect_attached_files_anonymization(
                         chat_request
                     )
-                    if file_paths:
+                    if file_paths and getattr(
+                            openrouter_client, "backend", "openrouter"
+                    ) == "openrouter":
                         # Сессию создаём заранее, чтобы проставить X-Session-Id
                         # в заголовке (сама подготовка теперь идёт в фоне).
                         files_session_id = await mapping_store.get_or_create_session(
@@ -416,6 +495,12 @@ async def chat_completions(
             chat_request,
             session_id=x_session_id
         )
+
+        # Чат-команда «перезапусти прокси»: ответ уйдёт клиенту, затем
+        # процесс завершится и поднимется заново (см. _schedule_proxy_restart)
+        meta = getattr(response, "anonymization_metadata", None) or {}
+        if meta.get("mode") == "proxy_restart":
+            _schedule_proxy_restart()
 
         # Возвращаем ответ с session_id в заголовке
         return JSONResponse(
@@ -614,11 +699,33 @@ async def health_check():
     }
 
 
+
+@app.get("/api/backend", dependencies=[Depends(require_api_token)])
+async def get_llm_backend():
+    """Текущий LLM-бэкенд и доступность обоих (OpenRouter / LM Studio)"""
+    return {
+        "backend": openrouter_client.backend,
+        "backends": await openrouter_client.backends_available(),
+    }
+
+
+@app.post("/api/backend", dependencies=[Depends(require_api_token)])
+async def set_llm_backend(body: dict):
+    """Переключить активный LLM-бэкенд без перезапуска: {"backend": "local" | "openrouter"}"""
+    backend = (body or {}).get("backend")
+    try:
+        active = openrouter_client.set_backend(backend)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"backend": active}
+
 @app.get("/api/status", dependencies=[Depends(require_api_token)])
 async def get_status():
     """Получить статус сервиса"""
     return {
         "version": PROXY_VERSION,
+        "llm_backend": openrouter_client.backend,
+        "llm_backends": (await openrouter_client.backends_available()) if openrouter_client else {},
         "mode": CURRENT_MODE,
         "ner_engine": {
             "available": ner_service.is_available(),

@@ -18,7 +18,9 @@ from ..anonymizer.replacer import (
     StreamDeAnonymizer,
     split_entities_by_segments,
 )
-from ..config import Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END
+from ..config import (
+    Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, LOCAL_LLM,
+)
 from ..models.schemas import (
     Entity,
     ChatCompletionRequest,
@@ -39,6 +41,9 @@ from .utils import (
     ANONYMIZER_DONE_MARKER_RE,
     SESSION_ID_LINE_RE,
     DEANONYMIZE_INTENT_RE,
+    RESTART_INTENT_RE,
+    LOCAL_BACKEND_RE,
+    CLOUD_BACKEND_RE,
     ANONYMIZER_COPY_MARKER_RE,
     ANONYMIZER_RESULT_MARKER_RE,
     _iter_content_texts,
@@ -890,6 +895,123 @@ class RequestHandler:
         )
 
 
+    # ==================== Чат-команды управления прокси ====================
+
+    def detect_restart_request(self, request: ChatCompletionRequest) -> bool:
+        """Чат-команда «перезапусти прокси» — только в ТЕКУЩЕМ сообщении
+        пользователя (команды из старых сообщений истории не срабатывают)."""
+        return any(
+            RESTART_INTENT_RE.search(text)
+            for text in last_user_message_texts(request.messages)
+        )
+
+    def detect_backend_switch(
+        self, request: ChatCompletionRequest,
+    ) -> Optional[str]:
+        """Чат-команда переключения бэкенда: 'local' | 'openrouter' | None."""
+        joined = "\n".join(last_user_message_texts(request.messages))
+        if RESTART_INTENT_RE.search(joined):
+            return None  # перезапуск приоритетнее — команды не смешиваем
+        if LOCAL_BACKEND_RE.search(joined):
+            return "local"
+        if CLOUD_BACKEND_RE.search(joined):
+            return "openrouter"
+        return None
+
+    @staticmethod
+    def _build_backend_switch_text(backend: str) -> str:
+        if backend == "local":
+            return (
+                "[ANONYMIZER] Активный LLM-бэкенд: локальная модель "
+                f"({LOCAL_LLM['model'] or 'LM Studio'}). Запросы в облако не "
+                "отправляются, данные не покидают машину; авто-анонимизация "
+                "приложенных файлов отключена. Вернуться в облако — команда "
+                "«работай через облако»."
+            )
+        return (
+            "[ANONYMIZER] Активный LLM-бэкенд: OpenRouter (облако). "
+            "Данные анонимизируются как раньше; перейти на локальную модель "
+            "можно командой «работай через локальную модель»."
+        )
+
+    @staticmethod
+    def _build_restart_text() -> str:
+        return (
+            "[ANONYMIZER] Прокси перезапускается. Это займёт 20–40 секунд "
+            "(NER-модель загружается заново) — первый запрос сразу после "
+            "перезапуска может не пройти по соединению, повторите его чуть "
+            "позже. Готовность: GET /health (поле version). Сессии и "
+            "маппинги сохранены (SQLite)."
+        )
+
+    async def stream_text_response(
+        self, request: ChatCompletionRequest, text: str,
+    ) -> AsyncIterator[str]:
+        """SSE-поток с готовым текстом (служебные ответы перехватов)."""
+        created = int(time.time())
+        response_id = f"proxy-command-{created}"
+
+        def chunk(delta: dict, finish: Optional[str] = None) -> str:
+            payload = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": request.model,
+                "choices": [{"index": 0, "delta": delta,
+                             "finish_reason": finish}],
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        yield chunk({"role": "assistant"})
+        for i in range(0, len(text), 80):
+            yield chunk({"content": text[i:i + 80]})
+        yield chunk({}, "stop")
+        yield "data: [DONE]\n\n"
+
+    def handle_backend_switch(
+        self, request: ChatCompletionRequest, backend: str,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Переключить активный LLM-бэкенд (без перезапуска сервера)."""
+        active = self.openrouter.set_backend(backend)
+        text = self._build_backend_switch_text(active)
+        response = ChatCompletionResponse(
+            id=f"backend-switch-{int(time.time())}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=text),
+                finish_reason="stop",
+            )],
+            usage=UsageInfo(),
+            anonymization_metadata={"mode": "backend_switch",
+                                    "backend": active},
+        )
+        return response, "backend-switch"
+
+    def handle_restart(
+        self, request: ChatCompletionRequest,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Подготовить ответ на чат-команду перезапуска.
+
+        Сам перезапуск выполняет main.py ПОСЛЕ отправки ответа клиенту
+        (метаданные mode == "proxy_restart").
+        """
+        text = self._build_restart_text()
+        response = ChatCompletionResponse(
+            id=f"proxy-restart-{int(time.time())}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=text),
+                finish_reason="stop",
+            )],
+            usage=UsageInfo(),
+            anonymization_metadata={"mode": "proxy_restart"},
+        )
+        return response, "restart"
+
     # ==================== Авто-де-анонимизация файлов ====================
 
     def detect_deanonymize_request(
@@ -1161,6 +1283,15 @@ class RequestHandler:
         # Passthrough: anonymize=False или режим passthrough по умолчанию
         if not request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
             if request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+                # Чат-команды управления прокси — проверяются ПЕРВЫМИ
+                # (только в текущем сообщении пользователя). Перезапуск:
+                # сам процесс завершает main.py после отправки ответа
+                # (метаданные mode == "proxy_restart").
+                if self.detect_restart_request(request):
+                    return self.handle_restart(request)
+                backend_switch = self.detect_backend_switch(request)
+                if backend_switch:
+                    return self.handle_backend_switch(request, backend_switch)
                 # Авто-де-анонимизация файлов по естественной команде
                 # («деанонимизируй файлы…»). Проверяем ДО анонимизации, т.к.
                 # слово «деанонимизируй» содержит «анонимизируй».
@@ -1172,8 +1303,12 @@ class RequestHandler:
                 # Автоматическая анонимизация приложенных файлов по явной команде
                 # («Анонимизируй файл…») — локальной NER-моделью, без облака.
                 # Явное anonymize=false отключает и перехват тоже.
+                # На локальном бэкенде (LM Studio) перехват отключён:
+                # данные не покидают машину, маскировать незачем.
                 file_paths = self.detect_attached_files_anonymization(request)
-                if file_paths:
+                if file_paths and getattr(
+                        self.openrouter, "backend", "openrouter"
+                ) == "openrouter":
                     return await self.handle_files_anonymization(
                         request, file_paths, session_id
                     )
@@ -1261,7 +1396,7 @@ class RequestHandler:
         try:
             cloud_response = await self.openrouter.chat_completion(
                 messages=final_messages,
-                model=None,
+                model=request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 top_p=request.top_p,
@@ -1480,7 +1615,7 @@ class RequestHandler:
 
             async for chunk in self.openrouter.chat_completion_stream(
                 messages=final_messages,
-                model=None,
+                model=request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 top_p=request.top_p,
@@ -1653,7 +1788,9 @@ class RequestHandler:
         "([URL_1], [ADDRESS_2], [ORG_1_SHORT] и т.п.): у прокси нет для них "
         "маппингов, де-анонимизация их не восстановит, а нумерация "
         "столкнётся с настоящими токенами. Сообщите пользователю, что нужна "
-        "повторная анонимизация исходника."
+        "повторная анонимизация исходника. Когда вызываете инструмент, "
+        "сначала завершите текущее предложение текстом ответа — не обрывайте "
+        "фразу на полуслове."
     )
 
     @classmethod
@@ -1723,7 +1860,7 @@ class RequestHandler:
 
         cloud_response = await self.openrouter.chat_completion(
             messages=messages_payload,
-            model=None,
+            model=request.model,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             top_p=request.top_p,
@@ -1812,7 +1949,7 @@ class RequestHandler:
         try:
             async for chunk in self.openrouter.chat_completion_stream(
                 messages=messages_payload,
-                model=None,
+                model=request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 top_p=request.top_p,
