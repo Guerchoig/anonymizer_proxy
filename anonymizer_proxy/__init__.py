@@ -19,10 +19,10 @@ Anonymizer Proxy - Прокси-сервер для анонимизации з�
     main()  # Запуск сервера
 """
 
-__version__ = "1.0.0"
-__author__ = "Anonymizer Proxy"
+from .config import Mode, CURRENT_MODE, PROXY_VERSION
 
-from .config import Mode, CURRENT_MODE
+__version__ = PROXY_VERSION
+__author__ = "Anonymizer Proxy"
 from .anonymizer import NERService, FileParser, MappingStore, TextReplacer
 from .proxy import OpenRouterClient, RequestHandler
 

@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anonymizer_proxy.config import (
     Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, NER_ENGINE,
-    ensure_directories, logger
+    PROXY_VERSION, ensure_directories, logger
 )
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
@@ -60,6 +60,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("=" * 60)
     logger.info("  Прокси-сервер анонимизации")
+    logger.info("  Версия: %s", PROXY_VERSION)
     logger.info("=" * 60)
     logger.info("  Режим: %s", CURRENT_MODE)
     logger.info("  Интерпретатор: %s", sys.executable)
@@ -142,7 +143,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Anonymizer Proxy",
     description="Прокси-сервер для анонимизации запросов к облачным LLM",
-    version="1.1.0",
+    version=PROXY_VERSION,
     lifespan=lifespan,
 )
 
@@ -605,6 +606,7 @@ async def health_check():
     """Проверка работоспособности сервиса"""
     return {
         "status": "healthy",
+        "version": PROXY_VERSION,
         "ner_available": ner_service.is_available(),
         "ner_backend": ner_service.backend_info(),
         "mode": CURRENT_MODE,
@@ -616,6 +618,7 @@ async def health_check():
 async def get_status():
     """Получить статус сервиса"""
     return {
+        "version": PROXY_VERSION,
         "mode": CURRENT_MODE,
         "ner_engine": {
             "available": ner_service.is_available(),

@@ -458,6 +458,35 @@ def test_money_without_currency_keyword():
     print(f"TEST 13 OK: MONEY без валюты — {len(money)} сумм, индексы целы")
 
 
+def test_replace_by_value_boundaries():
+    """replace_by_value: короткое значение не портит цифры в датах, суммах
+    и уже вставленных токенах (регрессия вложенных плейсхолдеров)"""
+    import re as _re
+
+    r = TextReplacer()
+    text = (
+        "Редакция 3, дата 31.07.2023, сумма [MONEY_63] и срок 13 дней. "
+        "Контрагент: АО «НПФ «БЛАГОСОСТОЯНИЕ»."
+    )
+    value_to_token = {
+        "3": "[ORG_120]",
+        "АО «НПФ «БЛАГОСОСТОЯНИЕ»": "[ORG_2]",
+    }
+    out = r.replace_by_value(text, value_to_token)
+
+    # Автономная '3' заменена
+    assert "Редакция [ORG_120]," in out, out
+    # Цифры внутри дат/сроков/токенов НЕ тронуты
+    assert "31.07.2023" in out, out
+    assert "13 дней" in out, out
+    assert "[MONEY_63]" in out, out
+    # Длинное значение заменено целиком
+    assert "[ORG_2]" in out and "БЛАГОСОСТОЯНИЕ" not in out, out
+    # Вложенных токенов не появилось
+    assert not _re.search(r"\[[A-Z_]+_\d+\[", out), out
+    print("TEST 14 OK: replace_by_value — границы слов защищают даты и токены")
+
+
 async def main():
     test_split_into_chunks_short()
     test_split_into_chunks_long()
@@ -474,6 +503,7 @@ async def main():
     test_regex_web_addresses()
     await test_web_roundtrip_replacement()
     test_money_without_currency_keyword()
+    test_replace_by_value_boundaries()
     print("\nALL NER QUALITY TESTS PASSED")
 
 

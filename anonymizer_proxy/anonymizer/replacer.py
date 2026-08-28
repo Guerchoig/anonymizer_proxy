@@ -153,13 +153,20 @@ class TextReplacer:
         Используется для анонимизации markdown-представления файлов: маппинг
         value -> token уже получен из NER, а оффсеты в markdown отличаются от
         оффсетов в плоском тексте (таблицы, разделители).
+
+        ВАЖНО: замена выполняется ОДНИМ regex-проходом с границами слова
+        (значение не примыкает к буквам/цифрам). Последовательный
+        str.replace здесь недопустим: короткое значение (например, мусорная
+        сущность '3' от GLiNER) тогда заменяет цифры внутри дат, сумм и уже
+        вставленных токенов — '[MONEY_63]' превращается в
+        '[MONEY_6[ORG_120]]', '2023' — в '202[ORG_120]'.
         """
         if not value_to_token or not text:
             return text
-        result = text
-        for value in sorted(value_to_token.keys(), key=len, reverse=True):
-            result = result.replace(value, value_to_token[value])
-        return result
+        values = sorted(value_to_token.keys(), key=len, reverse=True)
+        pattern = re.compile(
+            "(?<!\\w)(?:" + "|".join(re.escape(v) for v in values) + ")(?!\\w)")
+        return pattern.sub(lambda m: value_to_token[m.group(0)], text)
 
 
 class StreamDeAnonymizer:
