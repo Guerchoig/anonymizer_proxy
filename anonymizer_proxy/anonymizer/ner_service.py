@@ -144,6 +144,11 @@ class NERService:
         # Кэш в памяти процесса — сбрасывается перезапуском прокси.
         self._entities_cache: dict[str, list] = {}
 
+    @property
+    def engine(self):
+        """Доступ к GLiNER-движку (для ИИ-детектора чат-команд)."""
+        return self._engine
+
     async def warmup(self):
         """Прогреть NER-движки (загрузить веса)."""
         await self._engine.warmup()

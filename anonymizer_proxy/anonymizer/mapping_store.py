@@ -116,6 +116,21 @@ class MappingStore:
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS file_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(file_path, session_id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_file_sessions_path
+            ON file_sessions(file_path, created_at)
+        """)
+
         await db.commit()
 
         self._initialized = True
@@ -447,6 +462,30 @@ class MappingStore:
         path = session_dir / f"{prefix}_{timestamp}.md"
         path.write_text(text, encoding="utf-8")
         return path
+
+    async def register_file_session(self, file_path: str, session_id: str) -> None:
+        """Связать путь файла с сессией анонимизации (для частичной
+        де-анонимизации: по пути файла находится сессия с маппингами)."""
+        await self.initialize()
+        db = await self._get_db()
+        await db.execute(
+            "INSERT OR IGNORE INTO file_sessions (file_path, session_id) "
+            "VALUES (?, ?)",
+            (str(file_path), session_id),
+        )
+        await db.commit()
+
+    async def get_latest_session_for_file(self, file_path: str) -> Optional[str]:
+        """Последняя сессия анонимизации, создававшая этот файл."""
+        await self.initialize()
+        db = await self._get_db()
+        cursor = await db.execute(
+            "SELECT session_id FROM file_sessions "
+            "WHERE file_path = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (str(file_path),),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def get_all_sessions(self) -> list[dict]:
         """Возвращает список активных сессий с количеством маппингов."""

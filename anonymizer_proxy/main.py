@@ -1,4 +1,4 @@
-"""
+﻿"""
 Прокси-сервер для анонимизации запросов к облачным LLM
 FastAPI приложение с OpenAI-совместимым API
 """
@@ -75,7 +75,6 @@ def _schedule_proxy_restart(delay: float = 2.0) -> None:
         await asyncio.sleep(0.2)
         os._exit(0)
     asyncio.get_event_loop().create_task(_job())
-
 
 
 def _is_local_bind() -> bool:
@@ -345,83 +344,42 @@ async def chat_completions(
 
         # Стриминг режим
         if chat_request.stream:
+            # Чат-команды управления прокси — гибридная детекция (правила +
+            # GLiNER, см. RequestHandler.resolve_chat_command). Проверяются
+            # ПЕРВЫМИ и в ЛЮБОМ режиме (в т.ч. anonymize=false): команды
+            # перехватывает сам прокси, в облако они не уходят никогда.
+            command = await request_handler.resolve_chat_command(chat_request)
+            if command:
+                async def _prepare_command():
+                    return await request_handler.execute_chat_command(
+                        chat_request, command
+                    )
+
+                async def _stream_command(prepared):
+                    response, kind = prepared
+                    text = (response.choices[0].message.content
+                            if response.choices else "") or ""
+                    async for event in request_handler.stream_text_response(
+                            chat_request, text):
+                        yield event
+                    if kind == "restart":
+                        _schedule_proxy_restart()
+
+                return StreamingResponse(
+                    _stream_with_keepalive(_prepare_command, _stream_command),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",  # Для nginx
+                    }
+                )
             # Passthrough: anonymize=False или режим passthrough по умолчанию
             if not chat_request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
                 # Автоматическая анонимизация приложенных файлов по явной
                 # команде («Анонимизируй файл…») — локальной NER-моделью,
                 # без облака. Явное anonymize=false отключает и перехват.
                 if chat_request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
-                    # Чат-команды управления (только текущее сообщение
-                    # пользователя) — проверяются ПЕРВЫМИ
-                    if request_handler.detect_restart_request(chat_request):
-                        restart_text = request_handler._build_restart_text()
-
-                        async def _stream_restart():
-                            async for event in (
-                                request_handler.stream_text_response(
-                                    chat_request, restart_text)
-                            ):
-                                yield event
-                            _schedule_proxy_restart()
-
-                        return StreamingResponse(
-                            _stream_restart(),
-                            media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                                "X-Accel-Buffering": "no",  # Для nginx
-                            }
-                        )
-                    backend_switch = request_handler.detect_backend_switch(
-                        chat_request
-                    )
-                    if backend_switch:
-                        request_handler.openrouter.set_backend(backend_switch)
-                        backend_text = (
-                            request_handler._build_backend_switch_text(
-                                backend_switch))
-
-                        async def _stream_backend():
-                            async for event in (
-                                request_handler.stream_text_response(
-                                    chat_request, backend_text)
-                            ):
-                                yield event
-
-                        return StreamingResponse(
-                            _stream_backend(),
-                            media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                                "X-Accel-Buffering": "no",  # Для nginx
-                            }
-                        )
-                    deanon_targets = request_handler.detect_deanonymize_request(
-                        chat_request
-                    )
-                    if deanon_targets:
-                        async def _prepare_deanon():
-                            return await request_handler.prepare_deanonymize_files(
-                                chat_request, deanon_targets
-                            )
-
-                        async def _stream_deanon(prepared_deanon):
-                            async for event in request_handler.stream_deanonymize_files(
-                                chat_request, prepared_deanon
-                            ):
-                                yield event
-
-                        return StreamingResponse(
-                            _stream_with_keepalive(_prepare_deanon, _stream_deanon),
-                            media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                                "X-Accel-Buffering": "no",  # Для nginx
-                            }
-                        )
                     file_paths = request_handler.detect_attached_files_anonymization(
                         chat_request
                     )
@@ -697,7 +655,6 @@ async def health_check():
         "mode": CURRENT_MODE,
         "timestamp": datetime.now().isoformat(),
     }
-
 
 
 @app.get("/api/backend", dependencies=[Depends(require_api_token)])

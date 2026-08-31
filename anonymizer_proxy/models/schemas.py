@@ -1,4 +1,4 @@
-"""
+﻿"""
 Pydantic схемы данных для прокси-сервера анонимизации
 """
 import re
@@ -133,11 +133,6 @@ class AnonymizeFileRequest(BaseModel):
         None,
         description="Куда сохранить анонимизированную копию (по умолчанию — <name>.anonymized.<ext> рядом с оригиналом)",
     )
-
-    @field_validator("session_id")
-    @classmethod
-    def _check_session_id(cls, v: Optional[str]) -> Optional[str]:
-        return validate_session_id(v)
 
 
 class DeanonymizeRequest(BaseModel):

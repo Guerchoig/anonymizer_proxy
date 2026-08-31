@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from ..models.schemas import Entity
 from ..config import NER_ENGINE
@@ -396,6 +396,48 @@ class GlinerEngine:
                     "(NER_TIMEOUT_SECONDS)"
                 ) from exc
         return await future
+
+    async def predict_with_labels(
+        self, text: str, labels: List[str], threshold: float = 0.0,
+        timeout: Optional[float] = None,
+    ) -> List[dict]:
+        """
+        Zero-shot инференс с произвольными метками (вне PII-схемы).
+
+        Используется ИИ-детектором чат-команд: GLiNER сравнивает текст с
+        классами-описаниями («команда переключения на облако» и т.п.).
+        Чанкование не нужно — детектируются короткие сообщения; инференс
+        выполняется в том же executor-потоке, что и основной NER-путь.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._executor, self._predict_raw, text, labels, threshold,
+        )
+        effective_timeout = timeout if timeout and timeout > 0 else self._timeout
+        if effective_timeout and effective_timeout > 0:
+            try:
+                return await asyncio.wait_for(future, timeout=effective_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "GLiNER: таймаут predict_with_labels (%.0f с)",
+                    effective_timeout,
+                )
+                return []
+        return await future
+
+    def _predict_raw(
+        self, text: str, labels: List[str], threshold: float,
+    ) -> List[dict]:
+        """Синхронный инференс с сырыми метками (без маппинга категорий)."""
+        self._ensure_loaded()
+        if not self._model or not labels:
+            return []
+        return list(self._model.predict_entities(
+            text=text,
+            labels=list(labels),
+            flat_ner=True,
+            threshold=max(0.0, float(threshold)),
+        ))
 
     async def close(self) -> None:
         """Освободить ресурсы."""

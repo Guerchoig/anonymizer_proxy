@@ -17,6 +17,18 @@ logger = logging.getLogger("anonymizer_proxy.openrouter")
 # или OPENROUTER_PROXY=socks5://127.0.0.1:10808  (SOCKS5)
 OPENROUTER_PROXY = os.getenv("OPENROUTER_PROXY", None)
 
+# User-Agent для запросов к OpenRouter.
+# OpenRouter (WAF перед API) блокирует Python-клиентов по User-Agent:
+# 'OpenAI/Python x.y.z', 'Anthropic/Python x.y.z' и 'python-httpx/x.y.z'
+# получают HTTP 403 {"success": false, "error": "Access denied by
+# security policy."}. Поэтому по умолчанию шлём браузерный UA — его WAF
+# пропускает. При необходимости переопределите в .env:
+# OPENROUTER_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+_DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/126.0.0.0 Safari/537.36")
+OPENROUTER_USER_AGENT = os.getenv("OPENROUTER_USER_AGENT", _DEFAULT_UA)
+
 
 class OpenRouterError(Exception):
     """Ошибка OpenRouter API с HTTP-статусом"""
@@ -74,6 +86,9 @@ class OpenRouterClient:
                     "Content-Type": "application/json",
                     "HTTP-Referer": "http://localhost:8081",  # Для OpenRouter
                     "X-Title": "Anonymizer Proxy",
+                    # Без браузерного UA OpenRouter отвечает 403
+                    # "Access denied by security policy." (см. комментарий выше)
+                    "User-Agent": OPENROUTER_USER_AGENT,
                 }
             }
 

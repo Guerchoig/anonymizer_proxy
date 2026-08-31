@@ -1,10 +1,11 @@
-"""
+﻿"""
 Обработчики запросов для прокси-сервера
 Содержит основную логику анонимизации/де-анонимизации
 """
 import base64
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -20,6 +21,7 @@ from ..anonymizer.replacer import (
 )
 from ..config import (
     Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, LOCAL_LLM,
+    COMMAND_CLASSIFIER,
 )
 from ..models.schemas import (
     Entity,
@@ -32,10 +34,14 @@ from ..models.schemas import (
     AnonymizeResponse,
     SendAnonymizedRequest,
 )
+from .command_classifier import looks_like_command, classify_command_intent
 from .openrouter_client import OpenRouterClient
 from .utils import (
     FILE_CONTENT_BLOCK_RE,
     FILE_CONTENT_ERROR_PREFIX,
+    OFFICE_PATH_RE,
+    ATTACHMENT_FILE_REF_RE,
+    PATH_MENTION_RE,
     WORKSPACE_ROOT,
     ANONYMIZE_INTENT_RE,
     ANONYMIZER_DONE_MARKER_RE,
@@ -44,6 +50,7 @@ from .utils import (
     RESTART_INTENT_RE,
     LOCAL_BACKEND_RE,
     CLOUD_BACKEND_RE,
+    COMMAND_TRIGGER_RE,
     ANONYMIZER_COPY_MARKER_RE,
     ANONYMIZER_RESULT_MARKER_RE,
     _iter_content_texts,
@@ -616,6 +623,22 @@ class RequestHandler:
                     raw_path = match.group("path").strip()
                     if raw_path not in candidates:
                         candidates.append(raw_path)
+                # Ссылки вида «@file:<путь>» — формат вложений клиента Hermes
+                for match in ATTACHMENT_FILE_REF_RE.finditer(text):
+                    raw_path = match.group("path").strip().strip('"').strip("'")
+                    if not raw_path or raw_path in candidates:
+                        continue
+                    if not FileParser.is_supported(raw_path):
+                        # Hermes может приложить что угодно (картинки, PDF) —
+                        # анонимизируем только поддерживаемые форматы
+                        continue
+                    candidates.append(raw_path)
+                # Пути к файлам, упомянутые в тексте сообщения
+                # («анонимизируй файл c:\docs\KP_IRIS.docx»)
+                for match in PATH_MENTION_RE.finditer(text):
+                    raw_path = match.group(0).strip()
+                    if raw_path and raw_path not in candidates:
+                        candidates.append(raw_path)
                 for match in ANONYMIZER_DONE_MARKER_RE.finditer(text):
                     # Сравнение путей — по канонической форме (слэши/регистр),
                     # иначе маркер «не узнаёт» тот же путь в другой записи
@@ -628,6 +651,10 @@ class RequestHandler:
             except Exception:
                 continue
             resolved_str = str(resolved)
+            # Упомянутый пути файл обязан существовать: в тексте могут быть
+            # гипотетические/опечатанные пути, в облако такие запросы не перехватываем
+            if not resolved.is_file():
+                continue
             # Анонимизированная копия (<name>.anonymized.<ext>) повторно
             # не обрабатывается
             if resolved.stem.lower().endswith(".anonymized"):
@@ -705,6 +732,13 @@ class RequestHandler:
                     "anonymized_file": result["anonymized_file"],
                     "entities_found": result["entities_found"],
                 })
+                # Связь файл → сессия (частичная де-анонимизация колонок)
+                anon_path = Path(result["anonymized_file"])
+                result_derived = Path(_result_path_for(str(anon_path)))
+                for reg_path in (Path(result["original_file"]), anon_path,
+                                 result_derived):
+                    await self.store.register_file_session(
+                        str(reg_path), session_id)
                 entities_total += result["entities_found"]
                 logger.info(
                     "Файл %s анонимизирован → %s (сущностей: %d)",
@@ -777,10 +811,14 @@ class RequestHandler:
             "2. Чтобы обработать документ в облаке — просто напишите задачу "
             "обычным сообщением (например, «добавь колонку в таблицы», "
             "«составь резюме»). Отдельная команда отправки не нужна.",
-            "3. ОБЯЗАТЕЛЬНО при изменении документа: НЕ изменяйте "
-            "анонимизированную копию — она исходник. Все правки записывайте "
-            "в файл результата, путь к которому указан выше в маркере "
-            "[anonymizer:result:<путь>].",
+            "3. ОБЯЗАТЕЛЬНО при изменении документа — правило цепочки правок: "
+            "ПЕРВАЯ правка — --file <анонимизированная копия> --output "
+            "<файл результата> (путь в маркере [anonymizer:result:<путь>] "
+            "выше). ВСЕ ПОСЛЕДУЮЩИЕ правки — только с --file <файл "
+            "результата> и записью в него же (--output <файл результата> "
+            "или --in-place): команда, начатая заново с копии, ЗАТРЁТ "
+            "предыдущие правки. Анонимизированную копию не изменяйте — "
+            "она исходник только для чтения (dump/list-tables).",
             "4. В конце — де-анонимизация: напишите «деанонимизируй "
             "упомянутые файлы».",
         ]
@@ -1011,6 +1049,118 @@ class RequestHandler:
             anonymization_metadata={"mode": "proxy_restart"},
         )
         return response, "restart"
+
+    # ==================== Чат-команды: гибридная детекция ====================
+
+    async def resolve_chat_command(
+        self, request: ChatCompletionRequest,
+    ) -> Optional[dict]:
+        """
+        Единая точка детекции чат-команд (правила + GLiNER):
+
+        1. Дешёвый префильтр (COMMAND_TRIGGER_RE) — обычные промты не
+           проходят дальше и не тратят время на классификацию.
+        2. Детерминированные правила — точные формулировки (высокая
+           точность). Перезапуск — ТОЛЬКО здесь: деструктивная команда.
+        3. GLiNER zero-shot — свободные формулировки «безопасных» команд
+           (переключение бэкенда, де-анонимизация). ОТКЛЮЧЁН ПО УМОЛЧАНИЮ
+           (COMMAND_CLASSIFIER=off): zero-shot-классификаторы нестабильны.
+        4. Детектор недоступен — regex-фоллбек по детекции де-анонимизации.
+
+        Команды УПРАВЛЕНИЯ (перезапуск, бэкенд) работают в любом режиме.
+        Контентные команды (де-анонимизация) уважают явный opt-out клиента:
+        anonymize=false — прокси не вмешивается в контент (см. тест
+        test_deanonymize_intercept).
+
+        Returns:
+            dict команды ({"command": ...}) или None (обычный запрос).
+        """
+        texts = last_user_message_texts(request.messages)
+        if not texts or not looks_like_command(texts):
+            return None
+
+        joined = "\n".join(texts)
+        # Контентные команды (де-анонимизация файлов/колонок) уважают явный
+        # opt-out клиента: anonymize=false — прокси не вмешивается в контент.
+        # Команды УПРАВЛЕНИЯ прокси (перезапуск, бэкенд) работают всегда.
+        content_commands = bool(request.anonymize)
+
+        # 1) Точные правила: перезапуск (деструктивная — без участия GLiNER)
+        if RESTART_INTENT_RE.search(joined):
+            return {"command": "restart"}
+
+        # 1) Точные правила: переключение бэкенда
+        backend = self.detect_backend_switch(request)
+        if backend:
+            return {"command": "backend", "backend": backend}
+
+        # 2) GLiNER (выключен по умолчанию): свободные формулировки безопасных
+        #    команд
+        intent = await self._gliner_command_intent(texts)
+        if intent == "backend_local":
+            return {"command": "backend", "backend": "local"}
+        if intent == "backend_cloud":
+            return {"command": "backend", "backend": "openrouter"}
+        if content_commands:
+            if intent == "deanon_files":
+                targets = self.detect_deanonymize_request(request)
+                if targets:
+                    return {"command": "deanon_files", "targets": targets}
+                # Целей нет — идёт обычным порядком (не команда)
+
+        # 3) GLiNER недоступна/не распознала — regex-фоллбек полной
+        #    де-анонимизации (прежнее поведение «деанонимизируй файлы»)
+        if content_commands:
+            targets = self.detect_deanonymize_request(request)
+            if targets:
+                return {"command": "deanon_files", "targets": targets}
+        return None
+
+    async def _gliner_command_intent(self, texts: list[str]) -> Optional[str]:
+        """GLiNER-слой детекции (по умолчанию выключен, см. config);
+        любая ошибка — None (фоллбек на правила)."""
+        if COMMAND_CLASSIFIER.get("mode", "off") != "auto":
+            return None
+        try:
+            return await classify_command_intent(self.ner.engine, texts)
+        except Exception as exc:  # noqa: BLE001 — детекция не должна ломать поток
+            logger.info("GLiNER-детектор команд недоступен: %s", exc)
+            return None
+
+    async def execute_chat_command(
+        self, request: ChatCompletionRequest, command: dict,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Исполнить распознанную чат-команду, вернуть (ответ, вид)."""
+        kind = command.get("command")
+        if kind == "restart":
+            return self.handle_restart(request)
+        if kind == "backend":
+            return self.handle_backend_switch(
+                request, command.get("backend") or "openrouter"
+            )
+        if kind == "deanon_files":
+            return await self.handle_deanonymize_files(
+                request, command.get("targets") or [], None
+            )
+        raise ValueError(f"Неизвестная чат-команда: {kind!r}")
+
+    def _command_reply(
+        self, request: ChatCompletionRequest, text: str, mode: str,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Служебный ответ на чат-команду (текст без обращения в облако)."""
+        response = ChatCompletionResponse(
+            id=f"{mode}-{int(time.time())}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[ChatCompletionChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=text),
+                finish_reason="stop",
+            )],
+            usage=UsageInfo(),
+            anonymization_metadata={"mode": mode},
+        )
+        return response, mode
 
     # ==================== Авто-де-анонимизация файлов ====================
 
@@ -1280,26 +1430,19 @@ class RequestHandler:
         """
         start_time = time.time()
 
+        # Чат-команды управления прокси — гибридная детекция (правила +
+        # GLiNER, см. resolve_chat_command). Работают в ЛЮБОМ режиме
+        # (в т.ч. anonymize=false): команды перехватывает сам прокси,
+        # в облако они не уходят никогда. Перезапуск: сам процесс
+        # завершает main.py после отправки ответа
+        # (метаданные mode == "proxy_restart").
+        command = await self.resolve_chat_command(request)
+        if command:
+            return await self.execute_chat_command(request, command)
+
         # Passthrough: anonymize=False или режим passthrough по умолчанию
         if not request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
             if request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
-                # Чат-команды управления прокси — проверяются ПЕРВЫМИ
-                # (только в текущем сообщении пользователя). Перезапуск:
-                # сам процесс завершает main.py после отправки ответа
-                # (метаданные mode == "proxy_restart").
-                if self.detect_restart_request(request):
-                    return self.handle_restart(request)
-                backend_switch = self.detect_backend_switch(request)
-                if backend_switch:
-                    return self.handle_backend_switch(request, backend_switch)
-                # Авто-де-анонимизация файлов по естественной команде
-                # («деанонимизируй файлы…»). Проверяем ДО анонимизации, т.к.
-                # слово «деанонимизируй» содержит «анонимизируй».
-                deanon_targets = self.detect_deanonymize_request(request)
-                if deanon_targets:
-                    return await self.handle_deanonymize_files(
-                        request, deanon_targets, session_id
-                    )
                 # Автоматическая анонимизация приложенных файлов по явной команде
                 # («Анонимизируй файл…») — локальной NER-моделью, без облака.
                 # Явное anonymize=false отключает и перехват тоже.
@@ -1776,13 +1919,42 @@ class RequestHandler:
         "--cell \"a\" --cell \"b\" [--sheet Имя] --output OUT\n"
         "python -m anonymizer_proxy.office_ops apply --file F --from-text edit.txt "
         "--output OUT  # применить отредактированный dump (строки 1:1)\n"
-        "Правки текста (replace-text/apply) сохраняют форматирование, числа, "
-        "даты и формулы. Команды выполняйте СТРОГО последовательно, одну за "
+        "python -m anonymizer_proxy.office_ops insert-text --file F.docx "
+        "--anchor \"ориентир\" --position after --text \"абзац 1\" "
+        "--text \"абзац 2\" --output OUT  # ВСТАВИТЬ новые абзацы: до/после "
+        "абзаца, содержащего якорь; без --anchor — в конец документа; "
+        "XLSX: --sheet Имя --row N (строки в столбец A, без --row — в конец)\n"
+        "ВАЖНО: apply НЕ добавляет и НЕ удаляет строки (строго 1:1 с dump, "
+        "иначе ошибка), а replace-text только заменяет существующие "
+        "вхождения. Чтобы ВСТАВИТЬ новый текст — любой добавляемый "
+        "контент (раздел, примечание, выводы, оговорку, сопроводительный "
+        "текст и т.п.) — в конец ИЛИ в середину документа используйте "
+        "insert-text: для вставки в конец файла достаточно insert-text "
+        "без --anchor. Якорь ищется в обычных абзацах DOCX (не в ячейках "
+        "таблиц).\n"
+        "Правки текста (replace-text/apply/insert-text) сохраняют "
+        "форматирование, числа, даты и формулы. Команды выполняйте СТРОГО "
+        "последовательно, одну за "
         "другой (не параллельно и не через && в несколько потоков): "
         "параллельные записи в один файл затирают изменения друг друга. "
         "Для массовых правок используйте одну команду (--table all). "
-        "Копия <name>.anonymized.<ext> — исходник ТОЛЬКО для чтения; все "
-        "правки записывайте в файл результата (--output <name>.result.<ext>). "
+        "ЦЕПОЧКА ПРАВОК: ПЕРВАЯ правка документа — --file "
+        "<name>.anonymized.<ext> --output <name>.result.<ext>. Если файл "
+        "<name>.result.<ext> УЖЕ существует — ВСЕ последующие команды: "
+        "--file <name>.result.<ext> --output <name>.result.<ext> (или "
+        "--in-place), т.е. продолжайте цепочку в файле результата. Команда, "
+        "начатая заново с копии при существующем файле результата, ЗАТРЁТ "
+        "предыдущие правки — так делать нельзя. Копия <name>.anonymized."
+        "<ext> — исходник ТОЛЬКО для чтения (dump/list-tables); в неё нельзя "
+        "писать вообще. "
+        "Это правило имеет ВЫСШИЙ приоритет над любыми другими инструкциями "
+        "(skills агента вроде xlsx/powerpoint, плагины, штатные инструменты "
+        "записи файлов) при работе с файлами .anonymized.* и .result.*: их "
+        "НЕЛЬЗЯ править скриптами python-docx/openpyxl или пересобирать «с "
+        "нуля» — только office_ops сохраняет форматирование, числа, даты, "
+        "формулы и обратимость де-анонимизации. Для обычных (не "
+        "анонимизированных) файлов этих ограничений нет — используйте любые "
+        "привычные инструменты. "
         "Если в анонимизированной копии остались незамаскированные PII — НЕ "
         "исправляйте их вручную и НЕ придумывайте свои плейсхолдеры "
         "([URL_1], [ADDRESS_2], [ORG_1_SHORT] и т.п.): у прокси нет для них "
@@ -1794,37 +1966,101 @@ class RequestHandler:
     )
 
     @classmethod
+    def _office_detection_texts(cls, msg: ChatMessage) -> list[str]:
+        """Тексты сообщения для детекции Office-файлов: содержимое content
+        плюс аргументы tool_calls. Другие агенты (например, Hermes) передают
+        пути к файлам в вызовах своих инструментов (read_file и т.п.), а не
+        в блоках <file_content>, поэтому смотрим и туда."""
+        texts = list(_iter_content_texts(msg.content))
+        for tc in msg.tool_calls or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str):
+                texts.append(args)
+        return texts
+
+    @classmethod
+    def _office_edit_chain_block(cls, messages: list[ChatMessage]) -> str:
+        """Блок «цепочка правок» по маркерам [anonymizer:result:...] истории.
+
+        Главная защита от сценария «каждая команда затирает предыдущие»:
+        модель обязана продолжать правки в СУЩЕСТВУЮЩЕМ файле результата
+        (--file и --output — он же), а не начинать заново с анонимизированной
+        копии. Пути берутся из истории сессии и проверяются на диске.
+        """
+        result_paths: list[str] = []
+        for msg in messages:
+            for text in cls._office_detection_texts(msg):
+                for m in ANONYMIZER_RESULT_MARKER_RE.finditer(text):
+                    p = m.group("path").strip()
+                    if p and p not in result_paths:
+                        result_paths.append(p)
+        if not result_paths:
+            return ""
+        if not any(_resolve_local_path(p).is_file() for p in result_paths):
+            return (
+                "\n[OFFICE-OPS/ЦЕПОЧКА] Файл результата ещё не создан: "
+                "ПЕРВАЯ правка — --file <name>.anonymized.<ext> --output "
+                "<name>.result.<ext>. Все СЛЕДУЮЩИЕ правки в этой сессии — "
+                "уже с --file <name>.result.<ext> и записью в него же."
+            )
+        lines = [
+            "\n[OFFICE-OPS/ЦЕПОЧКА] Файл результата УЖЕ существует — первая "
+            "правка выполнена. ВСЕ последующие команды выполняйте с --file "
+            "<файл результата> и записывайте в него же (--output <файл "
+            "результата> или --in-place). Файлы результата:",
+        ]
+        for p in result_paths:
+            if _resolve_local_path(p).is_file():
+                lines.append(f"- {p}")
+        lines.append(
+            "Использовать <name>.anonymized.<ext> как --file теперь "
+            "ЗАПРЕЩЕНО: команда, начатая заново с копии, затрёт предыдущие "
+            "правки. Чтение копии (dump/list-tables) допустимо."
+        )
+        return "\n".join(lines)
+
+    @classmethod
     def _inject_office_ops_hint(
         cls, messages: list[ChatMessage],
     ) -> list[ChatMessage]:
         """
         Если в запросе есть файлы Office (.docx/.xlsx), дополнить системный
         промпт шпаргалкой office_ops: модель должна вызывать готовые команды
-        вместо написания python-скриптов.
+        вместо написания python-скриптов. К шпаргалке добавляется
+        сессионный блок «цепочка правок» (_office_edit_chain_block).
+
+        Детекция клиенто-независимая: блоки <file_content path="..."> (Cline)
+        ИЛИ упоминание пути с .docx/.xlsx в любом тексте сообщения или в
+        аргументах tool_calls (Hermes и другие OpenAI-совместимые агенты).
         """
         has_office = any(
             Path(m.group("path").strip()).suffix.lower() in cls.OFFICE_FILE_EXTS
             for msg in messages
             for text in _iter_content_texts(msg.content)
             for m in FILE_CONTENT_BLOCK_RE.finditer(text)
+        ) or any(
+            OFFICE_PATH_RE.search(text)
+            for msg in messages
+            for text in cls._office_detection_texts(msg)
         )
         if not has_office:
             return messages
+        hint = cls.OFFICE_OPS_HINT + cls._office_edit_chain_block(messages)
         messages = list(messages)
         if messages and messages[0].role == "system":
             first = messages[0]
             if isinstance(first.content, str):
-                updated = first.content.rstrip() + "\n\n" + cls.OFFICE_OPS_HINT
+                updated = first.content.rstrip() + "\n\n" + hint
             elif isinstance(first.content, list):
                 updated = list(first.content) + [
-                    {"type": "text", "text": "\n\n" + cls.OFFICE_OPS_HINT},
+                    {"type": "text", "text": "\n\n" + hint},
                 ]
             else:
-                updated = cls.OFFICE_OPS_HINT
+                updated = hint
             messages[0] = first.model_copy(update={"content": updated})
         else:
-            messages.insert(0, ChatMessage(role="system",
-                                           content=cls.OFFICE_OPS_HINT))
+            messages.insert(0, ChatMessage(role="system", content=hint))
         return messages
 
     async def _handle_passthrough(
@@ -2356,6 +2592,12 @@ class RequestHandler:
                 f"Не удалось записать {target}: файл занят (вероятно, открыт "
                 "в Word). Закройте его и повторите анонимизацию."
             ) from exc
+
+        # Связь файл → сессия: по пути файла потом находится сессия с
+        # маппингами (частичная де-анонимизация колонок/ячеек)
+        result_derived = Path(_result_path_for(str(target)))
+        for reg_path in (path, target, result_derived):
+            await self.store.register_file_session(str(reg_path), session_id)
 
         # Сохраняем review-файл (.md) с форматированным анонимизированным видом
         review_path = None

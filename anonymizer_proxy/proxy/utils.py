@@ -1,4 +1,4 @@
-"""
+﻿"""
 Утилиты прокси: пути файлов, блоки <file_content>, намерения анонимизации.
 
 Вынесено из handlers.py, чтобы уменьшить god-object и дать чистым функциям
@@ -20,6 +20,28 @@ FILE_CONTENT_BLOCK_RE = re.compile(
 # Префикс заглушки-ошибки: клиент не смог прочитать файл (обычно бинарный
 # документ вида DOCX/XLSX) и прислал вместо содержимого текст ошибки
 FILE_CONTENT_ERROR_PREFIX = "Error fetching content"
+# Упоминание Office-файла (.docx/.xlsx) в произвольном тексте. Клиенто-
+# независимый триггер шпаргалки office_ops: Cline присылает блоки
+# <file_content path="...">, другие агенты (Hermes и т.п.) — пути в тексте
+# сообщений и в аргументах tool_calls. Требуем непробельные символы перед
+# расширением (имя/путь файла), чтобы не срабатывать на «форматы .docx»
+# без конкретного файла.
+OFFICE_PATH_RE = re.compile(r"\S+\.(?:docx|xlsx)\b", re.IGNORECASE)
+# Ссылки на файлы в стиле Hermes: «@file:<путь>» в тексте сообщения.
+# Desktop-клиент Hermes передаёт вложения такими ссылками (без блоков
+# <file_content path="...">); путь может быть в кавычках.
+ATTACHMENT_FILE_REF_RE = re.compile(
+    r"@file:(?P<path>\"[^\"]+\"|'[^']+'|[^\s,;)\]]+)",
+    re.IGNORECASE,
+)
+# Упоминание файла поддерживаемого формата простым путём в тексте сообщения
+# («анонимизируй файл c:\docs\KP_IRIS.docx») — без @file: и без <file_content>.
+# Граница \b отсекает замыкающую пунктуацию («…docx.» / «…docx,»); несуществующие
+# пути отфильтровываются при разрешении (файл обязан существовать).
+PATH_MENTION_RE = re.compile(
+    r"[^\s\"'<>|*?]+\.(?:docx|xlsx|xml|txt|md)\b",
+    re.IGNORECASE,
+)
 # Корень рабочей области для относительных путей из <file_content path="...">
 # (BASE_DIR — корень проекта, он же workspace; сервер запускается из него)
 WORKSPACE_ROOT = BASE_DIR
@@ -38,9 +60,14 @@ SESSION_ID_LINE_RE = re.compile(r"session_id:\s*([A-Za-z0-9_-]{1,64})")
 DEANONYMIZE_INTENT_RE = re.compile(r"де.?анонимиз|deanonymi[sz]", re.IGNORECASE)
 # Чат-команды управления прокси (проверяются ТОЛЬКО в текущем сообщении
 # пользователя — см. last_user_message_texts): перезапуск сервера и
-# переключение активного LLM-бэкенда (OpenRouter / локальная LM Studio)
+# переключение активного LLM-бэкенда (OpenRouter / локальная LM Studio).
+# «перезагрузи прокси» и «рестартни сервер» — те же команды другими словами.
 RESTART_INTENT_RE = re.compile(
-    r"перезапусти\w*\s+(?:прокси|сервер)|перезапуск\s+(?:прокси|сервера)",
+    r"(?:перезапусти|перезапустить|перезагрузи|перезагрузить"
+    r"|рестартни|рестартан)\w*\s+(?:прокси|сервер)"
+    r"|перезапуск\s+(?:прокси|сервера)"
+    r"|перезагрузк\w+\s+(?:прокси|сервера)"
+    r"|\brestart\s+(?:the\s+)?proxy\b",
     re.IGNORECASE,
 )
 LOCAL_BACKEND_RE = re.compile(
@@ -56,6 +83,18 @@ CLOUD_BACKEND_RE = re.compile(
 ANONYMIZER_COPY_MARKER_RE = re.compile(r"\[anonymizer:copy:(?P<path>[^\]]+)\]")
 # Маркер пути «файла результата» — куда модель пишет правки, не изменяя копию
 ANONYMIZER_RESULT_MARKER_RE = re.compile(r"\[anonymizer:result:(?P<path>[^\]]+)\]")
+# Дешёвый префильтр-подозрение на чат-команду прокси (детектирование гибридное:
+# правила + ИИ-классификация). Специально НЕ включает одиночное «анонимиз» —
+# у авто-анонимизации приложенных файлов свой детерминированный триггер.
+# Ложные срабатывания (упоминание «прокси»/«локальн» в обычном тексте) не
+# страшны: ИИ-классификатор вернёт none, и запрос пойдёт обычным порядком.
+COMMAND_TRIGGER_RE = re.compile(
+    r"перезапус|перезагруз|рестарт|\brestart\b"
+    r"|прокси|\bproxy\b|бэкенд|бекенд|\bbackend\b"
+    r"|локальн|обла(?:чн|к)|openrouter|опенроутер"
+    r"|де.?анонимиз|deanonymi",
+    re.IGNORECASE,
+)
 
 
 def _iter_content_texts(content) -> list[str]:
@@ -84,7 +123,15 @@ def _resolve_local_path(path_str: str) -> Path:
             path_str = path_str[1:]
     path = Path(path_str)
     if not path.is_absolute():
-        path = (WORKSPACE_ROOT / path).resolve()
+        workspace_candidate = (WORKSPACE_ROOT / path).resolve()
+        if workspace_candidate.exists():
+            return workspace_candidate
+        # Ссылки агентов вроде Hermes (@file:AppData/Local/hermes/attachments/…)
+        # задаются относительно домашней папки пользователя, а не workspace
+        home_candidate = (Path.home() / path).resolve()
+        if home_candidate.exists():
+            return home_candidate
+        return workspace_candidate
     return path
 
 
