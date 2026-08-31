@@ -1,4 +1,4 @@
-"""
+﻿"""
 office_ops — CLI-инструментарий правки документов MS Office без Python-кода.
 
 Облачная модель вызывает готовые команды вместо написания скриптов на
@@ -18,12 +18,20 @@ python-docx/openpyxl (запуск из корня проекта):
 сохраняются форматирование, стили, числа, даты и формулы — перезаписываются
 только изменённые сегменты. Результат пишется в отдельный файл (--output)
 или на место исходника (--in-place); по умолчанию исходник не трогается.
+
+Цепочка правок анонимизированных документов: ПЕРВАЯ правка —
+--file <name>.anonymized.<ext> --output <name>.result.<ext>; ВСЕ последующие
+правки — --file <name>.result.<ext> --output <name>.result.<ext> (или
+--in-place). Запись в <name>.anonymized.<ext> запрещена (правило исходника).
 """
 import argparse
 import asyncio
 import io
+import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from pathlib import Path
 
@@ -63,6 +71,11 @@ def _assemble(path: Path, content: bytes, edited_text: str, structure: dict) -> 
     ))
 
 
+def _is_anonymized_copy(path: Path) -> bool:
+    """True для анонимизированной копии <name>.anonymized.<ext> (исходник)."""
+    return path.stem.lower().endswith(".anonymized")
+
+
 def _write_output(args, src: Path, data: bytes) -> Path:
     if getattr(args, "in_place", False):
         out = src
@@ -70,6 +83,26 @@ def _write_output(args, src: Path, data: bytes) -> Path:
         out = Path(args.output)
     else:
         raise SystemExit("Укажите --output ПУТЬ или --in-place")
+    # Правило исходника: анонимизированная копия <name>.anonymized.<ext> —
+    # только для чтения, писать в неё нельзя ни при каких условиях.
+    if _is_anonymized_copy(out):
+        result_hint = out.with_name(
+            out.stem.replace(".anonymized", ".result") + out.suffix)
+        raise SystemExit(
+            f"ЗАПРЕЩЕНО записывать в анонимизированную копию ({out.name}): "
+            "она — неизменяемый исходник. Пишите в файл результата: "
+            f"--output {result_hint.name}. Если файл результата уже "
+            "существует — продолжайте цепочку правок в нём: --file "
+            f"{result_hint.name} --output {result_hint.name} (или --in-place).")
+    # Защита цепочки правок: команда, начатая заново с анонимизированной
+    # копии при существующем файле результата, затрёт предыдущие правки.
+    if _is_anonymized_copy(src) and out.is_file():
+        print(
+            "ВНИМАНИЕ: исходник — анонимизированная копия, а файл результата "
+            f"({out.name}) уже существует. Эта команда НАЧНЁТ ЦЕПОЧКУ ЗАНОВО "
+            "и затрёт предыдущие правки. Если нужно ПРОДОЛЖИТЬ правки — "
+            f"используйте --file {out.name}.",
+            file=sys.stderr)
     if not getattr(args, "in_place", False) and out.resolve() == src.resolve():
         print(
             "ВНИМАНИЕ: --output совпадает с исходным файлом. Записи "
@@ -178,6 +211,86 @@ def cmd_apply(args) -> None:
     out = _write_output(args, path, out_bytes)
     print(f"OK: применён {args.from_text}; файл: {out}")
 
+
+
+def cmd_insert_text(args) -> None:
+    """Вставить новые абзацы (DOCX) или строки (XLSX) в произвольное место.
+
+    DOCX: --anchor — подстрока-ориентир (первый обычный абзац, содержащий
+    её); --position before|after — вставить до/после ориентира; без
+    --anchor текст добавляется в конец документа. Новые абзацы наследуют
+    стиль абзаца-ориентира.
+    XLSX: каждая строка --text становится строкой листа (столбец A);
+    --row N (1-based) — вставить ПЕРЕД строкой N, без --row — в конец
+    листа.
+    """
+    path, content = _read(args.file)
+    if path.suffix.lower() == ".docx":
+        _insert_text_docx(args, path, content)
+    elif path.suffix.lower() == ".xlsx":
+        _insert_text_xlsx(args, path, content)
+    else:
+        raise SystemExit("Поддерживаются только .docx и .xlsx")
+
+
+def _insert_text_docx(args, path: Path, content: bytes) -> None:
+    """DOCX: вставить абзацы до/после абзаца-ориентира или в конец."""
+    doc = Document(io.BytesIO(content))
+    lines = list(args.text)
+    if args.anchor:
+        anchor = None
+        for p in doc.paragraphs:
+            if args.anchor in p.text:
+                anchor = p
+                break
+        if anchor is None:
+            raise SystemExit(
+                f"Абзац-ориентир не найден: {args.anchor!r}. Скопируйте "
+                "подстроку из вывода dump (обычные абзацы документа — "
+                "ячейки таблиц и колонтитулы якорем быть не могут).")
+        if args.position == "before":
+            for line in lines:
+                new_p = anchor.insert_paragraph_before(line)
+                new_p.style = anchor.style
+            where = f"до абзаца-ориентира ({args.anchor[:40]!r}…)"
+        else:
+            ref = anchor._p
+            for line in lines:
+                new_p = doc.add_paragraph(line)
+                new_p.style = anchor.style
+                ref.addnext(new_p._p)
+                ref = new_p._p
+            where = f"после абзаца-ориентира ({args.anchor[:40]!r}…)"
+    else:
+        for line in lines:
+            doc.add_paragraph(line)
+        where = "в конец документа"
+    buf = io.BytesIO()
+    doc.save(buf)
+    out = _write_output(args, path, buf.getvalue())
+    print(f"OK: вставлено абзацев: {len(lines)} ({where}); файл: {out}")
+
+
+def _insert_text_xlsx(args, path: Path, content: bytes) -> None:
+    """XLSX: вставить строки (столбец A) по номеру строки или в конец."""
+    wb = load_workbook(io.BytesIO(content))
+    ws = wb[args.sheet] if args.sheet else wb.active
+    lines = list(args.text)
+    if args.row is not None:
+        if args.row < 1:
+            raise SystemExit("--row: номер строки указывается с 1")
+        ws.insert_rows(args.row, amount=len(lines))
+        for i, line in enumerate(lines):
+            ws.cell(row=args.row + i, column=1, value=line)
+        where = f"перед строкой {args.row}"
+    else:
+        for line in lines:
+            ws.append([line])
+        where = f"в конец листа «{ws.title}»"
+    buf = io.BytesIO()
+    wb.save(buf)
+    out = _write_output(args, path, buf.getvalue())
+    print(f"OK: вставлено строк: {len(lines)} ({where}); файл: {out}")
 
 # ==================== Правка таблиц DOCX ====================
 
@@ -333,6 +446,20 @@ def cmd_append_row(args) -> None:
           f"(значений: {len(args.cell or [])}); файл: {out}")
 
 
+# ==================== Частичная де-анонимизация (через прокси) ====================
+
+def _env_value(name: str, default: str = "") -> str:
+    """Прочитать значение из .env корня проекта."""
+    env = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
 # ==================== Разбор аргументов ====================
 
 def build_parser() -> argparse.ArgumentParser:
@@ -369,6 +496,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file", required=True)
     sp.add_argument("--from-text", required=True)
     sp.set_defaults(func=cmd_apply)
+    sp = sub.add_parser("insert-text", parents=[out_opts],
+                        help="вставить новые абзацы/строки в произвольное "
+                             "место: DOCX — по якорю или в конец, XLSX — по "
+                             "номеру строки или в конец")
+    sp.add_argument("--file", required=True)
+    sp.add_argument("--anchor",
+                    help="подстрока-ориентир в абзаце DOCX (без — в конец)")
+    sp.add_argument("--position", choices=("before", "after"), default="after",
+                    help="DOCX: вставить до или после абзаца-ориентира")
+    sp.add_argument("--sheet", help="XLSX: имя листа (по умолчанию активный)")
+    sp.add_argument("--row", type=int,
+                    help="XLSX: вставить перед строкой N (с 1); без — в конец")
+    sp.add_argument("--text", action="append", required=True,
+                    help="абзац/строка текста (повторяйте флаг)")
+    sp.set_defaults(func=cmd_insert_text)
 
     sp = sub.add_parser("set-cell", parents=[out_opts],
                         help="записать ячейку таблицы DOCX (индексы с 0)")

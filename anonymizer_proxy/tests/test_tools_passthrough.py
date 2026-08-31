@@ -61,6 +61,13 @@ class FakeStore:
     def __init__(self):
         self.counters = {}
         self.mappings = {}  # token -> original
+        self.file_sessions = {}  # file_path -> session_id
+
+    async def register_file_session(self, file_path, session_id):
+        self.file_sessions[str(file_path)] = session_id
+
+    async def get_latest_session_for_file(self, file_path):
+        return self.file_sessions.get(str(file_path))
 
     async def get_or_create_session(self, session_id=None):
         return session_id or "sess-test"

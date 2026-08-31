@@ -397,6 +397,133 @@ async def test_anonymize_false_disables_intercept():
         path.unlink(missing_ok=True)
 
 
+def make_hermes_request(path: Path, text: str) -> ChatCompletionRequest:
+    """Запрос в стиле Hermes desktop: файл ссылкой «@file:<путь>» в тексте
+    сообщения, без блока <file_content>"""
+    return ChatCompletionRequest(
+        model="m", anonymize=True, stream=False,
+        messages=[ChatMessage(role="user", content=f"@file:{path}  {text}")],
+    )
+
+
+async def test_hermes_file_ref_intercepted():
+    """Формат Hermes («@file:<путь>», без <file_content>) перехватывается:
+    локальная анонимизация, облако НЕ вызывается, копия создана"""
+    path = make_txt_file()
+    try:
+        handler = make_handler()
+        request = make_hermes_request(path, "анонимизируй приложенный файл")
+        file_paths = handler.detect_attached_files_anonymization(request)
+        assert file_paths == [str(path)], file_paths
+
+        resp, sid = await handler.handle_chat_completion(request)
+        assert not handler.openrouter.captured, "запрос ушёл в облако"
+        anon_path = path.with_name(f"{path.stem}.anonymized{path.suffix}")
+        assert anon_path.exists(), "анонимизированная копия не создана"
+        anon_text = anon_path.read_text(encoding="utf-8")
+        assert "[PERSON_1]" in anon_text and "Иван Петров" not in anon_text
+        answer = resp.choices[0].message.content
+        assert sid in answer, answer
+        assert f"[anonymizer:done:{path}]" in answer, answer
+        assert resp.anonymization_metadata["mode"] == "files_anonymization"
+        print("TEST 9 OK: ссылка @file: (Hermes) — перехват, облако не вызвано")
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_name(f"{path.stem}.anonymized{path.suffix}").unlink(missing_ok=True)
+
+
+async def test_hermes_relative_path_resolved_from_home():
+    """Относительная ссылка Hermes вида @file:AppData/Local/hermes/… резолвится
+    от домашней папки пользователя (CWD Hermes не совпадает с workspace прокси)"""
+    path = make_txt_file()
+    try:
+        home = Path.home()
+        if not path.is_relative_to(home):
+            print("TEST 10 SKIP: tempdir не внутри домашней папки")
+            return
+        rel = path.relative_to(home)
+        handler = make_handler()
+        request = make_hermes_request(rel, "анонимизируй приложенный файл")
+        file_paths = handler.detect_attached_files_anonymization(request)
+        assert file_paths == [str(path.resolve())], file_paths
+        print("TEST 10 OK: относительный @file-путь резолвится от домашней папки")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def test_plain_path_mention_intercepted():
+    """Файл, указанный простым путём в тексте («анонимизируй файл <путь>»),
+    перехватывается так же, как @file: и <file_content>"""
+    path = make_txt_file()
+    try:
+        handler = make_handler()
+        request = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(
+                role="user",
+                content=f"анонимизируй файл {path}, он мне нужен",
+            )],
+        )
+        file_paths = handler.detect_attached_files_anonymization(request)
+        assert file_paths == [str(path)], file_paths
+
+        resp, _ = await handler.handle_chat_completion(request)
+        assert not handler.openrouter.captured, "запрос ушёл в облако"
+        assert path.with_name(
+            f"{path.stem}.anonymized{path.suffix}"
+        ).exists(), "анонимизированная копия не создана"
+        print("TEST 11 OK: путь в тексте сообщения — перехват, облако не вызвано")
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_name(f"{path.stem}.anonymized{path.suffix}").unlink(missing_ok=True)
+
+
+async def test_path_mention_with_punctuation():
+    """Путь в кавычках и с замыкающей пунктуацией узнаётся; имя файла без
+    каталога резолвится от workspace"""
+    path = make_txt_file()
+    try:
+        handler = make_handler()
+        request = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(
+                role="user",
+                content=f'анонимизируй файл "{path}".',
+            )],
+        )
+        file_paths = handler.detect_attached_files_anonymization(request)
+        assert file_paths == [str(path)], file_paths
+        print("TEST 12 OK: путь в кавычках с пунктуацией распознан")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def test_nonexistent_path_not_intercepted():
+    """Упоминание несуществующего файла не перехватывает запрос — он идёт
+    в облако как обычный passthrough"""
+    handler = make_handler(cloud_response={
+        "id": "c-1", "created": 1, "model": "m",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": {},
+    })
+    request = ChatCompletionRequest(
+        model="m", anonymize=True, stream=False,
+        messages=[ChatMessage(
+            role="user",
+            content=r"анонимизируй файл C:\нет\такого\файла.docx",
+        )],
+    )
+    assert handler.detect_attached_files_anonymization(request) == []
+    resp, _ = await handler.handle_chat_completion(request)
+    assert handler.openrouter.captured, "облако не вызвано"
+    assert resp.anonymization_metadata["mode"] == "passthrough"
+    print("TEST 13 OK: несуществующий путь — passthrough в облако")
+
+
 async def main():
     await test_intercept_anonymizes_file_no_cloud()
     await test_no_intent_goes_to_cloud()
@@ -406,6 +533,11 @@ async def main():
     await test_anonymize_false_disables_intercept()
     await test_no_reintercept_after_deanon_new_task()
     await test_done_marker_matches_other_path_spellings()
+    await test_hermes_file_ref_intercepted()
+    await test_hermes_relative_path_resolved_from_home()
+    await test_plain_path_mention_intercepted()
+    await test_path_mention_with_punctuation()
+    await test_nonexistent_path_not_intercepted()
     print("\nALL FILES AUTO-ANONYMIZE TESTS PASSED")
 
 

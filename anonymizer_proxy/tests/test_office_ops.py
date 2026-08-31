@@ -1,4 +1,4 @@
-"""
+﻿"""
 Функциональные тесты office_ops — CLI-инструментария правки DOCX/XLSX.
 
 Проверяют, что облачная модель может менять документы готовыми командами
@@ -328,6 +328,243 @@ def test_add_column_all_tables() -> None:
         out.unlink(missing_ok=True)
 
 
+def test_office_ops_hint_client_agnostic() -> None:
+    """Шпаргалка office_ops срабатывает и БЕЗ блоков <file_content> (Cline):
+    по упоминанию .docx/.xlsx в тексте сообщения и в аргументах tool_calls
+    (другие агенты, например Hermes), а также содержит пункт о приоритете
+    над skills/инструментами агента."""
+    inject = RequestHandler._inject_office_ops_hint
+
+    # 1. Путь в тексте user-сообщения (кириллица и пробелы в имени —
+    #    как у реальных файлов), блоков <file_content> нет
+    msgs = [ChatMessage(
+        role="user",
+        content="Проверь отчёт КП ДО 01.docx и добавь колонку в таблицы",
+    )]
+    out = inject(msgs)
+    assert out[0].role == "system", out[0].role
+    assert "python -m anonymizer_proxy.office_ops" in out[0].content
+    assert "ВЫСШИЙ приоритет" in out[0].content
+
+    # 2. Путь только в аргументах tool_calls (стиль агентов вида Hermes:
+    #    read_file/execute_code с путем к xlsx), content пустой
+    msgs = [
+        ChatMessage(role="user", content="Обнови данные в Excel"),
+        ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path": "C:\\Test\\отчёт.xlsx"}',
+                },
+            }],
+        ),
+    ]
+    out = inject(msgs)
+    assert out[0].role == "system", out[0].role
+    assert "office_ops" in out[0].content
+
+    # 3. Без Office-файлов шпаргалка не добавляется
+    msgs = [ChatMessage(role="user", content="Составь резюме заметки.md")]
+    out = inject(msgs)
+    assert out[0].role == "user", "шпаргалка не нужна без .docx/.xlsx"
+
+    # 4. Голое упоминание расширения («форматы .docx») — не триггер:
+    #    перед расширением требуются непробельные символы (имя/путь файла)
+    msgs = [ChatMessage(role="user", content="Какие форматы .docx вы читаете?")]
+    out = inject(msgs)
+    assert out[0].role == "user", "упоминание расширения без файла — не триггер"
+
+    print("TEST 8 OK: шпаргалка office_ops — клиенто-независимый триггер "
+          "(текст/tool_calls) и приоритет над skills")
+
+
+def test_write_guard_anonymized_copy() -> None:
+    """Правило исходника: запись в <name>.anonymized.<ext> запрещена CLI;
+    повторная команда с --file <копия> при существующем результате получает
+    предупреждение о перезапуске цепочки (предыдущие правки будут затёрты)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    tmp.close()
+    path = Path(tmp.name)
+    copy = path.with_name(path.stem + ".anonymized.docx")
+    result = path.with_name(path.stem + ".result.docx")
+    try:
+        doc = Document()
+        doc.add_paragraph("Вводная часть договора подряда")
+        doc.save(copy)
+
+        # 1. Запись в саму копию (--output = копия) — запрещена
+        proc = run_cli("replace-text", "--file", str(copy),
+                       "--find", "Вводная", "--replace", "X",
+                       "--output", str(copy))
+        assert proc.returncode != 0, proc.stdout
+        assert "ЗАПРЕЩЕНО" in proc.stderr, proc.stderr
+
+        # 2. --in-place на копии — запрещён
+        proc = run_cli("replace-text", "--file", str(copy),
+                       "--find", "Вводная", "--replace", "X",
+                       "--in-place")
+        assert proc.returncode != 0, proc.stdout
+        assert "ЗАПРЕЩЕНО" in proc.stderr, proc.stderr
+
+        # 3. Первая правка: копия -> результат — разрешена
+        proc = run_cli("replace-text", "--file", str(copy),
+                       "--find", "Вводная", "--replace", "Первая",
+                       "--output", str(result))
+        assert proc.returncode == 0, proc.stderr
+        assert not proc.stderr.strip(), proc.stderr
+        assert "Первая часть" in Document(result).paragraphs[0].text
+
+        # 4. Повторная команда с --file <копия> при существующем результате —
+        #    выполняется, но с предупреждением о перезапуске цепочки
+        proc = run_cli("replace-text", "--file", str(copy),
+                       "--find", "Вводная", "--replace", "Вторая",
+                       "--output", str(result))
+        assert proc.returncode == 0, proc.stderr
+        assert "ЦЕПОЧКУ ЗАНОВО" in proc.stderr, proc.stderr
+        assert "затрёт предыдущие правки" in proc.stderr, proc.stderr
+        assert "Вторая часть" in Document(result).paragraphs[0].text
+        print("TEST 9 OK: запрет записи в .anonymized-копию + предупреждение "
+              "о перезапуске цепочки правок")
+    finally:
+        for p in (path, copy, result):
+            Path(str(p) + ".tmp").unlink(missing_ok=True)
+            p.unlink(missing_ok=True)
+
+
+def test_office_edit_chain_hint() -> None:
+    """Динамический блок «цепочка правок» в шпаргалке: по маркерам
+    [anonymizer:result:...] истории модель получает КОНКРЕТНОЕ указание
+    продолжать правки в существующем файле результата."""
+    inject = RequestHandler._inject_office_ops_hint
+    docx_tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    docx_tmp.close()
+    docx = Path(docx_tmp.name)
+    result = docx.with_name(docx.stem + ".result.docx")
+    try:
+        marker = f"[anonymizer:result:{result}]"
+        base = [
+            ChatMessage(role="system", content="Ты ассистент."),
+            ChatMessage(role="assistant",
+                        content=f"[ANONYMIZER] Готово.\n{marker}"),
+            ChatMessage(role="user", content=(
+                f'<file_content path="{docx}">binary</file_content> '
+                "добавь колонку")),
+        ]
+
+        # 1. Файл результата существует -> «УЖЕ существует» + путь
+        result.write_bytes(b"stub")
+        out = inject(list(base))
+        assert out[0].role == "system"
+        assert "[OFFICE-OPS/ЦЕПОЧКА]" in out[0].content
+        assert "УЖЕ существует" in out[0].content
+        assert str(result) in out[0].content
+        assert "ЗАПРЕЩЕНО" in out[0].content
+
+        # 2. Маркер есть, но файла ещё нет -> «ещё не создан»
+        result.unlink()
+        out = inject(list(base))
+        assert "[OFFICE-OPS/ЦЕПОЧКА]" in out[0].content
+        assert "ещё не создан" in out[0].content
+
+        # 3. Без маркеров результата сессионного блока нет (шпаргалка
+        #    вставляется отдельным system-сообщением)
+        out = inject([ChatMessage(role="user", content=(
+            f'<file_content path="{docx}">binary</file_content> добавь колонку'))])
+        assert out[0].role == "system"
+        assert "office_ops" in out[0].content
+        assert "[OFFICE-OPS/ЦЕПОЧКА]" not in out[0].content
+        print("TEST 10 OK: динамический блок «цепочка правок» по маркерам "
+              "[anonymizer:result:]")
+    finally:
+        docx.unlink(missing_ok=True)
+        result.unlink(missing_ok=True)
+
+
+def test_insert_text() -> None:
+    """insert-text: вставка новых абзацев (DOCX) по якорю и в конец,
+    строк (XLSX) по номеру строки и в конец; ошибка при ненайденном якоре."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    tmp.close()
+    docx_path = Path(tmp.name)
+    xlsx_path = docx_path.with_suffix(".xlsx")
+    result = docx_path.with_name(docx_path.stem + ".result.docx")
+    try:
+        doc = Document()
+        doc.add_paragraph("Вводная часть договора подряда")
+        doc.add_paragraph("Условия оплаты")
+        doc.save(docx_path)
+
+        # 1. Вставка ПОСЛЕ якоря: порядок абзацев правильный
+        proc = run_cli("insert-text", "--file", str(docx_path),
+                       "--anchor", "Условия оплаты", "--position", "after",
+                       "--text", "Резюме: договор выгоден.",
+                       "--text", "Итоговая рекомендация — положительная.",
+                       "--output", str(result))
+        assert proc.returncode == 0, proc.stderr
+        out_doc = Document(result)
+        texts = [p.text for p in out_doc.paragraphs]
+        assert texts == ["Вводная часть договора подряда", "Условия оплаты",
+                         "Резюме: договор выгоден.",
+                         "Итоговая рекомендация — положительная."], texts
+
+        # 2. Вставка ДО якоря (в файл результата, поверх)
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--anchor", "Вводная часть", "--position", "before",
+                       "--text", "Заголовок документа", "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts[0] == "Заголовок документа"
+        assert texts[1] == "Вводная часть договора подряда"
+
+        # 3. Без якоря — в конец документа
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--text", "Финальная строка", "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts[-1] == "Финальная строка"
+
+        # 4. Ненайденный якорь — явная ошибка, файл не изменён
+        before = result.read_bytes()
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--anchor", "нет такого абзаца",
+                       "--text", "X", "--in-place")
+        assert proc.returncode != 0
+        assert "не найден" in proc.stderr
+        assert result.read_bytes() == before
+
+        # 5. XLSX: вставка перед строкой сдвигает существующие вниз
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = "шапка"
+        ws["A2"] = "данные"
+        wb.save(xlsx_path)
+        xlsx_result = xlsx_path.with_name(xlsx_path.stem + ".result.xlsx")
+        proc = run_cli("insert-text", "--file", str(xlsx_path),
+                       "--row", "2", "--text", "строка-вставка",
+                       "--output", str(xlsx_result))
+        assert proc.returncode == 0, proc.stderr
+        ws2 = load_workbook(xlsx_result).active
+        assert (ws2["A1"].value, ws2["A2"].value,
+                ws2["A3"].value) == ("шапка", "строка-вставка", "данные")
+
+        # 6. XLSX: без --row — в конец листа
+        proc = run_cli("insert-text", "--file", str(xlsx_result),
+                       "--text", "итоговая строка", "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        ws3 = load_workbook(xlsx_result).active
+        assert ws3["A4"].value == "итоговая строка"
+        print("TEST 11 OK: insert-text — вставка по якорю/в конец (DOCX и XLSX)")
+    finally:
+        for p in (docx_path, result, xlsx_path, xlsx_result,
+                  Path(str(docx_path) + ".tmp"),
+                  Path(str(xlsx_path) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
 def main():
     test_list_tables_and_dump()
     test_replace_text_preserves_original()
@@ -336,6 +573,10 @@ def main():
     test_xlsx_set_value_append_row()
     test_office_ops_hint_injection()
     test_add_column_all_tables()
+    test_office_ops_hint_client_agnostic()
+    test_write_guard_anonymized_copy()
+    test_office_edit_chain_hint()
+    test_insert_text()
     print("\nALL OFFICE OPS TESTS PASSED")
 
 
