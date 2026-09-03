@@ -8,6 +8,7 @@ import re
 import zipfile
 import posixpath
 import xml.etree.ElementTree as ET
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
@@ -41,6 +42,27 @@ def _cell_to_line(value) -> str:
     if value is None:
         return ""
     return _normalize_line(str(value))
+
+
+def _fmt_cell_value(value) -> str:
+    """Значение ячейки Excel в читаемом виде (markdown, read-column).
+
+    Даты — ISO (YYYY-MM-DD, без шума «00:00:00»), escape _x000D_ (CR,
+    попадающий в текст при Excel-экспорте многострочных заголовков) —
+    убирается, переносы строк сворачиваются (markdown-таблица обязана
+    быть однострочной). Используется ТОЛЬКО для отображения: сегменты
+    parse/assemble (_cell_to_line) остаются как есть — обратная сборка
+    по 1:1-сравнению не ломается.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        if (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return _normalize_line(re.sub(r"_x000D_", "", str(value)))
 
 
 def _rows_to_markdown(rows: list[list[str]]) -> str:
@@ -623,12 +645,14 @@ class FileParser:
             structure["sheets"].append(sheet_data)
 
         # Markdown-представление: каждый лист -> markdown-таблица
+        # (дисплейное представление через _fmt_cell_value: даты ISO,
+        # без _x000D_ — сегменты text остаются через _cell_to_line)
         markdown_parts = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             rows = []
             for row in ws.iter_rows():
-                cells = [_cell_to_line(cell.value) for cell in row]
+                cells = [_fmt_cell_value(cell.value) for cell in row]
                 if not any(cells):
                     continue
                 rows.append(cells)

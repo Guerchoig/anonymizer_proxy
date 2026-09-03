@@ -14,6 +14,7 @@ import io
 import subprocess
 import sys
 import tempfile
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.parent
@@ -484,6 +485,368 @@ def test_office_edit_chain_hint() -> None:
         result.unlink(missing_ok=True)
 
 
+def test_read_column_and_delete_column() -> None:
+    """read-column: значения колонки с адресами ячеек (даты ISO, шапка
+    журнала не в первой строке); delete-column: удаление столбца XLSX/DOCX
+    в файл результата — исходник не тронут, даты не теряются."""
+    # --- XLSX: шапка в 4-й строке, как в реальных журналах контроля ---
+    xlsx = Path(tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ЖКП"
+    ws.append(["Журнал контроля поручений"])
+    ws.append([]), ws.append([])
+    ws.append(["№", "Наименование", "Срок поручения", "Комментарий"])
+    ws.cell(row=5, column=1, value="1.1")
+    ws.cell(row=5, column=3, value=date(2026, 5, 22))
+    ws.cell(row=5, column=4, value="ok")
+    ws.cell(row=6, column=1, value="1.2")
+    ws.cell(row=6, column=3, value=date(2026, 5, 15))
+    wb.save(xlsx)
+    xlsx_out = xlsx.with_name(xlsx.stem + ".result.xlsx")
+    copy = None  # временная .anonymized.-копия для проверки запрета записи
+    docx = docx_out = None
+    try:
+        # 1. Чтение по тексту заголовка: адрес + ISO-дата, без 00:00:00
+        proc = run_cli("read-column", "--file", str(xlsx),
+                       "--column", "Срок поручения")
+        assert proc.returncode == 0, proc.stderr
+        assert "колонка C (Срок поручения), заголовок в строке 4" in proc.stdout, proc.stdout
+        assert "C5 (строка 5): 2026-05-22" in proc.stdout, proc.stdout
+        assert "C6 (строка 6): 2026-05-15" in proc.stdout, proc.stdout
+        assert "00:00:00" not in proc.stdout, proc.stdout
+        assert "A5 (строка 5):" not in proc.stdout  # только целевая колонка
+
+        # 2. Чтение по букве столбца; пустые ячейки пропускаются
+        proc = run_cli("read-column", "--file", str(xlsx), "--column", "D")
+        assert "D5 (строка 5): ok" in proc.stdout, proc.stdout
+        assert "D6" not in proc.stdout, proc.stdout
+
+        # 3. Незнакомый заголовок — явная ошибка
+        proc = run_cli("read-column", "--file", str(xlsx), "--column", "Нет такого")
+        assert proc.returncode != 0 and "не найден" in proc.stderr, proc.stderr
+
+        # 4. Удаление по заголовку — в файл результата, исходник цел
+        proc = run_cli("delete-column", "--file", str(xlsx),
+                       "--column", "Комментарий", "--output", str(xlsx_out))
+        assert proc.returncode == 0, proc.stderr
+        ws_out = load_workbook(xlsx_out).active
+        assert ws_out.max_column == 3, ws_out.max_column
+        assert ws_out.cell(row=4, column=3).value == "Срок поручения"
+        assert ws_out.cell(row=5, column=3).value == datetime(2026, 5, 22)
+        assert load_workbook(xlsx).active.max_column == 4  # исходник не тронут
+
+        # 5. Запись в анонимизированную копию по-прежнему запрещена
+        copy = xlsx.with_name(xlsx.stem + ".anonymized.xlsx")
+        copy.write_bytes(xlsx.read_bytes())
+        proc = run_cli("delete-column", "--file", str(copy),
+                       "--column", "Комментарий", "--in-place")
+        assert proc.returncode != 0 and "ЗАПРЕЩЕНО" in proc.stderr, proc.stderr
+
+        # --- DOCX: чтение и удаление столбца таблицы ---
+        docx = make_docx()
+        docx_out = docx.with_name(docx.stem + ".result.docx")
+        proc = run_cli("read-column", "--file", str(docx),
+                       "--table", "0", "--column", "1")
+        assert proc.returncode == 0, proc.stderr
+        assert "строка 1: 10" in proc.stdout, proc.stdout
+        assert "Таблица 0, колонка 1" in proc.stdout, proc.stdout
+
+        proc = run_cli("delete-column", "--file", str(docx),
+                       "--table", "0", "--column", "2", "--output", str(docx_out))
+        assert proc.returncode == 0, proc.stderr
+        t_out = Document(docx_out).tables[0]
+        assert len(t_out.columns) == 2 and t_out.rows[0].cells[1].text == "Кол-во"
+        assert len(Document(docx).tables[0].columns) == 3  # исходник не тронут
+        print("TEST 12 OK: read-column / delete-column (XLSX и DOCX)")
+    finally:
+        copy = xlsx.with_name(xlsx.stem + ".anonymized.xlsx")
+        for p in (xlsx, xlsx_out, copy, docx, docx_out,
+                  Path(str(xlsx) + ".tmp"), Path(str(xlsx_out) + ".tmp")):
+            if p is not None:
+                p.unlink(missing_ok=True)
+
+
+def test_xlsx_add_column() -> None:
+    """add-column (XLSX): вставка столбца после целевого по заголовку,
+    ISO-даты становятся датами, merge-шапка сдвигается, исходник не тронут."""
+    xlsx = Path(tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ЖКП"
+    ws["B1"] = "Журнал"
+    ws.merge_cells("B1:D1")  # шапка-заголовок на всю ширину, как в журналах
+    for c, v in enumerate(
+            ["№", "Наименование", "Срок поручения", "Комментарий"], start=1):
+        ws.cell(row=4, column=c, value=v)
+    ws.cell(row=5, column=1, value="1.1")
+    ws.cell(row=5, column=3, value=date(2026, 5, 22))
+    ws.cell(row=5, column=4, value="ok")
+    ws.cell(row=6, column=1, value="1.2")
+    ws.cell(row=6, column=3, value=date(2026, 5, 15))
+    wb.save(xlsx)
+    out = xlsx.with_name(xlsx.stem + ".result.xlsx")
+    try:
+        # 1. Вставка ПОСЛЕ «Срок поручения» со значениями-датами
+        proc = run_cli(
+            "add-column", "--file", str(xlsx),
+            "--column", "Срок поручения", "--position", "after",
+            "--header", "Поручение выдано",
+            "--cell", "2026-05-19", "--cell", "2026-05-12",
+            "--output", str(out))
+        assert proc.returncode == 0, proc.stderr
+        assert "столбец D «Поручение выдано»" in proc.stdout, proc.stdout
+        assert "строка заголовка: 4" in proc.stdout, proc.stdout
+        ws_out = load_workbook(out).active
+        assert ws_out.max_column == 5  # было 4 (A..D), вставка после C — 5
+        assert ws_out.cell(row=4, column=4).value == "Поручение выдано"
+        assert ws_out.cell(row=4, column=5).value == "Комментарий"
+        d5 = ws_out.cell(row=5, column=4).value
+        assert d5 == datetime(2026, 5, 19), d5
+        assert "YY" in ws_out.cell(row=5, column=4).number_format.upper() or \
+               "DD" in ws_out.cell(row=5, column=4).number_format.upper()
+        assert ws_out.cell(row=6, column=4).value == datetime(2026, 5, 12)
+        # шапка-merge расширлась: B1:D1 -> B1:E1
+        assert "B1:E1" in [str(m) for m in ws_out.merged_cells.ranges], \
+            [str(m) for m in ws_out.merged_cells.ranges]
+        # исходник не тронут
+        ws_src = load_workbook(xlsx).active
+        assert ws_src.max_column == 4 and ws_src.cell(row=4, column=4).value == "Комментарий"
+        assert "B1:D1" in [str(m) for m in ws_src.merged_cells.ranges]
+
+        # 2. Вставка ДО целевого столбца (merge левее точки вставки сдвигается)
+        proc = run_cli(
+            "add-column", "--file", str(out),
+            "--column", "Наименование", "--position", "before",
+            "--header", "Отметка", "--output", str(out), "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        ws2 = load_workbook(out).active
+        assert ws2.cell(row=4, column=2).value == "Отметка"
+        assert ws2.cell(row=4, column=3).value == "Наименование"
+        assert ws2.max_column == 6
+        assert "C1:F1" in [str(m) for m in ws2.merged_cells.ranges], \
+            [str(m) for m in ws2.merged_cells.ranges]
+
+        # 3. Без --column — столбец в конец листа, шапка найдена в строке 4
+        proc = run_cli(
+            "add-column", "--file", str(out), "--header", "Итог",
+            "--output", str(out), "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        assert "строка заголовка: 4" in proc.stdout, proc.stdout
+        ws3 = load_workbook(out).active
+        assert ws3.cell(row=4, column=7).value == "Итог"
+        print("TEST 13 OK: add-column (XLSX) — вставка по ориентиру, даты, merge")
+    finally:
+        for p in (xlsx, out, Path(str(xlsx) + ".tmp"), Path(str(out) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
+def test_guard_result_naming_and_dates() -> None:
+    """Защита имён результата: чтение/запись «….xlsx.result» даёт понятную
+    ошибку с правильным именем и НЕ создаёт мусорный файл; add-column
+    (XLSX) отклоняет --table с подсказкой; даты DD.MM.YYYY приводятся к
+    датам; без --column строка заголовков определяется автоматически."""
+    xlsx = Path(tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ЖКП"
+    ws["B1"] = "Журнал"
+    ws.merge_cells("B1:D1")
+    for c, v in enumerate(
+            ["№", "Наименование", "Срок поручения", "Комментарий"], start=1):
+        ws.cell(row=4, column=c, value=v)
+    ws.cell(row=5, column=1, value="1.1")
+    ws.cell(row=5, column=3, value=date(2026, 5, 22))
+    wb.save(xlsx)
+    bad = xlsx.with_name(xlsx.stem + ".xlsx.result")  # неверное имя результата
+    bad.write_bytes(xlsx.read_bytes())
+    out = xlsx.with_name(xlsx.stem + ".result.xlsx")
+    try:
+        # 1. Чтение файла с неверным именем — ошибка + правильное имя
+        proc = run_cli("read-column", "--file", str(bad), "--column", "A")
+        assert proc.returncode != 0, proc.stdout
+        assert "неперепутано" not in proc.stderr  # san: текст сообщения ниже
+        assert "результата перепутано" in proc.stderr, proc.stderr
+        assert out.name in proc.stderr and bad.name in proc.stderr, proc.stderr
+
+        # 2. Запись в неверное имя — отказ, подсказка, мусор не создан
+        proc = run_cli("add-column", "--file", str(xlsx), "--header", "X",
+                       "--output", str(bad))
+        assert proc.returncode != 0 and "Неверное имя файла результата" in proc.stderr, proc.stderr
+        assert out.name in proc.stderr, proc.stderr
+        assert not out.exists()  # nothing written to the correct name
+
+        # 3. --table для XLSX — явная ошибка вместо молчаливого игнорирования
+        proc = run_cli("add-column", "--file", str(xlsx), "--table", "all",
+                       "--header", "X", "--output", str(out))
+        assert proc.returncode != 0 and "--table" in proc.stderr \
+            and "DOCX" in proc.stderr, proc.stderr
+        assert not out.exists()
+
+        # 4. Даты DD.MM.YYYY -> настоящие даты; без --column шапка ищется
+        #    автоматически (заголовок в строке 4, а не в 1-й)
+        proc = run_cli("add-column", "--file", str(xlsx),
+                       "--header", "Поручение выдано",
+                       "--cell", "15.05.2026", "--cell", "19.05.2026",
+                       "--output", str(out))
+        assert proc.returncode == 0, proc.stderr
+        assert "строка заголовка: 4" in proc.stdout, proc.stdout
+        ws_out = load_workbook(out).active
+        assert ws_out.cell(row=4, column=5).value == "Поручение выдано"
+        assert ws_out.cell(row=5, column=5).value == datetime(2026, 5, 15)
+        assert ws_out.cell(row=6, column=5).value == datetime(2026, 5, 19)
+        print("TEST 14 OK: имена результата, --table (XLSX), DD.MM.YYYY, авто-шапка")
+    finally:
+        for p in (xlsx, bad, out, Path(str(xlsx) + ".tmp"),
+                  Path(str(out) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
+def test_insert_text_multiline() -> None:
+    """insert-text: переносы внутри --text (настоящие и литеральные \\n)
+    делят текст на отдельные абзацы — многострочное резюме не склеивается
+    в один абзац; apply с добавленными строками подсказывает insert-text."""
+    docx = Path(tempfile.NamedTemporaryFile(suffix=".docx", delete=False).name)
+    Document().save(docx)
+    out = docx.with_name(docx.stem + ".result.docx")
+    try:
+        # 1. Литеральные \\n (как их присылает модель через PowerShell)
+        proc = run_cli("insert-text", "--file", str(docx),
+                       "--text", "========================================\\n"
+                                 "РЕЗЮМЕ ДОКУМЕНТА\\n"
+                                 "========================================",
+                       "--output", str(out))
+        assert proc.returncode == 0, proc.stderr
+        assert "вставлено абзацев: 3" in proc.stdout, proc.stdout
+        paras = [p.text for p in Document(out).paragraphs]
+        assert paras[-3:] == ["========================================",
+                              "РЕЗЮМЕ ДОКУМЕНТА",
+                              "========================================"], paras[-3:]
+        assert "\\n" not in paras[-1], "литеральные \\n не должны попасть в текст"
+
+        # 2. Настоящие переносы + смешение с обычными --text
+        proc = run_cli("insert-text", "--file", str(out),
+                       "--text", "Первый абзац\\nВторой абзац",
+                       "--text", "Третий абзац", "--in-place")
+        assert proc.returncode == 0 and "вставлено абзацев: 3" in proc.stdout, proc.stdout
+        paras = [p.text for p in Document(out).paragraphs]
+        assert paras[-3:] == ["Первый абзац", "Второй абзац", "Третий абзац"], paras[-3:]
+
+        # 3. XLSX: многострочный --text -> несколько строк
+        xlsx = Path(tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name)
+        Workbook().save(xlsx)
+        try:
+            proc = run_cli("insert-text", "--file", str(xlsx),
+                           "--text", "строка 1\\nстрока 2", "--in-place")
+            assert proc.returncode == 0 and "вставлено строк: 2" in proc.stdout, proc.stdout
+            ws = load_workbook(xlsx).active
+            assert ws["A1"].value == "строка 1" and ws["A2"].value == "строка 2"
+        finally:
+            xlsx.unlink(missing_ok=True)
+
+        # 4. apply с ДОБАВЛЕННЫМИ строками указывает на insert-text
+        proc = run_cli("dump", "--file", str(out), "--format", "text")
+        dump_path = out.with_name("edit_check.txt")
+        dump_path.write_text(proc.stdout + "\nДОБАВЛЕННАЯ СТРОКА\nЕЩЁ ОДНА\n",
+                             encoding="utf-8")
+        proc = run_cli("apply", "--file", str(out),
+                       "--from-text", str(dump_path), "--output", str(out))
+        assert proc.returncode != 0 and "insert-text" in proc.stderr, proc.stderr
+        dump_path.unlink(missing_ok=True)
+        print("TEST 15 OK: insert-text делит переносы на абзацы; apply -> insert-text")
+    finally:
+        for p in (docx, out, Path(str(docx) + ".tmp"), Path(str(out) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
+def test_docx_add_column_position() -> None:
+    """add-column (DOCX): вставка столбца в середину таблицы справа/слева
+    от столбца-ориентира (по номеру и по заголовку), gridCol добавляется,
+    соседние столбцы сдвигаются; неоднозначные сочетания отклоняются."""
+    docx = make_docx()  # таблица 3x3: Наименование | Кол-во | Цена
+    out = docx.with_name(docx.stem + ".result.docx")
+    try:
+        # 1. Вставка СПРАВА от «Кол-во» (по заголовку) со значениями
+        proc = run_cli("add-column", "--file", str(docx), "--table", "0",
+                       "--column", "Кол-во", "--position", "after",
+                       "--header", "Ед. изм.",
+                       "--cell", "м", "--cell", "шт",
+                       "--output", str(out))
+        assert proc.returncode == 0, proc.stderr
+        assert "вставлен на позицию 2" in proc.stdout, proc.stdout
+        t = Document(out).tables[0]
+        assert len(t.columns) == 4, len(t.columns)
+        assert [c.text for c in t.rows[0].cells] == \
+            ["Наименование", "Кол-во", "Ед. изм.", "Цена"]
+        assert t.rows[1].cells[2].text == "м"
+        assert t.rows[2].cells[2].text == "шт"
+        # исходник не тронут
+        assert len(Document(docx).tables[0].columns) == 3
+
+        # 2. Вставка СЛЕВА от «Цена» (по номеру 2 в файле результата)
+        proc = run_cli("add-column", "--file", str(out), "--table", "0",
+                       "--column", "2", "--position", "before",
+                       "--header", "Примечание", "--in-place")
+        assert proc.returncode == 0 and "вставлен на позицию 2" in proc.stdout, proc.stdout
+        t = Document(out).tables[0]
+        assert [c.text for c in t.rows[0].cells] == \
+            ["Наименование", "Кол-во", "Примечание", "Ед. изм.", "Цена"]
+
+        # 3. --table all с --column — отказ (куда вставлять во всех таблицах?)
+        proc = run_cli("add-column", "--file", str(out), "--table", "all",
+                       "--column", "Цена", "--header", "X", "--in-place")
+        assert proc.returncode != 0 and "--table all" in proc.stderr, proc.stderr
+
+        # 4. Незнакомый заголовок — ошибка со списком заголовков
+        proc = run_cli("add-column", "--file", str(out), "--table", "0",
+                       "--column", "Нет такого", "--header", "X", "--in-place")
+        assert proc.returncode != 0 and "не найден" in proc.stderr \
+            and "Наименование" in proc.stderr, proc.stderr
+        print("TEST 16 OK: add-column (DOCX) — вставка по ориентиру before/after")
+    finally:
+        for p in (docx, out, Path(str(docx) + ".tmp"), Path(str(out) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
+def test_read_delete_column_by_docx_header() -> None:
+    """read-column/delete-column (DOCX): --column принимает не только
+    номер, но и текст заголовка (регрессия «invalid literal for int()»)."""
+    docx = make_docx()  # Наименование | Кол-во | Цена; строки: 10/100, 5/50
+    out = docx.with_name(docx.stem + ".result.docx")
+    try:
+        # 1. Чтение по тексту заголовка
+        proc = run_cli("read-column", "--file", str(docx), "--table", "0",
+                       "--column", "Цена")
+        assert proc.returncode == 0, proc.stderr
+        assert "Таблица 0, колонка 2 (Цена)" in proc.stdout, proc.stdout
+        assert "строка 1: 100" in proc.stdout, proc.stdout
+        assert "строка 2: 50" in proc.stdout, proc.stdout
+
+        # 2. Чтение по номеру по-прежнему работает
+        proc = run_cli("read-column", "--file", str(docx), "--table", "0",
+                       "--column", "1")
+        assert "Таблица 0, колонка 1 (Кол-во)" in proc.stdout, proc.stdout
+
+        # 3. Удаление по тексту заголовка
+        proc = run_cli("delete-column", "--file", str(docx), "--table", "0",
+                       "--column", "Цена", "--output", str(out))
+        assert proc.returncode == 0, proc.stderr
+        t = Document(out).tables[0]
+        assert len(t.columns) == 2 and t.rows[0].cells[1].text == "Кол-во"
+        # исходник не тронут
+        assert len(Document(docx).tables[0].columns) == 3
+
+        # 4. Незнакомый заголовок — ошибка с перечнем заголовков таблицы
+        proc = run_cli("read-column", "--file", str(docx), "--table", "0",
+                       "--column", "Нет такого")
+        assert proc.returncode != 0 and "не найден" in proc.stderr \
+            and "Наименование" in proc.stderr, proc.stderr
+        print("TEST 17 OK: read-column/delete-column (DOCX) по заголовку")
+    finally:
+        for p in (docx, out, Path(str(docx) + ".tmp"), Path(str(out) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
 def test_insert_text() -> None:
     """insert-text: вставка новых абзацев (DOCX) по якорю и в конец,
     строк (XLSX) по номеру строки и в конец; ошибка при ненайденном якоре."""
@@ -565,6 +928,67 @@ def test_insert_text() -> None:
             p.unlink(missing_ok=True)
 
 
+def test_insert_text_occurrence() -> None:
+    """insert-text (DOCX): --occurrence выбирает N-е вхождение якоря
+    (по умолчанию — первое); --occurrence больше числа вхождений —
+    явная ошибка, файл не изменён."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    tmp.close()
+    docx_path = Path(tmp.name)
+    result = docx_path.with_name(docx_path.stem + ".result.docx")
+    try:
+        doc = Document()
+        doc.add_paragraph("Раздел: Итоги")
+        doc.add_paragraph("Итоги первого этапа")
+        doc.add_paragraph("Итоги второго этапа")
+        doc.save(docx_path)
+
+        # 1. Без --occurrence — первое вхождение (прежнее поведение)
+        proc = run_cli("insert-text", "--file", str(docx_path),
+                       "--anchor", "Итоги", "--position", "before",
+                       "--text", "Перед первым", "--output", str(result))
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts[0] == "Перед первым", texts
+        assert texts[1] == "Раздел: Итоги", texts
+
+        # 2. --occurrence 2 после якоря — после «Итоги первого этапа»
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--anchor", "Итоги", "--position", "after",
+                       "--occurrence", "2",
+                       "--text", "После второго", "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts == ["Перед первым", "Раздел: Итоги",
+                         "Итоги первого этапа", "После второго",
+                         "Итоги второго этапа"], texts
+
+        # 3. --occurrence 3 перед якорем — перед «Итоги второго этапа»
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--anchor", "Итоги", "--position", "before",
+                       "--occurrence", "3",
+                       "--text", "Перед третьим", "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts == ["Перед первым", "Раздел: Итоги",
+                         "Итоги первого этапа", "После второго",
+                         "Перед третьим", "Итоги второго этапа"], texts
+
+        # 4. --occurrence больше числа вхождений — ошибка, файл не изменён
+        before = result.read_bytes()
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--anchor", "Итоги", "--occurrence", "10",
+                       "--text", "X", "--in-place")
+        assert proc.returncode != 0
+        assert "встречается" in proc.stderr, proc.stderr
+        assert result.read_bytes() == before
+        print("TEST 18 OK: insert-text --occurrence — N-е вхождение якоря")
+    finally:
+        for p in (docx_path, result, Path(str(docx_path) + ".tmp"),
+                  Path(str(result) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
 def main():
     test_list_tables_and_dump()
     test_replace_text_preserves_original()
@@ -577,6 +1001,13 @@ def main():
     test_write_guard_anonymized_copy()
     test_office_edit_chain_hint()
     test_insert_text()
+    test_insert_text_occurrence()
+    test_read_column_and_delete_column()
+    test_xlsx_add_column()
+    test_guard_result_naming_and_dates()
+    test_insert_text_multiline()
+    test_docx_add_column_position()
+    test_read_delete_column_by_docx_header()
     print("\nALL OFFICE OPS TESTS PASSED")
 
 

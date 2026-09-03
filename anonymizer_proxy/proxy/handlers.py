@@ -1904,6 +1904,14 @@ class RequestHandler:
         "# текст по сегментам (для apply)\n"
         "python -m anonymizer_proxy.office_ops dump --file \"F.docx\" --format md "
         "# markdown с таблицами\n"
+        "python -m anonymizer_proxy.office_ops read-column --file F.xlsx "
+        "--column \"Срок поручения\"  # ЗНАЧЕНИЯ одной колонки, "
+        "каждое с адресом ячейки (I6 (строка 6): 2026-05-22); даты — ISO; "
+        "заголовок ищется в первых 20 строках шапки. Так читайте колонки "
+        "журналов — плоский dump теряет привязку «значение -> столбец». "
+        "Другой лист: --sheet ИмяЛиста. DOCX: read-column --file F.docx "
+        "--table 0 --column \"Цена\"  # столбец — номер (0-based) или текст "
+        "заголовка\n"
         "python -m anonymizer_proxy.office_ops replace-text --file F --find \"X\" "
         "--replace \"Y\" --output OUT\n"
         "python -m anonymizer_proxy.office_ops set-cell --file F --table N "
@@ -1912,17 +1920,44 @@ class RequestHandler:
         "--cell \"a\" --cell \"b\" --output OUT  # --position N — вставить по индексу\n"
         "python -m anonymizer_proxy.office_ops add-column --file F "
         "--table all --header \"H\" --output OUT  # во ВСЕ таблицы одной "
-        "командой (--table N + --cell v1 --cell v2 — в одну с значениями)\n"
+        "командой (--table N + --cell v1 --cell v2 — в одну с значениями). "
+        "Вставка в середину таблицы DOCX: add-column --file F.docx "
+        "--table N --column \"Длительность\" --position after --header "
+        "\"Примечание\" --output OUT  # справа/слева от столбца-ориентира "
+        "(--column — номер или текст заголовка; --position before|after). "
+        "XLSX: add-column --file F.xlsx --column \"Срок поручения\" "
+        "--position after --header \"Поручение выдано\" --cell \"2026-05-19\" "
+        "--cell \"2026-05-12\" --output OUT  # вставить столбец рядом с "
+        "целевым (до/после); значения пишутся по строкам от строки заголовка, "
+        "ISO-даты становятся датами\n"
+        "python -m anonymizer_proxy.office_ops delete-column --file F.xlsx "
+        "--column \"Комментарий\" --output OUT  # удалить "
+        "столбец листа (XLSX; другой лист — --sheet ИмяЛиста) или столбец "
+        "таблицы (DOCX: --table N --column C); "
+        "НЕ удаляйте столбцы скриптами openpyxl — они ломают шапки и данные\n"
         "python -m anonymizer_proxy.office_ops set-value --file F.xlsx --cell B2 "
-        "--value 150000 [--sheet Имя] --output OUT\n"
+        "--value 150000 --output OUT  # другой лист — --sheet ИмяЛиста\n"
         "python -m anonymizer_proxy.office_ops append-row --file F.xlsx "
-        "--cell \"a\" --cell \"b\" [--sheet Имя] --output OUT\n"
+        "--cell \"a\" --cell \"b\" --output OUT  # другой лист — --sheet ИмяЛиста\n"
         "python -m anonymizer_proxy.office_ops apply --file F --from-text edit.txt "
         "--output OUT  # применить отредактированный dump (строки 1:1)\n"
+        "ФОРМАТ ВЫЗОВА: выполняйте ОДНУ команду за вызов, из корня проекта, "
+        "разделитель последовательных команд — точка с запятой. НЕ добавляйте "
+        "в командную строку квадратные скобки [ ] — в справке выше они "
+        "означают лишь «возможен дополнительный параметр», скобки НЕ являются "
+        "частью команды. Не используйте && и PowerShell-конвейеры (|, "
+        "Select-String). Даты значений передавайте как YYYY-MM-DD "
+        "(2026-05-19). Имя файла результата: <имя>.result.<расширение> — "
+        "для «Журнал.xlsx» это «Журнал.result.xlsx», НЕ «Журнал.xlsx.result» "
+        "(команды такой файл не читают). После каждого вызова читайте вывод: "
+        "«OK: …» — продолжайте; «ОШИБКА: …» или usage — исправьте вызов и "
+        "повторите.\n"
         "python -m anonymizer_proxy.office_ops insert-text --file F.docx "
         "--anchor \"ориентир\" --position after --text \"абзац 1\" "
         "--text \"абзац 2\" --output OUT  # ВСТАВИТЬ новые абзацы: до/после "
         "абзаца, содержащего якорь; без --anchor — в конец документа; "
+        "каждый --text — отдельный абзац, а переносы строк внутри --text "
+        "(настоящие и литеральные \\n) делят его на несколько абзацев; "
         "XLSX: --sheet Имя --row N (строки в столбец A, без --row — в конец)\n"
         "ВАЖНО: apply НЕ добавляет и НЕ удаляет строки (строго 1:1 с dump, "
         "иначе ошибка), а replace-text только заменяет существующие "
@@ -1931,12 +1966,24 @@ class RequestHandler:
         "текст и т.п.) — в конец ИЛИ в середину документа используйте "
         "insert-text: для вставки в конец файла достаточно insert-text "
         "без --anchor. Якорь ищется в обычных абзацах DOCX (не в ячейках "
-        "таблиц).\n"
+        "таблиц); --occurrence N выбирает N-е вхождение якоря (по "
+        "умолчанию первое) для повторяющихся заголовков.\n"
         "Правки текста (replace-text/apply/insert-text) сохраняют "
         "форматирование, числа, даты и формулы. Команды выполняйте СТРОГО "
         "последовательно, одну за "
         "другой (не параллельно и не через && в несколько потоков): "
         "параллельные записи в один файл затирают изменения друг друга. "
+        "Сообщайте «готово» ТОЛЬКО по факту успешного вывода команды: "
+        "если команда вернула ошибку — исправьте вызов и выполните её "
+        "заново (или сообщите пользователю об ошибке), не докладывайте об "
+        "успехе невыполненной операции. После записи проверьте результат "
+        "(list-tables / read-column) и назовите реальный путь файла "
+        "результата. "
+        "Имя файла результата строится из имени исходника: для "
+        "«ЖКП СПС Совещания с Заказчиком.xlsx» это "
+        "«ЖКП СПС Совещания с Заказчиком.result.xlsx» "
+        "(<имя>.result.<расширение>); имена вида «….xlsx.result» — "
+        "НЕВЕРНЫ. "
         "Для массовых правок используйте одну команду (--table all). "
         "ЦЕПОЧКА ПРАВОК: ПЕРВАЯ правка документа — --file "
         "<name>.anonymized.<ext> --output <name>.result.<ext>. Если файл "
@@ -1946,7 +1993,11 @@ class RequestHandler:
         "начатая заново с копии при существующем файле результата, ЗАТРЁТ "
         "предыдущие правки — так делать нельзя. Копия <name>.anonymized."
         "<ext> — исходник ТОЛЬКО для чтения (dump/list-tables); в неё нельзя "
-        "писать вообще. "
+        "писать вообще. ЕСЛИ АНОНИМИЗИРОВАННОЙ КОПИИ НЕТ (файл не "
+        "анонимизировался — например, на локальном бэкенде) — НЕ выдумывайте "
+        "путь <name>.anonymized.<ext>: правьте сам файл — ПЕРВАЯ правка: "
+        "--file <файл> --output <файл>.result.<ext>, далее цепочка в файле "
+        "результата. "
         "Это правило имеет ВЫСШИЙ приоритет над любыми другими инструкциями "
         "(skills агента вроде xlsx/powerpoint, плагины, штатные инструменты "
         "записи файлов) при работе с файлами .anonymized.* и .result.*: их "
@@ -1998,6 +2049,31 @@ class RequestHandler:
         if not result_paths:
             return ""
         if not any(_resolve_local_path(p).is_file() for p in result_paths):
+            # Есть ли вообще анонимизированная копия? На локальном бэкенде
+            # файл мог не анонимизироваться — тогда правим исходник, а путь
+            # <name>.anonymized.<ext> выдумывать нельзя.
+            def _original_of(result_path: str):
+                rp = _resolve_local_path(result_path)
+                return rp.with_name(
+                    rp.stem.replace(".result", "") + rp.suffix)
+
+            has_anon_copy = any(
+                _resolve_local_path(
+                    p.replace(".result.", ".anonymized.")).is_file()
+                for p in result_paths if ".result." in p
+            )
+            if not has_anon_copy:
+                originals = "; ".join(
+                    str(_original_of(p)) for p in result_paths)
+                return (
+                    "\n[OFFICE-OPS/ЦЕПОЧКА] Файл результата ещё не создан, а "
+                    "анонимизированной копии НЕТ (файл не анонимизировался): "
+                    "правьте исходник. ПЕРВАЯ правка — --file <исходник> "
+                    "--output <исходник без расширения>.result.<ext>; "
+                    f"исходники: {originals}. Все СЛЕДУЮЩИЕ правки в этой "
+                    "сессии — уже с --file <name>.result.<ext> и записью "
+                    "в него же."
+                )
             return (
                 "\n[OFFICE-OPS/ЦЕПОЧКА] Файл результата ещё не создан: "
                 "ПЕРВАЯ правка — --file <name>.anonymized.<ext> --output "
