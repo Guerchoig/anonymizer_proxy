@@ -411,8 +411,8 @@ Hermes: в нём уже есть команды office_ops) и **подстав
 
 | Симптом | Причина и решение |
 |---|---|
-| Hermes пишет «Пакет anonymizer_proxy не установлен», пытается `pip install` | Правила не загружены либо в `hermes_rules.md` не поправлен путь к папке прокси (шаг 3). Пакета `anonymizer-proxy` на PyPI нет — ставить его не нужно |
-| Модель сама анонимизирует документ скриптами python-docx | Запросы не идут через прокси. Проверьте `config.yaml` (шаг 2) и лог `%LOCALAPPDATA%\hermes\logs\agent.log`: в строках `API call #N` должно быть `provider=custom base_url=http://127.0.0.1:8081/v1` |
+| Hermes пишет «Пакет anonymizer_proxy не установлен», пытается `pip install` | Правила не загружены: `AGENTS.md` нет в корне рабочей папки — установите скриптом (шаг 3). Пакета `anonymizer-proxy` на PyPI нет — ставить его не нужно |
+| Модель сама анонимизирует документ скриптами python-docx | Запросы не идут через прокси. Проверьте `config.yaml` (шаг 2) и лог `%LOCALAPPDATA%\hermes\logs\agent.log`: в строках `API call #N` должно быть `provider=custom base_url=http://127.0.0.1:8081/v1`. Также проверьте, что в рабочей папке лежит `AGENTS.md` (шаг 3) — без него агент игнорирует office_ops |
 | Команда «анонимизируй» уходит в облако как обычный текст | Установлен прокси старой версии без поддержки формата Hermes (ссылки `@file:` и пути в тексте сообщения). Нужна сборка с поддержкой `@file:`/`PATH_MENTION_RE` — проверьте, что в `anonymizer_proxy/proxy/utils.py` есть константы `ATTACHMENT_FILE_REF_RE` и `PATH_MENTION_RE` |
 | В логе Hermes повторяется `Could not detect context length … (probe-down)` | Не задан `model.context_length` (шаг 2). На работу не влияет, только шум в логе |
 
@@ -889,6 +889,7 @@ CLI-инструментарий `anonymizer_proxy/office_ops.py`: облачн�
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | `list-tables --file F`             | Структура: таблицы DOCX (размер, заголовок 1-й строки) или листы XLSX |
 | `dump --file F [--format text\|md]` | Текст документа: сегменты по строкам (для`apply`) или markdown               |
+| `read-column --file F --column C [--table N] [--sheet S] [--header-row N]` | Прочитать столбец. XLSX: `--column` — буква (`I`), номер (`9`) или текст заголовка (строка заголовков — `--header-row`, по умолчанию ищется в первых 20; `--sheet` — лист). DOCX: индекс столбца (0-based) или текст заголовка таблицы `--table N` |
 
 ### Универсальные правки (DOCX и XLSX)
 
@@ -905,6 +906,7 @@ CLI-инструментарий `anonymizer_proxy/office_ops.py`: облачн�
 | `set-cell --file F --table N --row R --col C --text "…"`               | Записать ячейку (текст может быть многострочным)                                                                 |
 | `add-row --file F --table N --cell "а" --cell "б" [--position end\|N]` | Новая строка; форматирование копируется с последней строки                                             |
 | `add-column --file F --table N\|all --header "…" [--cell "…" …]`      | Новый столбец справа (заголовок в 1-ю строку,`--cell` — по строкам); `all` — во все таблицы |
+| `add-column --file F --table N --column "Заголовок ориентира" --position before\|after --header "…" …` | Вставить столбец перед/после столбца-ориентира (по тексту его заголовка), а не в конец |
 
 ### Листы XLSX
 
@@ -912,6 +914,8 @@ CLI-инструментарий `anonymizer_proxy/office_ops.py`: облачн�
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `set-value --file F.xlsx --cell B2 --value 150 [--sheet Лист1] [--as-text]`    | Записать значение в ячейку (`--as-text` — без приведения к числу) |
 | `append-row --file F.xlsx [--sheet Лист1] --cell "а" --cell "б" [--as-text]` | Добавить строку в конец листа                                                         |
+| `add-column --file F.xlsx --column "Ориентир" --position before\|after --header "…" [--cell …] [--header-row N]` | Вставить столбец перед/после столбца-ориентира (по заголовку); корректно обрабатывает даты и merge-ячейки |
+| `delete-column --file F --column I\|9\|"Заголовок" [--table N] [--sheet S] [--header-row N]` | Удалить столбец (XLSX: буква/номер/заголовок; DOCX: индекс или заголовок таблицы `--table N`) |
 
 Примеры:
 
@@ -919,6 +923,9 @@ CLI-инструментарий `anonymizer_proxy/office_ops.py`: облачн�
 .venv\Scripts\python.exe -m anonymizer_proxy.office_ops list-tables --file "КП.docx"
 .venv\Scripts\python.exe -m anonymizer_proxy.office_ops add-column --file "КП.docx" --table all --header "Комментарий" --output "КП.v2.docx"
 .venv\Scripts\python.exe -m anonymizer_proxy.office_ops replace-text --file "КП.docx" --find "[ORG_1]" --replace "ООО Ромашка" --in-place
+.venv\Scripts\python.exe -m anonymizer_proxy.office_ops insert-text --file "КП.docx" --anchor "Итоги" --position after --occurrence 2 --text "Всего к оплате: [MONEY_1]" --output "КП.v2.docx"
+.venv\Scripts\python.exe -m anonymizer_proxy.office_ops read-column --file "Расчёт.xlsx" --column "Итого" --sheet "Свод"
+.venv\Scripts\python.exe -m anonymizer_proxy.office_ops delete-column --file "Расчёт.xlsx" --column "Черновик"
 ```
 
 ## NER-движки (GLiNER + Natasha/Slovnet)
