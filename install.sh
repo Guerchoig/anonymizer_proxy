@@ -71,12 +71,28 @@ step "Прогрев NER-моделей (GLiNER + Natasha, первый раз �
 step "Самопроверка установки"
 "$PY" scripts/install_selftest.py || echo "[ПРЕДУПРЕЖДЕНИЕ] Self-test FAIL — см. выше."
 
+# ---------- 7. Ярлыки запуска ----------
+step "Ярлыки запуска (двойной клик / Dock)"
+chmod +x start_proxy.sh start_proxy.command 2>/dev/null || true
+if bash make_mac_app.sh; then
+    echo "  Anonymizer Proxy.app — перетащите в «Программы» или в Dock."
+else
+    echo "[ПРЕДУПРЕЖДЕНИЕ] Не удалось создать .app — запускайте через start_proxy.command."
+fi
+printf 'Включить автозапуск прокси при логине (LaunchAgent)? [y/N]: '
+read -r AUTO_START
+case "$AUTO_START" in
+    y|Y) bash install_launchagent.sh || echo "[ПРЕДУПРЕЖДЕНИЕ] LaunchAgent не установлен." ;;
+    *)   echo "Автозапуск не включён. Включить позже: bash install_launchagent.sh" ;;
+esac
+
 # ---------- Финал ----------
 echo ""
 echo "============================================================"
 echo " Установка завершена!"
 echo "============================================================"
-echo "Запуск:        ./start_proxy.sh"
+echo "Запуск:        ./start_proxy.sh  или двойной клик по start_proxy.command"
+echo "Ярлык:         Anonymizer Proxy.app (можно перетащить в Dock)"
 echo "Проверка:      http://127.0.0.1:8081/health"
 echo ""
 echo "Подключение Cline (расширение VS Code):"

@@ -1,4 +1,4 @@
-# Секреты и локальная конфигурация
+﻿# Секреты и локальная конфигурация
 .env
 *.env.local
 
@@ -34,3 +34,8 @@ temp_output.txt
 
 # Документы
 docs/
+
+# macOS-артефакты (генерируются make_mac_app.sh на машине пользователя)
+Anonymizer Proxy.app/
+*.app/
+.DS_Store
