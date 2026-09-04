@@ -6,6 +6,7 @@ python-docx/openpyxl (запуск из корня проекта):
 
   python -m anonymizer_proxy.office_ops list-tables --file "doc.docx"
   python -m anonymizer_proxy.office_ops dump --file "doc.docx" --format md
+  python -m anonymizer_proxy.office_ops dump --file F.docx --find "текст" --out-file DUMP.md
   python -m anonymizer_proxy.office_ops read-column --file F.xlsx --column "Срок поручения"
   python -m anonymizer_proxy.office_ops read-column --file F.docx --table 0 --column 1
   python -m anonymizer_proxy.office_ops replace-text --file F --find "a" --replace "b" --output OUT
@@ -212,11 +213,48 @@ def _one_line(text: str) -> str:
 
 # ==================== Команды чтения ====================
 
+def _norm_find(s: str) -> str:
+    """Нормализация для поиска по dump: нижний регистр, ё→е."""
+    return s.lower().replace("ё", "е")
+
+
+def _filter_dump(text: str, needle: str) -> str:
+    """Оставить только строки dump, содержащие needle (регистр и ё/е
+    не важны). Надёжный поиск по документу вместо Select-String/grep
+    по выводу (который в Cline может не захватиться) и python-однострочников
+    с кириллицей (в Windows PowerShell аргументы искажаются)."""
+    n = _norm_find(needle)
+    kept = [l for l in text.splitlines() if n in _norm_find(l)]
+    if not kept:
+        raise SystemExit(
+            f"Подстрока не найдена в dump: {needle!r}. Проверьте написание "
+            "(или уберите --find, чтобы увидеть весь текст документа).")
+    return "\n".join(kept)
+
+
 def cmd_dump(args) -> None:
-    """Показать текст документа: сегменты (для apply) или markdown."""
+    """Показать текст документа: сегменты (для apply) или markdown.
+
+    --find "текст" — вывести только строки, содержащие подстроку
+    (регистр и ё/е не важны): поиск якоря перед insert-text без
+    Select-String/grep и python-однострочников.
+    --out-file ПУТЬ — записать результат в файл в UTF-8 средствами
+    Python: в отличие от перенаправления «>» (Windows PowerShell
+    создаёт UTF-16LE) файл гарантированно читается как UTF-8.
+    """
     path, content = _read(args.file)
     parsed = _parse(path, content)
-    print(parsed.markdown if args.format == "md" else parsed.text)
+    text = parsed.markdown if args.format == "md" else parsed.text
+    find = getattr(args, "find", None)
+    if find:
+        text = _filter_dump(text, find)
+    out_file = getattr(args, "out_file", None)
+    if out_file:
+        out_path = Path(out_file)
+        out_path.write_text(text, encoding="utf-8")
+        print(f"OK: dump записан ({len(text)} символов, UTF-8): {out_path}")
+    else:
+        print(text)
 
 
 def cmd_list_tables(args) -> None:
@@ -978,6 +1016,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("dump", help="вывести текст: сегменты (text) или markdown (md)")
     sp.add_argument("--file", required=True)
     sp.add_argument("--format", choices=["text", "md"], default="text")
+    sp.add_argument("--find",
+                    help="вывести только строки с этой подстрокой (регистр "
+                         "и ё/е не важны) — вместо Select-String/grep")
+    sp.add_argument("--out-file",
+                    help="записать результат в файл UTF-8 (вместо stdout; "
+                         "не используйте «>» — PowerShell пишет UTF-16LE)")
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser("read-column",

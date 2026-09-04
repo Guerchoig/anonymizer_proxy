@@ -989,6 +989,55 @@ def test_insert_text_occurrence() -> None:
             p.unlink(missing_ok=True)
 
 
+def test_dump_find_outfile() -> None:
+    """dump: --find выводит только строки с подстрокой (регистр и ё/е
+    не важны, промах — явная ошибка); --out-file пишет валидный UTF-8."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    tmp.close()
+    docx_path = Path(tmp.name)
+    out_md = docx_path.with_name("dump_test_out.md")
+    try:
+        doc = Document()
+        doc.add_paragraph("Вводная часть")
+        doc.add_paragraph("Порядок оплаты")
+        doc.add_paragraph("Автоматический Учёт сумм")
+        doc.add_paragraph("Порядок оплаты работ")
+        doc.save(docx_path)
+
+        # 1. --find без учёта регистра
+        proc = run_cli("dump", "--file", str(docx_path),
+                       "--find", "порядок оплаты")
+        assert proc.returncode == 0, proc.stderr
+        assert "Порядок оплаты" in proc.stdout, proc.stdout
+        assert "Порядок оплаты работ" in proc.stdout, proc.stdout
+        assert "Вводная часть" not in proc.stdout, proc.stdout
+
+        # 2. --find: ё в запросе покрывает е в тексте
+        proc = run_cli("dump", "--file", str(docx_path), "--find", "учет")
+        assert proc.returncode == 0, proc.stderr
+        assert "Учёт сумм" in proc.stdout, proc.stdout
+
+        # 3. Промах — явная ошибка, а не пустой вывод
+        proc = run_cli("dump", "--file", str(docx_path),
+                       "--find", "нет такой строки")
+        assert proc.returncode != 0
+        assert "не найдена" in proc.stderr, proc.stderr
+
+        # 4. --out-file: валидный UTF-8 (не UTF-16LE), фильтр применён
+        proc = run_cli("dump", "--file", str(docx_path),
+                       "--find", "Порядок", "--out-file", str(out_md))
+        assert proc.returncode == 0, proc.stderr
+        raw = out_md.read_bytes()
+        assert not raw.startswith(b"\xff\xfe"), "UTF-16LE вместо UTF-8"
+        content = out_md.read_text(encoding="utf-8")
+        assert "Порядок оплаты" in content, content
+        assert "Вводная часть" not in content, content
+        print("TEST 19 OK: dump --find/--out-file — поиск и UTF-8-вывод")
+    finally:
+        for p in (docx_path, out_md, Path(str(docx_path) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
 def main():
     test_list_tables_and_dump()
     test_replace_text_preserves_original()
@@ -1002,6 +1051,7 @@ def main():
     test_office_edit_chain_hint()
     test_insert_text()
     test_insert_text_occurrence()
+    test_dump_find_outfile()
     test_read_column_and_delete_column()
     test_xlsx_add_column()
     test_guard_result_naming_and_dates()
