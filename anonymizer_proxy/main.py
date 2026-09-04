@@ -62,14 +62,23 @@ def _schedule_proxy_restart(delay: float = 2.0) -> None:
     async def _job():
         await asyncio.sleep(delay)
         helper = BASE_DIR / "data" / "restart_helper.py"
+        if sys.platform == "win32":
+            # DETACHED_PROCESS: хелпер живёт после смерти сервера и без окна
+            popen_kwargs: dict = {
+                "creationflags": subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP,
+            }
+        else:
+            # macOS/Linux: Windows-флаги не существуют; start_new_session
+            # отвязывает процесс от нашей сессии терминала (setsid).
+            popen_kwargs = {"start_new_session": True}
         subprocess.Popen(
             [sys.executable, str(helper)],
             cwd=str(BASE_DIR),
-            creationflags=subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **popen_kwargs,
         )
         logger.warning("Прокси завершается для перезапуска (чат-команда)")
         await asyncio.sleep(0.2)
@@ -148,15 +157,19 @@ async def lifespan(app: FastAPI):
         # запросов вернёт ошибку NERUnavailableError, а не ограниченный результат.
         # Самая частая причина — сервер запущен глобальным интерпретатором,
         # в котором нет пакета gliner (он установлен только в .venv).
+        if sys.platform == "win32":
+            interp = ".venv\\Scripts\\python.exe"
+            launcher = "start_proxy.cmd"
+        else:
+            interp, launcher = ".venv/bin/python", "start_proxy.sh"
         logger.error(
             "  [ОШИБКА] NER-движок не загрузился: %s\n"
             "  Анонимизация файлов/запросов будет возвращать ошибку, пока это "
             "не исправлено.\n"
-            "  Проверьте путь к интерпретатору выше: если это не "
-            ".venv\\Scripts\\python.exe — перезапустите прокси скриптом "
-            "start_proxy.cmd из корня проекта или командой:\n"
-            "    .venv\\Scripts\\python.exe -m anonymizer_proxy.main",
-            exc,
+            "  Проверьте путь к интерпретатору выше: если это не %s — "
+            "перезапустите прокси скриптом %s из корня проекта или "
+            "командой:\n    %s -m anonymizer_proxy.main",
+            exc, interp, launcher, interp,
         )
 
     logger.info("=" * 60)

@@ -176,6 +176,14 @@ class GlinerEngine:
         if not detected_providers:
             raise ImportError("onnxruntime не установлен")
 
+        # ONNX Runtime при создании CUDA/DirectML-сессии сыплет безвредными
+        # предупреждениями (Memcpy-трансформер, ScatterND) — они засоряют
+        # вывод прокси и пугают пользователя. Глушим ОБА канала логов ORT:
+        # глобальный (метки «onnxruntime:Default») и логгер сессии — до
+        # уровня ошибок. На инференс это не влияет.
+        if hasattr(ort, "set_default_logger_severity"):
+            ort.set_default_logger_severity(3)  # 3 = только ошибки
+
         logger.info(
             "Загрузка GLiNER ONNX %s (провайдер: %s)…",
             self._model_name, detected_providers[0],
@@ -189,6 +197,9 @@ class GlinerEngine:
         original_session = ort.InferenceSession
 
         def _session_with_providers(path_or_bytes, sess_options=None, providers=None, **kwargs):
+            if sess_options is None:
+                sess_options = ort.SessionOptions()
+                sess_options.log_severity_level = 3  # 3 = только ошибки
             try:
                 return original_session(
                     path_or_bytes, sess_options,
