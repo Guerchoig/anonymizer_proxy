@@ -440,9 +440,13 @@ def cmd_insert_text(args) -> None:
     --anchor текст добавляется в конец документа. Новые абзацы наследуют
     стиль абзаца-ориентира. Каждый --text — абзац; переносы строк внутри
     --text (настоящие и литеральные «\\n») делят его на отдельные абзацы.
-    XLSX: каждая строка --text становится строкой листа (столбец A);
-    --row N (1-based) — вставить ПЕРЕД строкой N, без --row — в конец
-    листа.
+    --text-file PATH — абзацы из файла UTF-8 (строка = абзац, пустые
+    пропускаются); можно совмещать с --text. Для списка из многих пунктов
+    предпочтителен --text-file: ОДНА команда вместо серии insert-text
+    (серия хрупка и при параллельном запуске затирает правки).
+    XLSX: каждая строка --text/--text-file становится строкой листа
+    (столбец A); --row N (1-based) — вставить ПЕРЕД строкой N, без --row —
+    в конец листа.
     """
     path, content = _read(args.file)
     if path.suffix.lower() == ".docx":
@@ -465,10 +469,38 @@ def _split_text_lines(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _collect_insert_lines(args) -> list[str]:
+    """Собрать абзацы из --text и/или --text-file.
+
+    --text-file (UTF-8, один абзац на строку; пустые строки пропускаются)
+    закрывает кейс «вставить список из N пунктов одной командой»: серия
+    из N insert-text с якорем=предыдущему пункту хрупка (каждая — полный
+    парс+сохранение docx, один сбой посреди цепочки оставляет документ
+    наполовину заполненным), а параллельный батч из двух insert-text
+    в Cline затирает правки друг друга.
+    """
+    lines: list[str] = []
+    for t in (args.text or []):
+        lines.extend(_split_text_lines(t))
+    text_file = getattr(args, "text_file", None)
+    if text_file:
+        tf_path = Path(text_file)
+        if not tf_path.is_file():
+            raise SystemExit(
+                f"--text-file: файл не найден: {tf_path}. Указывайте путь "
+                "внутри папки проекта (файл создаётся редактором заранее).")
+        tf_text = tf_path.read_text(encoding="utf-8-sig")
+        lines.extend(
+            l.strip() for l in tf_text.splitlines() if l.strip())
+    if not lines:
+        raise SystemExit("Пустой --text/--text-file: нечего вставлять")
+    return lines
+
+
 def _insert_text_docx(args, path: Path, content: bytes) -> None:
     """DOCX: вставить абзацы до/после абзаца-ориентира или в конец."""
     doc = Document(io.BytesIO(content))
-    lines = [l for t in args.text for l in _split_text_lines(t)]
+    lines = _collect_insert_lines(args)
     if not lines:
         raise SystemExit("Пустой --text: нечего вставлять")
     if args.anchor:
@@ -516,7 +548,7 @@ def _insert_text_xlsx(args, path: Path, content: bytes) -> None:
     """XLSX: вставить строки (столбец A) по номеру строки или в конец."""
     wb = load_workbook(io.BytesIO(content))
     ws = wb[args.sheet] if args.sheet else wb.active
-    lines = [l for t in args.text for l in _split_text_lines(t)]
+    lines = _collect_insert_lines(args)
     if not lines:
         raise SystemExit("Пустой --text: нечего вставлять")
     if args.row is not None:
@@ -1065,8 +1097,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sheet", help="XLSX: имя листа (по умолчанию активный)")
     sp.add_argument("--row", type=int,
                     help="XLSX: вставить перед строкой N (с 1); без — в конец")
-    sp.add_argument("--text", action="append", required=True,
-                    help="абзац/строка текста (повторяйте флаг)")
+    sp.add_argument("--text", action="append",
+                    help="абзац/строка текста (повторяйте флаг); обязателен "
+                         "хотя бы один из --text/--text-file")
+    sp.add_argument("--text-file",
+                    help="файл UTF-8 с абзацами (строка = абзац) — для "
+                         "вставки списка одной командой; можно вместе "
+                         "с --text")
     sp.set_defaults(func=cmd_insert_text)
 
     sp = sub.add_parser("set-cell", parents=[out_opts],

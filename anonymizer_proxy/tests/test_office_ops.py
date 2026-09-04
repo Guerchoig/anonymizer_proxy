@@ -1038,6 +1038,86 @@ def test_dump_find_outfile() -> None:
             p.unlink(missing_ok=True)
 
 
+def test_insert_text_textfile() -> None:
+    """insert-text --text-file: список абзацев из файла UTF-8 вставляется
+    ОДНОЙ командой (DOCX: перед N-м вхождением якоря; XLSX: строки листа);
+    совмещение с --text; ошибка при отсутствующем файле; --text без
+    --text-file по-прежнему работает (обратная совместимость)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+    tmp.close()
+    docx_path = Path(tmp.name)
+    xlsx_path = docx_path.with_suffix(".xlsx")
+    xlsx_result = xlsx_path.with_name(xlsx_path.stem + ".result.xlsx")
+    list_file = docx_path.with_name("list_docs.txt")
+    result = docx_path.with_name(docx_path.stem + ".result.docx")
+    try:
+        doc = Document()
+        doc.add_paragraph("Вводная часть")
+        doc.add_paragraph("Порядок оплаты")
+        doc.add_paragraph("Детали")
+        doc.add_paragraph("Порядок оплаты работ")
+        doc.save(docx_path)
+        list_file.write_text(
+            "1. Устав проекта\n"
+            "\n"  # пустые строки пропускаются
+            "2. Отчет об обследовании\n"
+            "3. Техническое задание\n",
+            encoding="utf-8")
+
+        # 1. DOCX: одна команда вставляет весь список перед 2-м вхождением
+        proc = run_cli("insert-text", "--file", str(docx_path),
+                       "--anchor", "Порядок оплаты", "--occurrence", "2",
+                       "--position", "before",
+                       "--text-file", str(list_file),
+                       "--output", str(result))
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts == ["Вводная часть", "Порядок оплаты", "Детали",
+                         "1. Устав проекта", "2. Отчет об обследовании",
+                         "3. Техническое задание",
+                         "Порядок оплаты работ"], texts
+
+        # 2. Совмещение --text и --text-file (порядок: сначала --text)
+        proc = run_cli("insert-text", "--file", str(result),
+                       "--text", "Заголовок списка:",
+                       "--text-file", str(list_file),
+                       "--output", str(result), "--in-place")
+        assert proc.returncode == 0, proc.stderr
+        texts = [p.text for p in Document(result).paragraphs]
+        assert texts[-1] == "3. Техническое задание", texts
+        assert "Заголовок списка:" in texts, texts
+
+        # 3. XLSX: строки из файла
+        wb = Workbook()
+        wb.active["A1"] = "шапка"
+        wb.save(xlsx_path)
+        proc = run_cli("insert-text", "--file", str(xlsx_path),
+                       "--text-file", str(list_file),
+                       "--output", str(xlsx_result))
+        assert proc.returncode == 0, proc.stderr
+        ws = load_workbook(xlsx_result).active
+        assert (ws["A2"].value, ws["A4"].value) == (
+            "1. Устав проекта", "3. Техническое задание"), \
+            [ws.cell(row=r, column=1).value for r in range(1, 6)]
+
+        # 4. Несуществующий файл — явная ошибка, результат не создан
+        if result.exists():
+            result.unlink()
+        proc = run_cli("insert-text", "--file", str(docx_path),
+                       "--text-file", str(docx_path.with_name("no_such.txt")),
+                       "--output", str(result))
+        assert proc.returncode != 0
+        assert "не найден" in proc.stderr, proc.stderr
+        assert not result.exists()
+        print("TEST 20 OK: insert-text --text-file — список одной командой")
+    finally:
+        for p in (docx_path, list_file, result,
+                  xlsx_path, xlsx_result,
+                  Path(str(docx_path) + ".tmp"),
+                  Path(str(result) + ".tmp")):
+            p.unlink(missing_ok=True)
+
+
 def main():
     test_list_tables_and_dump()
     test_replace_text_preserves_original()
@@ -1052,6 +1132,7 @@ def main():
     test_insert_text()
     test_insert_text_occurrence()
     test_dump_find_outfile()
+    test_insert_text_textfile()
     test_read_column_and_delete_column()
     test_xlsx_add_column()
     test_guard_result_naming_and_dates()
