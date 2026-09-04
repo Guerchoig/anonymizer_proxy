@@ -1893,12 +1893,21 @@ class RequestHandler:
     # Расширения файлов Office, при которых в запрос добавляется шпаргалка
     OFFICE_FILE_EXTS = {".docx", ".xlsx"}
 
+    # Корень проекта: пакет anonymizer_proxy импортируется ТОЛЬКО из него
+    # (в pyproject проект не ставится как пакет), поэтому шпаргалка
+    # подставляет фактический путь в требование «cd …». Без cd облачная
+    # модель получает «No module named anonymizer_proxy.office_ops» и
+    # теряет итерацию на поиск причины (реальный кейс 2026-09-04).
+    PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+
     OFFICE_OPS_HINT = (
         "[OFFICE-OPS] Для просмотра и правки файлов MS Office (.docx/.xlsx) "
         "НЕ пишите скрипты на python-docx/openpyxl — используйте готовые "
-        "команды (запуск из корня проекта; правки пишите в файл результата "
-        "через --output, исходник не изменяйте):\n"
-        "python -m anonymizer_proxy.office_ops list-tables --file \"F.docx\" "
+        "команды (КАЖДАЯ команда начинается с `cd \"{PROJECT_ROOT}\";` — модуль "
+        "импортируется только из корня проекта; правки пишите в файл "
+        "результата через --output, исходник не изменяйте):\n"
+        "cd \"{PROJECT_ROOT}\"; python -m anonymizer_proxy.office_ops "
+        "list-tables --file \"F.docx\" "
         "# обзор таблиц/листов\n"
         "python -m anonymizer_proxy.office_ops dump --file \"F.docx\" "
         "# текст по сегментам (для apply)\n"
@@ -1941,8 +1950,10 @@ class RequestHandler:
         "--cell \"a\" --cell \"b\" --output OUT  # другой лист — --sheet ИмяЛиста\n"
         "python -m anonymizer_proxy.office_ops apply --file F --from-text edit.txt "
         "--output OUT  # применить отредактированный dump (строки 1:1)\n"
-        "ФОРМАТ ВЫЗОВА: выполняйте ОДНУ команду за вызов, из корня проекта, "
-        "разделитель последовательных команд — точка с запятой. НЕ добавляйте "
+        "ФОРМАТ ВЫЗОВА: выполняйте ОДНУ команду за вызов из корня проекта "
+        "(предваряйте её `cd \"{PROJECT_ROOT}\";` — иначе получите «No module "
+        "named anonymizer_proxy.office_ops»), разделитель последовательных "
+        "команд — точка с запятой. НЕ добавляйте "
         "в командную строку квадратные скобки [ ] — в справке выше они "
         "означают лишь «возможен дополнительный параметр», скобки НЕ являются "
         "частью команды. Не используйте && и конвейеры | — в Windows "
@@ -2133,7 +2144,9 @@ class RequestHandler:
         )
         if not has_office:
             return messages
-        hint = cls.OFFICE_OPS_HINT + cls._office_edit_chain_block(messages)
+        hint = (cls.OFFICE_OPS_HINT.replace(
+            "{PROJECT_ROOT}", cls.PROJECT_ROOT)
+            + cls._office_edit_chain_block(messages))
         messages = list(messages)
         if messages and messages[0].role == "system":
             first = messages[0]
