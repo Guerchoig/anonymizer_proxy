@@ -1,5 +1,12 @@
 """
-Клиент для работы с OpenRouter API
+Универсальный клиент облачных LLM-провайдеров с OpenAI-совместимым API.
+
+Один клиент обслуживает OpenRouter, российских провайдеров (GPTunneL,
+BotHub, AITUNNEL, GenAPI) и любой пользовательский endpoint
+(реестр CLOUD_PROVIDERS в config.py). Провайдеры различаются только
+base_url, ключом, схемой авторизации (bearer/plain), заголовками и
+наличием VPN-прокси: российские провайдеры ходят напрямую (proxy=None),
+VPN-прокси остаётся только у OpenRouter (OPENROUTER_PROXY).
 """
 import json
 import logging
@@ -7,98 +14,155 @@ import os
 from typing import AsyncIterator, Optional
 import httpx
 
-from ..config import OPENROUTER
+from ..config import CLOUD_PROVIDERS, OPENROUTER
 
 logger = logging.getLogger("anonymizer_proxy.openrouter")
 
-# Прокси для доступа к OpenRouter (Happ VPN)
-# Если нужно использовать VPN-прокси, укажите в .env:
-# OPENROUTER_PROXY=http://127.0.0.1:10809  (HTTP)
-# или OPENROUTER_PROXY=socks5://127.0.0.1:10808  (SOCKS5)
-OPENROUTER_PROXY = os.getenv("OPENROUTER_PROXY", None)
-
-# User-Agent для запросов к OpenRouter.
+# Браузерный User-Agent — только для провайдеров с WAF (OpenRouter).
 # OpenRouter (WAF перед API) блокирует Python-клиентов по User-Agent:
 # 'OpenAI/Python x.y.z', 'Anthropic/Python x.y.z' и 'python-httpx/x.y.z'
 # получают HTTP 403 {"success": false, "error": "Access denied by
-# security policy."}. Поэтому по умолчанию шлём браузерный UA — его WAF
-# пропускает. При необходимости переопределите в .env:
-# OPENROUTER_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64)
+# security policy."}. Поэтому таким провайдерам шлём браузерный UA.
+# Переопределение: CLOUD_USER_AGENT в .env
 _DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
                "Chrome/126.0.0.0 Safari/537.36")
-OPENROUTER_USER_AGENT = os.getenv("OPENROUTER_USER_AGENT", _DEFAULT_UA)
+CLOUD_USER_AGENT = os.getenv("CLOUD_USER_AGENT", _DEFAULT_UA)
 
 
 class OpenRouterError(Exception):
-    """Ошибка OpenRouter API с HTTP-статусом"""
+    """Ошибка API облачного провайдера с HTTP-статусом"""
 
     def __init__(self, status_code: int, message: str):
         self.status_code = status_code
-        super().__init__(f"OpenRouter API error ({status_code}): {message}")
+        super().__init__(f"Cloud provider API error ({status_code}): {message}")
 
 
-def _humanize_error(status_code: int, message: str) -> str:
-    """Дописать к сырой ошибке OpenRouter понятное объяснение и что делать.
+def _humanize_error(status_code: int, message: str,
+                    provider: str = "openrouter") -> str:
+    """Дописать к сырой ошибке провайдера понятное объяснение и что делать.
 
     Прокси ретранслирует ошибки облака в чат модели/пользователя — без
     пояснения сырой текст вроде «User not found.» не подсказывает, что
     ключ API на этой машине не работает.
     """
     low = (message or "").lower()
-    if status_code == 401 and "user not found" in low:
+    if status_code == 401:
+        if provider == "openrouter" and "user not found" in low:
+            return (
+                f"{message}. OpenRouter не признал ключ API: проверьте в .env "
+                "OPENROUTER_API_KEY — должен начинаться с 'sk-or-v1-', быть без "
+                "кавычек и пробелов и быть действительным (создаётся и "
+                "проверяется на openrouter.ai/keys). Ключ подхватывается только "
+                "при старте прокси — после правки .env перезапустите сервер."
+            )
         return (
-            f"{message}. OpenRouter не признал ключ API: проверьте в .env "
-            "OPENROUTER_API_KEY — должен начинаться с 'sk-or-v1-', быть без "
-            "кавычек и пробелов и быть действительным (создаётся и "
-            "проверяется на openrouter.ai/keys). Ключ подхватывается только "
-            "при старте прокси — после правки .env перезапустите сервер."
+            f"{message}. Провайдер {provider} не принял ключ API: проверьте в "
+            f".env переменную {provider.upper()}_API_KEY (без кавычек и "
+            "пробелов, действительный ключ из личного кабинета провайдера). "
+            "Ключ подхватывается только при старте прокси — после правки "
+            ".env перезапустите сервер."
         )
     if status_code == 402:
         return (
-            f"{message}. Недостаточно кредитов OpenRouter для этой модели — "
-            "пополните баланс или выберите бесплатную модель."
+            f"{message}. Недостаточно кредитов у провайдера {provider} для "
+            "этой модели — пополните баланс или выберите бесплатную модель."
         )
     if status_code == 429:
         return (
-            f"{message}. Лимит запросов OpenRouter исчерпан — повторите "
-            "позже или смените модель."
+            f"{message}. Лимит запросов у провайдера {provider} исчерпан — "
+            "повторите позже, смените модель или провайдера."
         )
     return message
 
 
-class OpenRouterClient:
-    """HTTP клиент для OpenRouter API"""
+class OpenAICompatClient:
+    """HTTP клиент OpenAI-совместимого облачного провайдера"""
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or OPENROUTER["api_key"]
-        self.base_url = OPENROUTER["base_url"]
-        self.timeout = OPENROUTER["timeout"]
+    def __init__(self, config: Optional[dict] = None,
+                 api_key: Optional[str] = None):
+        cfg = config or OPENROUTER
+        # Реестровая запись хранится по ссылке: правки .env из формы
+        # (env_editor._sync_registry) видны клиенту БЕЗ перезапуска
+        self._cfg = cfg
+        self._api_key_override = api_key or ""
+        self.provider = cfg.get("name", "custom")
         self._client: Optional[httpx.AsyncClient] = None
 
+    # Значения читаются динамически из реестра — правки .env применяются
+    # к работающему серверу без пересоздания клиента
+    @property
+    def api_key(self) -> str:
+        return self._api_key_override or self._cfg.get("api_key") or ""
+
+    @property
+    def model(self) -> str:
+        return self._cfg.get("model") or ""
+
+    @property
+    def base_url(self) -> str:
+        return (self._cfg.get("base_url") or "").rstrip("/")
+
+    @property
+    def timeout(self) -> float:
+        return float(self._cfg.get("timeout", 120.0))
+
+    @property
+    def proxy(self) -> Optional[str]:
+        # VPN-прокси только там, где он задан для ЭТОГО провайдера
+        # (openrouter — OPENROUTER_PROXY; российские — None, прямой доступ)
+        return self._cfg.get("proxy") or None
+
+    @property
+    def auth_scheme(self) -> str:
+        # bearer — "Authorization: Bearer <key>"; plain — ключ без префикса
+        return self._cfg.get("auth_scheme", "bearer")
+
+    @property
+    def browser_ua(self) -> bool:
+        return bool(self._cfg.get("browser_ua"))
+
+    @property
+    def extra_headers(self) -> dict:
+        return dict(self._cfg.get("extra_headers") or {})
+
+    def _auth_headers(self) -> dict:
+        """Заголовки авторизации и служебные заголовки провайдера."""
+        headers = {"Content-Type": "application/json"}
+        if self.auth_scheme == "plain":
+            # GPTunneL: ключ в Authorization без префикса Bearer
+            headers["Authorization"] = self.api_key
+        else:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.browser_ua:
+            headers["User-Agent"] = CLOUD_USER_AGENT
+        headers.update(self.extra_headers)
+        return headers
+
     async def _get_client(self) -> httpx.AsyncClient:
-        """Получить HTTP клиент с нужными заголовками и прокси для OpenRouter"""
+        """Получить HTTP клиент с заголовками и прокси ЭТОГО провайдера"""
         if self._client is None or self._client.is_closed:
-            client_kwargs = {
+            client_kwargs: dict = {
                 "timeout": self.timeout,
-                "headers": {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "http://localhost:8081",  # Для OpenRouter
-                    "X-Title": "Anonymizer Proxy",
-                    # Без браузерного UA OpenRouter отвечает 403
-                    # "Access denied by security policy." (см. комментарий выше)
-                    "User-Agent": OPENROUTER_USER_AGENT,
-                }
+                "headers": self._auth_headers(),
             }
-
-            # Если указан прокси для OpenRouter (VPN) — используем его
-            if OPENROUTER_PROXY:
-                client_kwargs["proxy"] = OPENROUTER_PROXY
-                logger.info("Используется прокси: %s", OPENROUTER_PROXY)
-
+            if self.proxy:
+                client_kwargs["proxy"] = self.proxy
+                logger.info("Провайдер %s: запросы через прокси %s",
+                            self.provider, self.proxy)
+            else:
+                logger.info("Провайдер %s: прямой доступ (без VPN-прокси)",
+                            self.provider)
             self._client = httpx.AsyncClient(**client_kwargs)
         return self._client
+
+    def _resolve_model(self, model: Optional[str]) -> str:
+        """Модель для запроса: явная (после среза префикса провайдера) > из .env"""
+        actual_model = model or self.model
+        if self.model and actual_model != self.model:
+            logger.info("Провайдер %s: модель из запроса '%s' (из .env: '%s')",
+                        self.provider, actual_model, self.model)
+        return actual_model
 
     async def chat_completion(
         self,
@@ -126,19 +190,13 @@ class OpenRouterClient:
         """
         client = await self._get_client()
 
-        # ВСЕГДА используем модель из конфига, игнорируем модель из запроса
-        actual_model = OPENROUTER["model"]
-        if model is not None and model != actual_model:
-            logger.warning(
-                "Запрошена модель '%s', но используется модель из .env: '%s'",
-                model, actual_model
-            )
-
+        actual_model = self._resolve_model(model)
         payload = {
             "model": actual_model,
             "messages": messages,
         }
-        logger.info("Отправка запроса: model=%s (из .env)", actual_model)
+        logger.info("Отправка запроса (%s): model=%s", self.provider,
+                    actual_model)
 
         if temperature is not None:
             payload["temperature"] = temperature
@@ -165,7 +223,8 @@ class OpenRouterClient:
                 pass
             raise OpenRouterError(
                 response.status_code,
-                _humanize_error(response.status_code, error_text)
+                _humanize_error(response.status_code, error_text,
+                                self.provider)
             )
 
         return response.json()
@@ -189,20 +248,14 @@ class OpenRouterClient:
         """
         client = await self._get_client()
 
-        # ВСЕГДА используем модель из конфига, игнорируем модель из запроса
-        actual_model = OPENROUTER["model"]
-        if model is not None and model != actual_model:
-            logger.warning(
-                "Запрошена модель '%s', но используется модель из .env: '%s'",
-                model, actual_model
-            )
-
+        actual_model = self._resolve_model(model)
         payload = {
             "model": actual_model,
             "messages": messages,
             "stream": True,
         }
-        logger.info("Стриминг запрос: model=%s (из .env)", actual_model)
+        logger.info("Стриминг запрос (%s): model=%s", self.provider,
+                    actual_model)
         logger.debug("URL: %s/chat/completions", self.base_url)
 
         if temperature is not None:
@@ -235,7 +288,8 @@ class OpenRouterClient:
                         pass
                     raise OpenRouterError(
                         response.status_code,
-                        _humanize_error(response.status_code, error_text)
+                        _humanize_error(response.status_code, error_text,
+                                        self.provider)
                     )
 
                 logger.info("Начинаем чтение chunk'ов...")
@@ -258,10 +312,11 @@ class OpenRouterClient:
                             continue
         except httpx.TimeoutException as e:
             logger.error("ТАЙМАУТ: %s", e)
-            raise OpenRouterError(504, f"OpenRouter timeout: {e}")
+            raise OpenRouterError(504, f"{self.provider} timeout: {e}")
         except httpx.ConnectError as e:
             logger.error("ОШИБКА СОЕДИНЕНИЯ: %s", e)
-            raise OpenRouterError(502, f"OpenRouter connection error: {e}")
+            raise OpenRouterError(
+                502, f"{self.provider} connection error: {e}")
 
     async def get_models(self) -> list[dict]:
         """Получить список доступных моделей"""
@@ -278,3 +333,14 @@ class OpenRouterClient:
         """Закрыть HTTP клиент"""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+
+class OpenRouterClient(OpenAICompatClient):
+    """Клиент дефолтного облачного провайдера (обратная совместимость).
+
+    Ранее обслуживал только OpenRouter; теперь это клиент провайдера,
+    выбранного CLOUD_PROVIDER (по умолчанию — openrouter).
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        super().__init__(config=OPENROUTER, api_key=api_key)

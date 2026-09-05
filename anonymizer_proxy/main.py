@@ -14,7 +14,7 @@ from typing import Optional
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Добавляем родительскую директорию в path для импортов
@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anonymizer_proxy.config import (
     Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, NER_ENGINE,
+    CLOUD_PROVIDER, CLOUD_PROVIDERS, acting_cloud_provider,
     PROXY_VERSION, BASE_DIR, ensure_directories, logger
 )
 from anonymizer_proxy.anonymizer.ner_service import NERService
@@ -29,6 +30,9 @@ from anonymizer_proxy.anonymizer.mapping_store import MappingStore
 from anonymizer_proxy.proxy.openrouter_client import OpenRouterError
 from anonymizer_proxy.proxy.llm_router import LLMRouter
 from anonymizer_proxy.proxy.handlers import RequestHandler
+from anonymizer_proxy.env_editor import (
+    EnvEditorError, ENV_PATH, apply_updates, read_schema,
+)
 from anonymizer_proxy.models.schemas import (
     ChatCompletionRequest,
     AnonymizeRequest,
@@ -91,6 +95,27 @@ def _is_local_bind() -> bool:
     return PROXY["host"] in ("127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1")
 
 
+def _acting_provider_key_warning() -> Optional[str]:
+    """Предупреждение при старте, если у ДЕЙСТВУЮЩЕГО облачного провайдера
+    не задан ключ (чистая функция — тестируется напрямую). None — всё в порядке.
+    """
+    name = acting_cloud_provider()
+    cfg = CLOUD_PROVIDERS.get(name) or {}
+    key = cfg.get("api_key") or ""
+    if key and "REPLACE_WITH" not in key.upper():
+        return None
+    key_env = ("OPENROUTER_API_KEY" if name == "openrouter"
+               else f"{name.upper()}_API_KEY")
+    keys_url = cfg.get("keys_url") or "личный кабинет провайдера"
+    return (
+        f"Ключ {key_env} не задан (или остался плейсхолдером) — запросы к "
+        f"облаку ({name}) будут падать с ошибкой 401. Вставьте ключ "
+        f"с {keys_url} в .env или через форму http://127.0.0.1:{PROXY['port']}"
+        "/env-editor и перезапустите прокси. Локальная анонимизация работает "
+        "и без ключа."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
@@ -103,19 +128,17 @@ async def lifespan(app: FastAPI):
     logger.info("  Режим: %s", CURRENT_MODE)
     logger.info("  Интерпретатор: %s", sys.executable)
     logger.info("  NER-движок: %s (device=%s)", NER_ENGINE["model"], NER_ENGINE["device"])
-    logger.info("  OpenRouter: %s", OPENROUTER["base_url"])
-    logger.info("  Модель: %s", OPENROUTER["model"])
 
-    # Раннее предупреждение: без валидного ключа облако ответит 401 «User not found»
-    _api_key = OPENROUTER.get("api_key") or ""
-    if not _api_key or "REPLACE_WITH" in _api_key.upper():
-        logger.warning(
-            "  [ВНИМАНИЕ] OPENROUTER_API_KEY не задан (или остался плейсхолдером).\n"
-            "  Запросы к облаку будут падать с ошибкой 401 «User not found».\n"
-            "  Вставьте ключ с https://openrouter.ai/keys в файл .env\n"
-            "  и перезапустите прокси. Локальная анонимизация работает и без ключа\n"
-            "  (режим anonymize_only / passthrough с явными командами)."
-        )
+    # Действующий облачный провайдер (последний явно выбранный; сразу после
+    # установки — стартовый CLOUD_PROVIDER = openrouter)
+    _acting = acting_cloud_provider()
+    _cfg = CLOUD_PROVIDERS.get(_acting) or {}
+    logger.info("  Облачный провайдер: %s (%s)", _acting, _cfg.get("base_url") or "не настроен")
+    logger.info("  Модель: %s", _cfg.get("model") or "не задана")
+
+    _key_warning = _acting_provider_key_warning()
+    if _key_warning:
+        logger.warning("  [ВНИМАНИЕ] %s", _key_warning)
 
     logger.info("  Логи: %s", LOGS_DIR)
     logger.info("=" * 60)
@@ -672,22 +695,110 @@ async def health_check():
 
 @app.get("/api/backend", dependencies=[Depends(require_api_token)])
 async def get_llm_backend():
-    """Текущий LLM-бэкенд и доступность обоих (OpenRouter / LM Studio)"""
+    """Текущий LLM-бэкенд, ДЕЙСТВУЮЩИЙ облачный провайдер и статус всех"""
     return {
         "backend": openrouter_client.backend,
+        # Действующий облачный провайдер (последний явно выбранный; до
+        # первого переключения — стартовый CLOUD_PROVIDER = openrouter).
+        # "default_cloud_provider" — устаревший алиас для совместимости.
+        "acting_cloud_provider": acting_cloud_provider(),
+        "default_cloud_provider": acting_cloud_provider(),
         "backends": await openrouter_client.backends_available(),
     }
 
 
 @app.post("/api/backend", dependencies=[Depends(require_api_token)])
 async def set_llm_backend(body: dict):
-    """Переключить активный LLM-бэкенд без перезапуска: {"backend": "local" | "openrouter"}"""
+    """Переключить активный LLM-бэкенд без перезапуска:
+    {"backend": "local" | "openrouter" | "gptunnel" | "bothub" | "aitunnel"
+    | "genapi" | "custom"}. Облачный провайдер становится действующим
+    (запоминается в runtime_state.json)."""
     backend = (body or {}).get("backend")
     try:
         active = openrouter_client.set_backend(backend)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"backend": active}
+
+
+@app.get("/api/models", dependencies=[Depends(require_api_token)])
+async def get_provider_models(provider: Optional[str] = None):
+    """Список моделей провайдера (для выпадающего списка в /env-editor).
+
+    Без параметра — модели действующего облачного провайдера.
+    Источник: GET {base_url}/models провайдера (у OpenRouter и GenAPI —
+    публичный, у остальных — с ключом); кэш 10 минут."""
+    try:
+        models = await openrouter_client.get_models(provider)
+        return {"object": "list",
+                "provider": provider or acting_cloud_provider(),
+                "data": models}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as exc:
+        logger.warning("Не удалось получить список моделей (%s): %s",
+                       provider or "действующий", exc)
+        raise HTTPException(status_code=502,
+                            detail=f"Список моделей недоступен: {exc}")
+
+
+# ==================== Редактор настроек (.env из веб-формы) ====================
+
+@app.get("/env-editor", include_in_schema=False)
+async def env_editor_page():
+    """Экранная форма редактирования .env (все данные — через /api/env/*
+    с PROXY_API_TOKEN; страница сама по себе секретов не содержит)."""
+    html_path = Path(__file__).parent / "static" / "env_editor.html"
+    if not html_path.is_file():
+        raise HTTPException(status_code=404, detail="env_editor.html не найден")
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/env/schema", dependencies=[Depends(require_api_token)])
+async def get_env_schema():
+    """Белый список редактируемых ключей .env и их состояние.
+
+    Секреты не возвращаются: только признак «задан / не задан».
+    """
+    try:
+        return read_schema()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"{ENV_PATH} не найден")
+    except Exception:
+        logger.exception("Ошибка чтения схемы .env")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/env", dependencies=[Depends(require_api_token)])
+async def post_env_updates(body: dict):
+    """Обновить ключи .env: {"updates": {KEY: "значение" | null}}.
+
+    Только ключи из белого списка; перед записью создаётся бэкап;
+    изменения вступают в силу после перезапуска прокси.
+    """
+    updates = (body or {}).get("updates") or {}
+    try:
+        return apply_updates(updates)
+    except EnvEditorError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Ошибка записи .env")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/restart", dependencies=[Depends(require_api_token)])
+async def restart_proxy():
+    """Перезапустить прокси (ответ уходит клиенту до завершения процесса).
+    Нужен после правки .env: ключи и настройки читаются только при старте."""
+    _schedule_proxy_restart(delay=1.5)
+    return {
+        "message": "Прокси перезапускается. Подождите 20–40 секунд "
+                   "(NER-модель загружается заново); готовность — GET /health.",
+    }
+
 
 @app.get("/api/status", dependencies=[Depends(require_api_token)])
 async def get_status():
@@ -707,6 +818,20 @@ async def get_status():
             "url": OPENROUTER["base_url"],
             "model": OPENROUTER["model"],
             "api_key_set": bool(OPENROUTER["api_key"]),
+        },
+        "cloud": {
+            "acting_provider": acting_cloud_provider(),
+            "startup_provider": CLOUD_PROVIDER,
+            "providers": {
+                name: {
+                    "base_url": cfg["base_url"],
+                    "model": cfg["model"],
+                    "api_key_set": bool(cfg["api_key"]),
+                    # VPN-прокси только для openrouter; остальные — напрямую
+                    "proxy": cfg["proxy"] or "direct",
+                }
+                for name, cfg in CLOUD_PROVIDERS.items()
+            },
         },
         "storage": {
             "logs_dir": str(LOGS_DIR),

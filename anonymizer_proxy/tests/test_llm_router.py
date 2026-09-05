@@ -55,9 +55,11 @@ def make_router() -> LLMRouter:
 def test_backend_resolution():
     """local//cloud-префиксы, имя локальной модели, рантайм-дефолт"""
     router = make_router()
-    old = RUNTIME["backend"]
+    old_backend = RUNTIME["backend"]
+    old_cloud = RUNTIME.get("cloud")
     try:
         RUNTIME["backend"] = "openrouter"
+        RUNTIME["cloud"] = "openrouter"
         assert router._resolve(None) == "openrouter"
         assert router._resolve("qwen/qwen-3.7-max") == "openrouter"
         assert router._resolve("local/qwen3.5-9b") == "local"
@@ -68,7 +70,8 @@ def test_backend_resolution():
         assert router._resolve("anything", backend="openrouter") == "openrouter"
         print("TEST 1 OK: разрешение бэкенда (local//cloud/, дефолт, явный)")
     finally:
-        RUNTIME["backend"] = old
+        RUNTIME["backend"] = old_backend
+        RUNTIME["cloud"] = old_cloud
 
 
 def test_set_backend_persists():
@@ -156,6 +159,7 @@ def make_request(text: str) -> ChatCompletionRequest:
 
 def test_command_detection():
     """Команды управления распознаются только в текущем сообщении"""
+    from anonymizer_proxy.config import RUNTIME
     handler = RequestHandler(
         ner_service=FakeNER({}),
         mapping_store=FakeStore(),
@@ -165,8 +169,15 @@ def test_command_detection():
     assert not handler.detect_restart_request(make_request("составь отчёт"))
     assert handler.detect_backend_switch(
         make_request("работай через локальную модель")) == "local"
-    assert handler.detect_backend_switch(
-        make_request("переключись на облако")) == "openrouter"
+    # «облако» -> ДЕЙСТВУЮЩИЙ облачный провайдер (для детерминизма теста
+    # фиксируем память о последнем выбранном)
+    old_cloud = RUNTIME.get("cloud")
+    RUNTIME["cloud"] = "openrouter"
+    try:
+        assert handler.detect_backend_switch(
+            make_request("переключись на облако")) == "openrouter"
+    finally:
+        RUNTIME["cloud"] = old_cloud
     assert handler.detect_backend_switch(
         make_request("перезапусти прокси")) is None
 

@@ -70,16 +70,118 @@ NER_ENGINE = {
     "models_dir": str(DATA_DIR / "models"),
 }
 
-# OpenRouter (облачная модель)
-OPENROUTER = {
-    "base_url": "https://openrouter.ai/api/v1",
-    "api_key": os.getenv("OPENROUTER_API_KEY", ""),
-    "model": os.getenv("OPENROUTER_MODEL", "qwen/qwen-3.7-max"),
-    "timeout": 120.0,
+# ==================== Облачные LLM-провайдеры (OpenAI-совместимые) ====================
+# Все провайдеры работают по единому OpenAI-совместимому формату
+# (POST {base_url}/chat/completions, SSE-стриминг, /models) и различаются
+# только base_url, ключом, схемой авторизации и именами моделей.
+#
+# CLOUD_PROVIDER — СТАРТОВЫЙ облачный провайдер: действует сразу после
+# установки (по умолчанию openrouter — существующие .env продолжают работать
+# без изменений) и после сброса runtime-состояния. Далее пользователь может
+# явно выбрать любого провайдера из реестра (форма /env-editor,
+# POST /api/backend) — он становится ДЕЙСТВУЮЩИМ и запоминается в
+# data/runtime_state.json (см. RUNTIME ниже).
+CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "openrouter").strip().lower()
+
+# VPN-прокси (Happ) нужен ТОЛЬКО для OpenRouter (доступ к openrouter.ai из РФ).
+# Российские провайдеры (gptunnel.ru, bothub.chat, api.aitunnel.ru,
+# proxy.gen-api.ru) доступны напрямую и по умолчанию
+# ХОДЯТ МИМО VPN: proxy=None. При необходимости прокси для конкретного
+# провайдера включается отдельной переменной <NAME>_PROXY (по умолчанию не задана).
+_OPENROUTER_PROXY = os.getenv("OPENROUTER_PROXY", None)
+
+
+def _cloud_provider(
+    name: str, base_url: str, model_env: str, model_default: str, *,
+    auth_scheme: str = "bearer", proxy: str | None = None,
+    browser_ua: bool = False, extra_headers: dict | None = None,
+    timeout: float = 120.0, keys_url: str = "",
+) -> dict:
+    """Запись реестра облачных провайдеров с env-переопределениями.
+
+    Для каждого провайдера <NAME> читаются из .env:
+      <NAME>_BASE_URL, <NAME>_API_KEY, <NAME>_MODEL, <NAME>_PROXY, <NAME>_TIMEOUT,
+    а модель — из переменной model_env (для openrouter это OPENROUTER_MODEL
+    для обратной совместимости со старыми .env).
+    """
+    env_prefix = name.upper()
+    if name == "openrouter":
+        key_env, url_env = "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL"
+    else:
+        key_env, url_env = f"{env_prefix}_API_KEY", f"{env_prefix}_BASE_URL"
+    return {
+        "name": name,
+        "base_url": os.getenv(url_env, base_url).rstrip("/"),
+        "api_key": os.getenv(key_env, ""),
+        "model": os.getenv(model_env, model_default),
+        # bearer — "Authorization: Bearer <key>"; plain — ключ без префикса
+        "auth_scheme": auth_scheme,
+        # None = прямой доступ (без VPN); переопределяется <NAME>_PROXY
+        "proxy": os.getenv(f"{env_prefix}_PROXY", "") or proxy,
+        # Браузерный User-Agent (для провайдеров с WAF, напр. OpenRouter)
+        "browser_ua": browser_ua,
+        "extra_headers": extra_headers or {},
+        "timeout": float(os.getenv(f"{env_prefix}_TIMEOUT", str(timeout))),
+        # Где взять ключ (для подсказок в форме/баннере/selftest)
+        "keys_url": keys_url,
+    }
+
+
+CLOUD_PROVIDERS: dict[str, dict] = {
+    "openrouter": _cloud_provider(
+        "openrouter", "https://openrouter.ai/api/v1",
+        "OPENROUTER_MODEL", "qwen/qwen-3.7-max",
+        proxy=_OPENROUTER_PROXY, browser_ua=True,
+        extra_headers={
+            "HTTP-Referer": "http://localhost:8081",
+            "X-Title": "Anonymizer Proxy",
+        },
+        keys_url="https://openrouter.ai/keys",
+    ),
+    # GPTunneL: по документации ключ передаётся в Authorization БЕЗ Bearer
+    "gptunnel": _cloud_provider(
+        "gptunnel", "https://gptunnel.ru/v1", "GPTUNNEL_MODEL", "gpt-4o",
+        auth_scheme="plain",
+        keys_url="https://gptunnel.ru/profile",
+    ),
+    # BotHub: нестандартный путь base URL (api/v2/openai/v1)
+    "bothub": _cloud_provider(
+        "bothub", "https://bothub.chat/api/v2/openai/v1",
+        "BOTHUB_MODEL", "gpt-4o",
+        keys_url="https://bothub.chat",
+    ),
+    # AITUNNEL: модели в формате провайдер/модель (как в OpenRouter)
+    "aitunnel": _cloud_provider(
+        "aitunnel", "https://api.aitunnel.ru/v1",
+        "AITUNNEL_MODEL", "openai/gpt-4o",
+        keys_url="https://aitunnel.ru",
+    ),
+    # GenAPI: OpenAI-совместимый endpoint для IDE/плагинов
+    "genapi": _cloud_provider(
+        "genapi", "https://proxy.gen-api.ru/v1", "GENAPI_MODEL", "gpt-5-4",
+        keys_url="https://gen-api.ru",
+    ),
+    # Свободно конфигурируемый OpenAI-совместимый endpoint
+    "custom": _cloud_provider(
+        "custom", "", "CUSTOM_MODEL", "",
+    ),
 }
 
+if CLOUD_PROVIDER not in CLOUD_PROVIDERS:
+    logger.warning(
+        "Неизвестный CLOUD_PROVIDER=%r (доступно: %s) — использую openrouter",
+        CLOUD_PROVIDER, ", ".join(CLOUD_PROVIDERS))
+    CLOUD_PROVIDER = "openrouter"
+
+# Обратная совместимость: прежний словарь OPENROUTER — запись реестра
+OPENROUTER = CLOUD_PROVIDERS["openrouter"]
+
+logger.debug(
+    "CLOUD_PROVIDER (дефолтный облачный провайдер): %s", CLOUD_PROVIDER)
 logger.debug("OPENROUTER_MODEL из .env: %s", OPENROUTER["model"])
-logger.debug("OPENROUTER_PROXY: %s", os.getenv("OPENROUTER_PROXY", "не задан"))
+logger.debug(
+    "OPENROUTER_PROXY: %s",
+    _OPENROUTER_PROXY if _OPENROUTER_PROXY else "не задан")
 
 # Прокси-сервер
 # ВАЖНО: по умолчанию слушаем только localhost.
@@ -159,24 +261,48 @@ COMMAND_CLASSIFIER = {
 }
 
 # ==================== Рантайм-состояние (без перезапуска) ====================
-# Активный LLM-бэкенд переключается на лету (чат-команда, /api/backend,
-# заголовок X-LLM-Backend). Не берётся из .env, чтобы не требовать
-# перезапуска; выбор сохраняется в data/runtime_state.json.
-RUNTIME = {"backend": "openrouter"}
+# Действующий LLM-бэкенд переключается на лету (форма /env-editor,
+# POST /api/backend, заголовок X-LLM-Backend). Не берётся из .env, чтобы
+# не требовать перезапуска; выбор сохраняется в data/runtime_state.json.
+#   backend — куда уходят запросы сейчас: "local" или провайдер реестра;
+#   cloud   — ДЕЙСТВУЮЩИЙ облачный провайдер: последний явно выбранный.
+#             Не затирается переходом на local — команда «работай через
+#             облако» возвращает именно к нему. Пока пользователь не
+#             переключался ни разу, равен стартовому CLOUD_PROVIDER.
+RUNTIME = {"backend": CLOUD_PROVIDER, "cloud": CLOUD_PROVIDER}
 RUNTIME_STATE_PATH = DATA_DIR / "runtime_state.json"
 
 
 def load_runtime_state() -> None:
-    """Восстановить рантайм-состояние (активный бэкенд) с диска."""
+    """Восстановить рантайм-состояние с диска (с миграцией старого формата)."""
     import json
     try:
         if RUNTIME_STATE_PATH.is_file():
             state = json.loads(RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
             backend = state.get("backend")
-            if backend in ("openrouter", "local"):
+            # local + любой облачный провайдер из реестра
+            if backend == "local" or backend in CLOUD_PROVIDERS:
                 RUNTIME["backend"] = backend
+            # Действующий облачный провайдер. Миграция старого файла без
+            # поля "cloud": облачный backend становится действующим; для
+            # local информации нет — сбрасываем на стартовый CLOUD_PROVIDER.
+            cloud = state.get("cloud")
+            if cloud in CLOUD_PROVIDERS:
+                RUNTIME["cloud"] = cloud
+            elif backend in CLOUD_PROVIDERS:
+                RUNTIME["cloud"] = backend
+            else:
+                RUNTIME["cloud"] = CLOUD_PROVIDER
     except Exception as exc:  # noqa: BLE001 — битый файл не должен ронять старт
         logger.warning("Не удалось прочитать runtime_state.json: %s", exc)
+
+
+def acting_cloud_provider() -> str:
+    """ДЕЙСТВУЮЩИЙ облачный провайдер: последний явно выбранный; до первого
+    переключения — стартовый CLOUD_PROVIDER (после установки — openrouter).
+    Единая точка правды для «работай через облако», `cloud/…` и подсказок
+    о ключе действующего провайдера."""
+    return RUNTIME.get("cloud") or CLOUD_PROVIDER
 
 
 def save_runtime_state() -> None:
@@ -195,7 +321,7 @@ def save_runtime_state() -> None:
 # FastAPI-приложении и баннере при старте). Увеличивайте при изменениях
 # кода: Python не перезагружает код в работающем сервере, и по /health
 # можно понять, выполняет ли процесс актуальную версию.
-PROXY_VERSION = "1.5.0"
+PROXY_VERSION = "1.8.0"
 
 # Категории PII для детекции
 PII_CATEGORIES = {

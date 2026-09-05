@@ -142,6 +142,12 @@ if (Test-Path ".env") {
         Write-Host "Ключ OpenRouter записан."
         break
     }
+    Write-Host ""
+    Write-Host "Сразу после установки действует OpenRouter (нужен VPN)."
+    Write-Host "Действующего провайдера можно сменить в любой момент: российские"
+    Write-Host "GPTunneL, BotHub, AITUNNEL, GenAPI и свой endpoint работают без VPN —"
+    Write-Host "форма http://127.0.0.1:8081/env-editor (выбор провайдера и модели),"
+    Write-Host "POST /api/backend или переменная CLOUD_PROVIDER в .env."
 }
 
 # ---------- 5. Прогрев моделей ----------

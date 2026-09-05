@@ -61,6 +61,12 @@ else
                 ;;
         esac
     done
+    echo ""
+    echo "Сразу после установки действует OpenRouter (нужен VPN)."
+    echo "Действующего провайдера можно сменить в любой момент: российские"
+    echo "GPTunneL, BotHub, AITUNNEL, GenAPI и свой endpoint работают без VPN —"
+    echo "форма http://127.0.0.1:8081/env-editor (выбор провайдера и модели),"
+    echo "POST /api/backend или переменная CLOUD_PROVIDER в .env."
 fi
 
 # ---------- 5. Прогрев моделей ----------

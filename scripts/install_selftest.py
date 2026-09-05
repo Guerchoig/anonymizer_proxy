@@ -64,54 +64,97 @@ def check_onnxruntime() -> bool:
     return True
 
 
-# Предупреждения, не фейлящие установку (заполняется check_openrouter)
+# Предупреждения, не фейлящие установку (заполняется check_provider_key)
 WARNINGS: list[str] = []
 
 
-def check_openrouter() -> bool:
-    """Шаг 4/4: конфигурация OpenRouter.
+def check_provider_key() -> bool:
+    """Шаг 4/4: конфигурация ДЕЙСТВУЮЩЕГО облачного провайдера.
 
     Отсутствие/невалидность ключа НЕ фейлит установку (локальная анонимизация
     самодостаточна), но печатается заметное предупреждение с инструкцией.
+    Сразу после установки действующий провайдер — стартовый CLOUD_PROVIDER
+    (openrouter); после явного переключения в runtime_state.json.
     """
-    print("==> Шаг 4/4: OpenRouter")
+    print("==> Шаг 4/4: облачный провайдер")
     import os
 
     import httpx
 
-    from anonymizer_proxy.config import OPENROUTER
+    from anonymizer_proxy.config import CLOUD_PROVIDERS, acting_cloud_provider
 
-    key = OPENROUTER.get("api_key") or ""
+    name = acting_cloud_provider()
+    cfg = CLOUD_PROVIDERS.get(name) or {}
+    key_env = ("OPENROUTER_API_KEY" if name == "openrouter"
+               else f"{name.upper()}_API_KEY")
+    keys_url = cfg.get("keys_url") or "личный кабинет провайдера"
+
+    print(f"    Действующий облачный провайдер: {name} ({cfg.get('base_url')})")
+    key = cfg.get("api_key") or ""
     if not key or "REPLACE_WITH" in key.upper():
-        WARNINGS.append("OPENROUTER_API_KEY не задан")
-        print("    [ВНИМАНИЕ] OPENROUTER_API_KEY не задан (или остался плейсхолдером):")
+        WARNINGS.append(f"{key_env} не задан")
+        print(f"    [ВНИМАНИЕ] {key_env} не задан (или остался плейсхолдером):")
         print("    анонимизация работать будет, а вот запросы к облаку упадут с 401.")
-        print("    Вставьте ключ с https://openrouter.ai/keys в .env и перезапустите прокси.")
+        print(f"    Вставьте ключ с {keys_url} в .env (или через форму")
+        print("    http://127.0.0.1:8081/env-editor) и перезапустите прокси.")
         return True
 
-    # Ключ есть — пробуем живую проверку через OpenRouter (учитывая VPN-прокси)
-    proxy = os.getenv("OPENROUTER_PROXY") or None
+    if name == "openrouter":
+        # Живая проверка ключа через OpenRouter (учитывая VPN-прокси)
+        proxy = os.getenv("OPENROUTER_PROXY") or None
+        try:
+            response = httpx.get(
+                "https://openrouter.ai/api/v1/auth/key",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=15,
+                proxy=proxy,
+            )
+        except Exception as exc:  # noqa: BLE001 — сеть может быть недоступна
+            WARNINGS.append("ключ не удалось проверить онлайн")
+            print(f"    [ВНИМАНИЕ] Не удалось проверить ключ онлайн ({exc}).")
+            print("    Если OpenRouter требует VPN — проверьте OPENROUTER_PROXY в .env.")
+            return True
+
+        if response.status_code == 200:
+            label = response.json().get("data", {}).get("label") or "(без имени)"
+            print(f"    OK: ключ действителен ({label})")
+            return True
+
+        WARNINGS.append(f"OpenRouter ответил {response.status_code}")
+        print(f"    [ВНИМАНИЕ] OpenRouter ответил {response.status_code}: {response.text[:120]}")
+        print("    Проверьте OPENROUTER_API_KEY в .env.")
+        return True
+
+    # Остальные провайдеры: живая проверка через их GET /models
+    # (у российских провайдеров — прямой доступ, без VPN)
     try:
         response = httpx.get(
-            "https://openrouter.ai/api/v1/auth/key",
+            f"{cfg.get('base_url')}/models",
             headers={"Authorization": f"Bearer {key}"},
             timeout=15,
-            proxy=proxy,
         )
-    except Exception as exc:  # noqa: BLE001 — сеть может быть недоступна
+    except Exception as exc:  # noqa: BLE001
         WARNINGS.append("ключ не удалось проверить онлайн")
         print(f"    [ВНИМАНИЕ] Не удалось проверить ключ онлайн ({exc}).")
-        print("    Если OpenRouter требует VPN — проверьте OPENROUTER_PROXY в .env.")
         return True
 
     if response.status_code == 200:
-        label = response.json().get("data", {}).get("label") or "(без имени)"
-        print(f"    OK: ключ действителен ({label})")
+        try:
+            n = len(response.json().get("data") or [])
+            print(f"    OK: ключ принят, доступно моделей: {n}")
+        except Exception:  # noqa: BLE001
+            print("    OK: ключ принят (список моделей не разобран)")
         return True
 
-    WARNINGS.append(f"OpenRouter ответил {response.status_code}")
-    print(f"    [ВНИМАНИЕ] OpenRouter ответил {response.status_code}: {response.text[:120]}")
-    print("    Проверьте OPENROUTER_API_KEY в .env.")
+    if response.status_code in (401, 403):
+        WARNINGS.append(f"{name} отверг ключ (HTTP {response.status_code})")
+        print(f"    [ВНИМАНИЕ] {name} отверг ключ (HTTP {response.status_code}).")
+        print(f"    Проверьте {key_env} в .env.")
+        return True
+
+    WARNINGS.append(f"{name} ответил {response.status_code} на /models")
+    print(f"    [ВНИМАНИЕ] {name} ответил {response.status_code} на /models —")
+    print("    ключ задан, но живую проверку выполнить не удалось (не критично).")
     return True
 
 
@@ -161,7 +204,7 @@ def main() -> int:
         check_imports(),
         check_onnxruntime(),
         check_ner_engines(),
-        check_openrouter(),
+        check_provider_key(),
     ]
     print()
     if not all(results):
