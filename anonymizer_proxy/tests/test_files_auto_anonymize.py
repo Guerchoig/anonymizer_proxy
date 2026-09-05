@@ -524,6 +524,91 @@ async def test_nonexistent_path_not_intercepted():
     print("TEST 13 OK: несуществующий путь — passthrough в облако")
 
 
+async def test_hermes_backticked_attachments_system_prompt_excluded():
+    """Регрессия 2026-09-05: Hermes прислал 4 вложения @file:`…путь с
+    пробелами…docx` + «Attached Context» с абсолютными путями в бэктиках,
+    а системный промпт Hermes упоминает AGENTS.md. Прежний код: бэктики не
+    распознавались (пути с пробелами терялись), а AGENTS.md из системного
+    промпта попадал в кандидаты — анонимизировался он, а не вложения.
+    Ожидание: анонимизируются ровно 4 приложенных docx, AGENTS.md — нет."""
+    attachments: list[Path] = []
+    used_agents_stub = False
+    agents_md = Path(__file__).parent.parent / "AGENTS.md"
+    try:
+        from docx import Document
+        for name in (
+                "Тестовое вложение Hermes 1 (пробелы в имени).docx",
+                "Тестовое вложение Hermes 2 (пробелы в имени).docx",
+                "Тестовое вложение Hermes 3 (пробелы в имени).docx",
+                "Тестовое вложение Hermes 4 (пробелы в имени).docx"):
+            target = Path(tempfile.gettempdir()) / name
+            doc = Document()
+            doc.add_paragraph(FILE_TEXT)
+            doc.save(target)
+            attachments.append(target)
+        if not agents_md.exists():
+            agents_md.write_text("# AGENTS\nправила проекта\n", encoding="utf-8")
+            used_agents_stub = True
+
+        home = Path.home()
+        rels = []
+        for p in attachments:
+            try:
+                rels.append(p.relative_to(home))
+            except ValueError:
+                rels.append(None)
+        if any(r is None for r in rels):
+            print("TEST 14 SKIP: tempdir не внутри домашней папки")
+            return
+
+        refs = "\n".join(
+            f"@file:`{r.as_posix()}`" for r in rels)
+        context = "\n\n".join(
+            f"📎 @file:`{r.as_posix()}` — binary file. It is available on "
+            f"disk at `{p}`."
+            for r, p in zip(rels, attachments))
+        user_text = (f"{refs}\n\nанонимизируй приложенные файлы\n\n"
+                     f"--- Attached Context ---\n\n{context}")
+        system_prompt = (
+            "## AGENTS.md\nправила из AGENTS.md (C:\\Test\\anonymizer_proxy)\n"
+            "…прочее содержимое системного промпта Hermes…")
+        request = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[
+                ChatMessage(role="system", content=system_prompt),
+                ChatMessage(role="user", content=user_text),
+            ],
+        )
+        handler = make_handler()
+        file_paths = handler.detect_attached_files_anonymization(request)
+        expected = [str(p.resolve()) for p in attachments]
+        assert sorted(file_paths) == sorted(expected), \
+            (file_paths, expected)
+        # AGENTS.md проекта не анонимизирован (нет .anonymized-копии рядом
+        # с корнем проекта, кроме ранее существовавшей)
+        agents_anon = agents_md.with_name("AGENTS.anonymized.md")
+        # Если реальная AGENTS.anonymized.md уже существовала — не трогаем;
+        # важно, что путь AGENTS.md НЕ попал в file_paths
+        assert str(agents_md) not in file_paths, file_paths
+        resp, sid = await handler.handle_chat_completion(request)
+        assert not handler.openrouter.captured, "запрос ушёл в облако"
+        for p in attachments:
+            assert p.with_name(
+                f"{p.stem}.anonymized{p.suffix}").exists(), p
+            p.with_name(f"{p.stem}.anonymized{p.suffix}").unlink(missing_ok=True)
+        answer = resp.choices[0].message.content
+        assert "AGENTS.md →" not in answer, answer
+        print("TEST 14 OK: Hermes backtick-вложения с пробелами; "
+              "AGENTS.md из system-промпта исключён")
+    finally:
+        for p in attachments:
+            p.unlink(missing_ok=True)
+            p.with_name(f"{p.stem}.anonymized{p.suffix}").unlink(missing_ok=True)
+            p.with_name(f"{p.stem}.result{p.suffix}").unlink(missing_ok=True)
+        if used_agents_stub:
+            agents_md.unlink(missing_ok=True)
+
+
 async def main():
     await test_intercept_anonymizes_file_no_cloud()
     await test_no_intent_goes_to_cloud()
@@ -538,6 +623,7 @@ async def main():
     await test_plain_path_mention_intercepted()
     await test_path_mention_with_punctuation()
     await test_nonexistent_path_not_intercepted()
+    await test_hermes_backticked_attachments_system_prompt_excluded()
     print("\nALL FILES AUTO-ANONYMIZE TESTS PASSED")
 
 

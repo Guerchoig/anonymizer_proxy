@@ -21,7 +21,7 @@ from ..anonymizer.replacer import (
 )
 from ..config import (
     Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, LOCAL_LLM,
-    COMMAND_CLASSIFIER,
+    COMMAND_CLASSIFIER, acting_cloud_provider, CLOUD_PROVIDERS,
 )
 from ..models.schemas import (
     Entity,
@@ -41,6 +41,7 @@ from .utils import (
     FILE_CONTENT_ERROR_PREFIX,
     OFFICE_PATH_RE,
     ATTACHMENT_FILE_REF_RE,
+    BACKTICKED_OFFICE_PATH_RE,
     PATH_MENTION_RE,
     WORKSPACE_ROOT,
     ANONYMIZE_INTENT_RE,
@@ -618,6 +619,14 @@ class RequestHandler:
         candidates: list[str] = []
         done: set[str] = set()
         for msg in request.messages:
+            # Системный промпт (Hermes/Cline) — НЕ источник файлов для
+            # анонимизации. Он всегда упоминает служебные файлы агента
+            # (AGENTS.md и т.п.): реальный кейс 2026-09-05 — «анонимизируй
+            # приложенные файлы» анонимизировал AGENTS.md из корня проекта
+            # вместо приложенных docx, потому что путь AGENTS.md попал в
+            # кандидаты из системного промпта.
+            if (msg.role or "").lower() == "system":
+                continue
             for text in _iter_content_texts(msg.content):
                 for match in FILE_CONTENT_BLOCK_RE.finditer(text):
                     raw_path = match.group("path").strip()
@@ -625,7 +634,8 @@ class RequestHandler:
                         candidates.append(raw_path)
                 # Ссылки вида «@file:<путь>» — формат вложений клиента Hermes
                 for match in ATTACHMENT_FILE_REF_RE.finditer(text):
-                    raw_path = match.group("path").strip().strip('"').strip("'")
+                    raw_path = (match.group("path").strip()
+                                .strip('"').strip("'").strip("`"))
                     if not raw_path or raw_path in candidates:
                         continue
                     if not FileParser.is_supported(raw_path):
@@ -633,6 +643,13 @@ class RequestHandler:
                         # анонимизируем только поддерживаемые форматы
                         continue
                     candidates.append(raw_path)
+                # Путь в бэктиках с офисным расширением — блок «Attached
+                # Context» Hermes (абсолютный путь с пробелами, \S+ его не
+                # берёт): …available on disk at `C:\…\Имя с пробелами.docx`
+                for match in BACKTICKED_OFFICE_PATH_RE.finditer(text):
+                    raw_path = match.group(1).strip()
+                    if raw_path and raw_path not in candidates:
+                        candidates.append(raw_path)
                 # Пути к файлам, упомянутые в тексте сообщения
                 # («анонимизируй файл c:\docs\KP_IRIS.docx»)
                 for match in PATH_MENTION_RE.finditer(text):
@@ -946,14 +963,21 @@ class RequestHandler:
     def detect_backend_switch(
         self, request: ChatCompletionRequest,
     ) -> Optional[str]:
-        """Чат-команда переключения бэкенда: 'local' | 'openrouter' | None."""
+        """Чат-команда переключения бэкенда: 'local' | 'облако' | None.
+
+        «Работай через облако» переключает на ДЕЙСТВУЮЩЕГО облачного
+        провайдера (acting_cloud_provider): последнего явно выбранного в
+        форме / POST /api/backend; до первого переключения — стартовый
+        CLOUD_PROVIDER (после установки — openrouter). Именованных команд
+        переключения на конкретных провайдеров больше нет — выбор делается
+        в форме настроек."""
         joined = "\n".join(last_user_message_texts(request.messages))
         if RESTART_INTENT_RE.search(joined):
             return None  # перезапуск приоритетнее — команды не смешиваем
         if LOCAL_BACKEND_RE.search(joined):
             return "local"
         if CLOUD_BACKEND_RE.search(joined):
-            return "openrouter"
+            return acting_cloud_provider()
         return None
 
     @staticmethod
@@ -966,10 +990,13 @@ class RequestHandler:
                 "приложенных файлов отключена. Вернуться в облако — команда "
                 "«работай через облако»."
             )
+        cfg = CLOUD_PROVIDERS.get(backend, {})
+        name = backend if backend != "openrouter" else "OpenRouter"
         return (
-            "[ANONYMIZER] Активный LLM-бэкенд: OpenRouter (облако). "
-            "Данные анонимизируются как раньше; перейти на локальную модель "
-            "можно командой «работай через локальную модель»."
+            f"[ANONYMIZER] Активный LLM-бэкенд: {name} (облако, "
+            f"{cfg.get('base_url', '')}). Данные анонимизируются как раньше; "
+            "перейти на локальную модель можно командой «работай через "
+            "локальную модель»."
         )
 
     @staticmethod
@@ -1100,7 +1127,7 @@ class RequestHandler:
         if intent == "backend_local":
             return {"command": "backend", "backend": "local"}
         if intent == "backend_cloud":
-            return {"command": "backend", "backend": "openrouter"}
+            return {"command": "backend", "backend": acting_cloud_provider()}
         if content_commands:
             if intent == "deanon_files":
                 targets = self.detect_deanonymize_request(request)
@@ -1136,7 +1163,7 @@ class RequestHandler:
             return self.handle_restart(request)
         if kind == "backend":
             return self.handle_backend_switch(
-                request, command.get("backend") or "openrouter"
+                request, command.get("backend") or acting_cloud_provider()
             )
         if kind == "deanon_files":
             return await self.handle_deanonymize_files(

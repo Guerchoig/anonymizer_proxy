@@ -29,9 +29,18 @@ FILE_CONTENT_ERROR_PREFIX = "Error fetching content"
 OFFICE_PATH_RE = re.compile(r"\S+\.(?:docx|xlsx)\b", re.IGNORECASE)
 # Ссылки на файлы в стиле Hermes: «@file:<путь>» в тексте сообщения.
 # Desktop-клиент Hermes передаёт вложения такими ссылками (без блоков
-# <file_content path="...">); путь может быть в кавычках.
+# <file_content path="...">); путь может быть в кавычках "…"/'…' или в
+# бэктиках `…` (Hermes оборачивает в них даже пути с пробелами:
+# @file:`AppData/Local/hermes/attachments/ERP.СМ Соглашение.docx`).
 ATTACHMENT_FILE_REF_RE = re.compile(
-    r"@file:(?P<path>\"[^\"]+\"|'[^']+'|[^\s,;)\]]+)",
+    r"@file:(?P<path>\"[^\"]+\"|'[^']+'|`[^`]+`|[^\s,;)\]]+)",
+    re.IGNORECASE,
+)
+# Путь в бэктиках с офисным расширением — так Hermes печатает блок
+# «Attached Context»: доступно на диске в `C:\…\attachments\Имя с пробелами.docx`.
+# Отдельная регулярка, потому что путь с пробелами не взять по \S+.
+BACKTICKED_OFFICE_PATH_RE = re.compile(
+    r"`([^`\r\n]+\.(?:docx|xlsx|xml|txt|md))`",
     re.IGNORECASE,
 )
 # Упоминание файла поддерживаемого формата простым путём в тексте сообщения
@@ -75,8 +84,8 @@ LOCAL_BACKEND_RE = re.compile(
     re.IGNORECASE,
 )
 CLOUD_BACKEND_RE = re.compile(
-    r"(?:переключи|переключись|работай|используй|верни)\w*[^\n]{0,40}"
-    r"(?:обла(?:чн|к)|openrouter|опенроутер|опенраутер)",
+    r"(?:переключи|переключись|работай|используй|верни|вернись)\w*[^\n]{0,40}"
+    r"(?:обла(?:чн|к)|cloud)",
     re.IGNORECASE,
 )
 # Машиночитаемый маркер пути анонимизированной копии в ответе перехвата
@@ -91,7 +100,7 @@ ANONYMIZER_RESULT_MARKER_RE = re.compile(r"\[anonymizer:result:(?P<path>[^\]]+)\
 COMMAND_TRIGGER_RE = re.compile(
     r"перезапус|перезагруз|рестарт|\brestart\b"
     r"|прокси|\bproxy\b|бэкенд|бекенд|\bbackend\b"
-    r"|локальн|обла(?:чн|к)|openrouter|опенроутер"
+    r"|локальн|обла(?:чн|к)"
     r"|де.?анонимиз|deanonymi",
     re.IGNORECASE,
 )
