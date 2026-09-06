@@ -2,10 +2,14 @@
 Прокси-сервер для анонимизации запросов к облачным LLM
 FastAPI приложение с OpenAI-совместимым API
 """
+import argparse
 import asyncio
 import json
 import os
 import sys
+import threading
+import time
+import webbrowser
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +29,7 @@ from anonymizer_proxy.config import (
     CLOUD_PROVIDER, CLOUD_PROVIDERS, acting_cloud_provider,
     PROXY_VERSION, BASE_DIR, ensure_directories, logger
 )
+from anonymizer_proxy import launcher
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
 from anonymizer_proxy.proxy.openrouter_client import OpenRouterError
@@ -852,13 +857,56 @@ async def cleanup_expired():
 
 # ==================== Запуск сервера ====================
 
-def main():
+def _schedule_open_settings(timeout: float = 180.0) -> None:
+    """Открыть страницу настроек /env-editor, когда сервер начнёт отвечать
+    (запуск ярлыком с флагом --open-settings).
+
+    Отдельный поток-демон опрашивает /health (lifespan-прогрев NER-модели
+    может занимать до минуты) и открывает браузер по умолчанию. Поток —
+    daemon: остановка сервера его не задерживает. Закрытие открытой страницы
+    прокси не останавливает — это только вкладка браузера.
+    """
+    def _job():
+        url = launcher.settings_url()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if launcher.probe_health():
+                try:
+                    webbrowser.open(url)
+                    logger.info("Страница настроек открыта: %s", url)
+                except Exception as exc:
+                    logger.warning(
+                        "Не удалось открыть браузер (%s): %s", url, exc)
+                return
+            time.sleep(1.0)
+        logger.warning(
+            "Сервер не ответил за %.0f c — страница настроек не открыта",
+            timeout)
+
+    threading.Thread(
+        target=_job, daemon=True, name="open-settings").start()
+
+
+def main(argv=None):
     """Точка входа для запуска сервера"""
+    parser = argparse.ArgumentParser(
+        prog="anonymizer_proxy.main",
+        description="Прокси-сервер анонимизации (OpenAI-совместимый API)")
+    parser.add_argument(
+        "--open-settings", action="store_true",
+        help="открыть страницу настроек /env-editor в браузере, когда сервер "
+             "начнёт отвечать (используется ярлыками start_proxy.cmd / "
+             "start_proxy.command; без флага — прежнее поведение)")
+    args = parser.parse_args(argv)
+
     host = PROXY["host"]
     port = PROXY["port"]
 
     logger.info("Запуск сервера на %s:%s...", host, port)
     logger.info("Документация API: http://localhost:%s/docs", port)
+
+    if args.open_settings:
+        _schedule_open_settings()
 
     uvicorn.run(
         "anonymizer_proxy.main:app",

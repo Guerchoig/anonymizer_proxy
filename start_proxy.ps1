@@ -7,6 +7,11 @@
 # не должен останавливать сервер — события консоли доставляются только
 # процессам этой же консоли. Вариант -Foreground — прежнее поведение
 # (сервер в текущей консоли, Ctrl+C его останавливает).
+#
+# Поведение по умолчанию (ярлык): если прокси УЖЕ запущен — просто
+# открывается страница настроек /env-editor в браузере (второй экземпляр
+# не поднимается); иначе сервер стартует и страница настроек откроется,
+# когда он будет готов. Закрытие страницы прокси не останавливает.
 param([switch]$Foreground)
 
 Set-Location -Path $PSScriptRoot
@@ -23,7 +28,16 @@ if ($Foreground) {
     exit $LASTEXITCODE
 }
 
+# Прокси уже запущен — открываем страницу настроек и выходим.
+& $py -m anonymizer_proxy.launcher check *> $null
+if ($LASTEXITCODE -eq 0) {
+    & $py -m anonymizer_proxy.launcher open
+    Write-Host "Прокси уже запущен — страница настроек открыта в браузере."
+    exit 0
+}
+
 Write-Host "Запуск anonymizer-proxy в отдельном окне консоли..."
 Write-Host "Остановка сервера: закрыть это окно или нажать Ctrl+C внутри него."
-$argList = @("-m", "anonymizer_proxy.main") + @args
+Write-Host "Страница настроек откроется в браузере, когда сервер будет готов."
+$argList = @("-m", "anonymizer_proxy.main", "--open-settings") + @($args)
 Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $PSScriptRoot
