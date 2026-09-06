@@ -5,6 +5,7 @@
 import base64
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from ..models.schemas import (
     SendAnonymizedRequest,
 )
 from .command_classifier import looks_like_command, classify_command_intent
+from .command_args import parse_name_list, parse_placeholder_spec
 from .openrouter_client import OpenRouterClient
 from .utils import (
     FILE_CONTENT_BLOCK_RE,
@@ -49,6 +51,9 @@ from .utils import (
     SESSION_ID_LINE_RE,
     DEANONYMIZE_INTENT_RE,
     RESTART_INTENT_RE,
+    EXTRA_ANONYMIZE_INTENT_RE,
+    PLACEHOLDER_DEANON_INTENT_RE,
+    PLACEHOLDER_TOKEN_RE,
     LOCAL_BACKEND_RE,
     CLOUD_BACKEND_RE,
     COMMAND_TRIGGER_RE,
@@ -63,6 +68,27 @@ from .utils import (
 )
 
 logger = logging.getLogger("anonymizer_proxy.handlers")
+
+
+def _help_command(text: str) -> dict:
+    """Anti-fallthrough: команда распознана, а аргументы — нет.
+
+    Возвращает служебную команду-подсказку вместо провала в обобщённую
+    семантику (полная деанонимизация / whole-file NER): восстанавливать или
+    маскировать больше, чем попросил пользователь, нельзя.
+    """
+    return {"command": "cmd_help", "text": text}
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Атомарная перезапись файла (временный файл + os.replace)."""
+    tmp = path.with_name(path.name + ".anonymizer-tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 class PreparedFilesAnonymization:
@@ -1095,6 +1121,20 @@ class RequestHandler:
         if backend:
             return {"command": "backend", "backend": backend}
 
+        # 1b) Новые команды v1.11 (канонические формулировки, детерминированные
+        #     правила + парсеры аргументов, БЕЗ моделей). Проверяются ДО
+        #     GLiNER-слоя и обобщённого deanon_files: «деанонимизируй
+        #     плейсхолдеры…» содержит «деанонимиз», «дополнительно
+        #     анонимизируй…» — «анонимиз», и иначе перехватились бы
+        #     полной деанонимизацией / whole-file NER соответственно.
+        if content_commands:
+            cmd = self._resolve_placeholder_deanon_command(request, joined)
+            if cmd:
+                return cmd
+            cmd = self._resolve_extra_anonymize_command(request, joined)
+            if cmd:
+                return cmd
+
         # 2) GLiNER (выключен по умолчанию): свободные формулировки безопасных
         #    команд
         intent = await self._gliner_command_intent(texts)
@@ -1143,6 +1183,24 @@ class RequestHandler:
             return await self.handle_deanonymize_files(
                 request, command.get("targets") or [], None
             )
+        if kind == "deanon_placeholders":
+            return await self.handle_deanonymize_placeholders(
+                request,
+                command.get("tokens") or [],
+                command.get("targets") or [],
+                command.get("unrecognized") or [],
+            )
+        if kind == "extra_anonymize":
+            return await self.handle_extra_anonymize(
+                request,
+                command.get("names") or [],
+                command.get("targets") or [],
+                command.get("unrecognized") or [],
+            )
+        if kind == "cmd_help":
+            # Anti-fallthrough: команда распознана, аргументы — нет.
+            return self._command_reply(
+                request, command.get("text") or "", "cmd_help")
         raise ValueError(f"Неизвестная чат-команда: {kind!r}")
 
     def _command_reply(
@@ -1250,6 +1308,147 @@ class RequestHandler:
             "Анонимизированная копия и исходный файл не изменялись.",
         ]
         return "\n".join(lines)
+
+    # ============ Точечные команды v1.11: детекция (только правила) ============
+
+    def _resolve_placeholder_deanon_command(
+        self, request: ChatCompletionRequest, joined: str,
+    ) -> Optional[dict]:
+        """
+        Команда «деанонимизируй плейсхолдеры PERSON_1, PERSON_3–PERSON_5».
+
+        Проверяется ДО обобщённого deanon_files: «деанонимизируй
+        плейсхолдеры…» содержит «деанонимиз» и иначе перехватился бы ПОЛНОЙ
+        деанонимизацией файлов (восстановить больше PII, чем попросил
+        пользователь, нельзя). Anti-fallthrough: интент есть, а токены не
+        распознаны — служебная подсказка вместо провала в полную
+        деанонимизацию. Ловит и «деанонимизируй PERSON_1…» без слова
+        «плейсхолдеры»: частичная деанонимизация безопаснее полной.
+        """
+        texts = last_user_message_texts(request.messages)
+        explicit = any(
+            PLACEHOLDER_DEANON_INTENT_RE.search(t) for t in texts)
+        tokens, errors = parse_placeholder_spec(joined)
+        if not explicit and not (
+                tokens
+                and any(DEANONYMIZE_INTENT_RE.search(t) for t in texts)):
+            return None
+        if not tokens:
+            return _help_command(
+                "[ANONYMIZER] Команда деанонимизации плейсхолдеров распознана, "
+                "но ни одного плейсхолдера не распознано. Укажите список или "
+                "диапазон, например: деанонимизируй плейсхолдеры PERSON_1, "
+                "PERSON_3–PERSON_5. Запрос в облако НЕ отправлялся.")
+        targets = self.detect_deanonymize_request(request)
+        if not targets:
+            return _help_command(
+                "[ANONYMIZER] Плейсхолдеры распознаны ("
+                + ", ".join(tokens) + "), но в диалоге не найдено файлов "
+                "результата (маркеров [anonymizer:result:…]). Сначала "
+                "выполните анонимизацию. Запрос в облако НЕ отправлялся.")
+        return {
+            "command": "deanon_placeholders",
+            "tokens": tokens,
+            "unrecognized": errors,
+            "targets": targets,
+        }
+
+    def _resolve_extra_anonymize_command(
+        self, request: ChatCompletionRequest, joined: str,
+    ) -> Optional[dict]:
+        """
+        Команда «дополнительно анонимизируй: Иванов, Петрова».
+
+        Проверяется до перехвата авто-анонимизации приложенных файлов:
+        «дополнительно анонимизируй…» содержит «анонимиз». Anti-fallthrough:
+        интент есть, а имена не распознаны — подсказка, а не whole-file NER.
+        """
+        match = EXTRA_ANONYMIZE_INTENT_RE.search(joined)
+        if not match:
+            return None
+        names, errors = parse_name_list(joined[match.end():])
+        if not names:
+            return _help_command(
+                "[ANONYMIZER] Команда дополнительной анонимизации распознана, "
+                "но имена не распознаны. Перечислите их через запятую: "
+                "дополнительно анонимизируй: Иванов, Петрова, Сидоров И. И. "
+                "Запрос в облако НЕ отправлялся.")
+        targets, default_sid = self._detect_extra_anonymize_targets(request)
+        if not targets:
+            return _help_command(
+                "[ANONYMIZER] Имена распознаны (" + ", ".join(names)
+                + "), но в диалоге не найдено анонимизированных копий "
+                "(маркеров [anonymizer:copy:…]). Сначала выполните "
+                "анонимизацию файлов. Запрос в облако НЕ отправлялся.")
+        return {
+            "command": "extra_anonymize",
+            "names": names,
+            "unrecognized": errors,
+            "targets": targets,
+            "session_id": default_sid,
+        }
+
+    def _detect_extra_anonymize_targets(
+        self, request: ChatCompletionRequest,
+    ) -> tuple[list[dict], Optional[str]]:
+        """
+        Цели команды «дополнительно анонимизируй…»: анонимизированные копии.
+
+        1) явные пути в ТЕКУЩЕМ сообщении (копия используется напрямую; для
+           оригинала берётся одноимённая копия <name>.anonymized.<ext>, если
+           она существует);
+        2) иначе — маркеры [anonymizer:copy:…] из истории диалога с
+           session_id (по образцу detect_deanonymize_request).
+
+        Returns:
+            (targets, default_session_id); target = {"copy_path", "session_id"}
+        """
+        targets: list[dict] = []
+        seen: set[str] = set()
+        default_sid: Optional[str] = None
+
+        def _add(copy_path: str, session_id: Optional[str]) -> None:
+            key = norm_fs_path(copy_path)
+            if key in seen:
+                return
+            seen.add(key)
+            targets.append({"copy_path": copy_path, "session_id": session_id})
+
+        # 1) явные пути из текущего сообщения
+        for text in last_user_message_texts(request.messages):
+            candidates: list[str] = []
+            for m in FILE_CONTENT_BLOCK_RE.finditer(text):
+                candidates.append(m.group("path").strip())
+            for m in ATTACHMENT_FILE_REF_RE.finditer(text):
+                candidates.append(
+                    m.group("path").strip().strip('"').strip("'").strip("`"))
+            for m in PATH_MENTION_RE.finditer(text):
+                candidates.append(m.group(0).strip())
+            for raw in candidates:
+                path = _resolve_local_path(raw)
+                if not path.is_file() or not FileParser.is_supported(str(path)):
+                    continue
+                if _is_anonymized_copy_path(raw):
+                    _add(str(path), None)
+                    continue
+                derived = path.with_name(
+                    path.stem + ".anonymized" + path.suffix)
+                if derived.is_file():
+                    _add(str(derived), None)
+
+        # 2) маркеры копий из истории
+        for msg in request.messages:
+            for text in _iter_content_texts(msg.content):
+                if "[anonymizer:copy:" not in text:
+                    continue
+                sid_match = SESSION_ID_LINE_RE.search(text)
+                sid = sid_match.group(1) if sid_match else None
+                if sid and not default_sid:
+                    default_sid = sid
+                for m in ANONYMIZER_COPY_MARKER_RE.finditer(text):
+                    _add(m.group("path").strip(), sid)
+
+        return targets, default_sid
 
     async def prepare_deanonymize_files(
         self,
@@ -2460,12 +2659,20 @@ class RequestHandler:
         session_id: str,
         file_path: str,
         output_path: Optional[str] = None,
+        mappings_subset: Optional[dict] = None,
     ) -> dict:
         """
         Де-анонимизировать файл: заменить плейсхолдеры на реальные значения
         из маппингов сессии и пересохранить файл (структура/таблицы сохраняются).
+
+        mappings_subset — необязательное ограничение набора токенов
+        (token -> original_value) для ВЫБОРОЧНОЙ де-анонимизации (команда
+        «деанонимизируй плейсхолдеры…»); None — все маппинги сессии.
         """
-        mappings_dict = await self.store.get_all_mappings(session_id)
+        if mappings_subset is None:
+            mappings_dict = await self.store.get_all_mappings(session_id)
+        else:
+            mappings_dict = dict(mappings_subset)
         path = Path(file_path)
         if not path.is_file():
             raise FileNotFoundError(f"Файл не найден: {path}")
@@ -2496,6 +2703,252 @@ class RequestHandler:
             "file_path": str(target),
             "mappings_count": len(mappings_dict),
         }
+
+    async def handle_deanonymize_placeholders(
+        self,
+        request: ChatCompletionRequest,
+        tokens: list[str],
+        targets: list[dict],
+        unrecognized: Optional[list[str]] = None,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """
+        Команда «деанонимизируй плейсхолдеры …»: восстановить ТОЛЬКО указанные
+        плейсхолдеры (список/диапазон) в файлах результата.
+
+        Гарантия статуса файла: результат ПО-ПРЕЖНЕМУ считается анонимизированным
+        (даже если восстановлены все его плейсхолдеры): анонимизированная копия
+        не изменяется, маппинги сессии сохраняются, никаких маркеров
+        «полностью деанонимизирован» не выставляется. Полная деанонимизация
+        «насовсем» — штатная команда «деанонимизируй файлы».
+        """
+        wanted = {t for t in tokens}
+        files_report: list[str] = []
+        restored_pairs: list[str] = []
+        unknown_tokens: set[str] = set()
+
+        for target in targets:
+            sid = target.get("session_id")
+            if not sid:
+                files_report.append(
+                    "- (без session_id) — ОШИБКА: сессия не определена")
+                continue
+            result_path = target.get("result_path")
+            copy_path = target.get("copy_path")
+            if result_path and Path(result_path).is_file():
+                file_path = result_path
+                output_path = result_path  # правим файл результата на месте
+            elif copy_path and Path(copy_path).is_file():
+                file_path = copy_path
+                # файла результата нет — как в полной деанонимизации: копию
+                # не трогаем, пишем в файл результата
+                output_path = _result_path_for(copy_path)
+            else:
+                files_report.append(
+                    f"- {result_path or copy_path} — ОШИБКА: файл не найден")
+                continue
+
+            mappings_all = await self.store.get_all_mappings(sid)
+            subset = {t: v for t, v in mappings_all.items() if t in wanted}
+            unknown_tokens |= (wanted - set(subset))
+            if not subset:
+                files_report.append(
+                    f"- {file_path} — указанные плейсхолдеры отсутствуют "
+                    "в маппингах сессии")
+                continue
+
+            info = await self.handle_deanonymize_file(
+                sid, file_path, output_path=str(output_path),
+                mappings_subset=subset)
+            lines = [
+                f"- {info['file_path']} — ОК (восстановлено: {len(subset)})"]
+            for token in sorted(subset):
+                lines.append(f"  - {token} → {subset[token]}")
+            if not (result_path and Path(result_path).is_file()) and copy_path:
+                lines.append(
+                    "  (файл результата не был создан — записан из "
+                    "анонимизированной копии)")
+            files_report.append("\n".join(lines))
+            for token in sorted(subset):
+                restored_pairs.append(f"{token} → {subset[token]}")
+
+        unknown_sorted = sorted(unknown_tokens)
+        reply_lines = [
+            "[ANONYMIZER] Деанонимизированы указанные плейсхолдеры. Запрос в "
+            "облако НЕ отправлялся.",
+            "",
+            "Файлы:",
+            *files_report,
+        ]
+        if unrecognized:
+            reply_lines.append(
+                "Не распознано как плейсхолдеры (исключено): "
+                + ", ".join(unrecognized))
+        if unknown_sorted:
+            reply_lines.append(
+                "Не найдены в маппингах сессии: " + ", ".join(unknown_sorted))
+        reply_lines += [
+            "",
+            "Важно: файл результата по-прежнему считается анонимизированным — "
+            "восстановлены только перечисленные плейсхолдеры (даже если это "
+            "все плейсхолдеры файла). Анонимизированная копия не изменялась; "
+            "полная деанонимизация «насовсем» — командой «деанонимизируй "
+            "файлы».",
+        ]
+        sid_for_log = (targets[0].get("session_id")
+                       if targets else "deanonymize")
+        await self.store.log_request(
+            session_id=sid_for_log,
+            request_type="placeholders_deanonymization",
+            original_content=", ".join(tokens),
+            anonymized_content=", ".join(tokens),
+            response_content=json.dumps(restored_pairs, ensure_ascii=False),
+            entities_found=[],
+            processing_time_ms=0.0,
+        )
+        return self._command_reply(
+            request, "\n".join(reply_lines), "placeholders_deanonymization")
+
+    async def handle_extra_anonymize(
+        self,
+        request: ChatCompletionRequest,
+        names: list[str],
+        targets: list[dict],
+        unrecognized: Optional[list[str]] = None,
+    ) -> tuple[ChatCompletionResponse, str]:
+        """Команда «дополнительно анонимизируй имена…»: заменить в копиях
+        имена, пропущенные NER (перечислены пользователем).
+
+        Детерминированно, без облака и без NER: вхождения — регистро-
+        независимый поиск по маске (существующие плейсхолдеры исключены),
+        для каждой найденной формы — маппинг сессии. Копия перезаписывается
+        атомарно на месте (артефакт прокси); исходник не изменяется, файл
+        по-прежнему считается анонимизированным.
+        """
+        default_sid = None
+        for target in targets:
+            if target.get("session_id"):
+                default_sid = target["session_id"]
+                break
+        if not default_sid and targets:
+            default_sid = await self.store.get_latest_session_for_file(
+                targets[0]["copy_path"])
+        if not default_sid:
+            default_sid = await self.store.get_or_create_session(None)
+
+        files_report: list[str] = []
+        copy_markers: list[str] = []
+        not_found_everywhere = list(names)
+        all_entities_count = 0
+
+        for target in targets:
+            copy_path = Path(target["copy_path"])
+            sid = target.get("session_id") or default_sid
+            if not copy_path.is_file():
+                files_report.append(f"- {copy_path} — ОШИБКА: файл не найден")
+                continue
+            ext = copy_path.suffix.lower()
+            try:
+                if ext in (".txt", ".md"):
+                    original_bytes = None
+                    structure = None
+                    text = copy_path.read_text(encoding="utf-8")
+                elif ext in (".docx", ".xlsx", ".xml"):
+                    original_bytes = copy_path.read_bytes()
+                    parsed = await self.file_parser.parse(
+                        original_bytes, copy_path.name)
+                    text = parsed.text
+                    structure = parsed.structure
+                else:
+                    files_report.append(
+                        f"- {copy_path} — ОШИБКА: неподдерживаемый формат {ext}")
+                    continue
+                masked = PLACEHOLDER_TOKEN_RE.sub(
+                    lambda m: " " * len(m.group(0)), text)
+                entities: list[Entity] = []
+                found_names: set[str] = set()
+                for name in names:
+                    pattern = re.compile(
+                        r"(?<![A-Za-zА-Яа-яЁё])" + re.escape(name)
+                        + r"(?![A-Za-zА-Яа-яЁё])", re.IGNORECASE)
+                    for m in pattern.finditer(masked):
+                        entities.append(Entity(
+                            text=text[m.start():m.end()], type="PERSON",
+                            start=m.start(), end=m.end(), confidence=1.0))
+                        found_names.add(name)
+                for name in found_names:
+                    if name in not_found_everywhere:
+                        not_found_everywhere.remove(name)
+
+                async def add_mapping(original_value, entity_type, _sid=sid):
+                    return await self.store.add_mapping(
+                        _sid, original_value, entity_type)
+
+                if entities:
+                    anonymized_text, mapping_entries = (
+                        await self.text_replacer.anonymize(
+                            text, entities, add_mapping))
+                else:
+                    anonymized_text, mapping_entries = text, []
+                all_entities_count += len(entities)
+
+                if ext in (".txt", ".md"):
+                    _atomic_write_text(copy_path, anonymized_text)
+                else:
+                    assembled = await self.file_assembler.assemble(
+                        original_bytes, copy_path.name, anonymized_text,
+                        structure, strip_hf_images=False, scrub_metadata=False)
+                    _atomic_write_bytes(copy_path, assembled)
+
+                lines = [f"- {copy_path} — ОК (замен: {len(entities)})"]
+                seen_pairs: set[str] = set()
+                for entry in mapping_entries:
+                    pair = f"{entry.original_value} → {entry.token}"
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        lines.append(f"  - {pair}")
+                if not mapping_entries:
+                    lines.append("  - вхождения не найдены")
+                files_report.append("\n".join(lines))
+                copy_markers.append(f"[anonymizer:copy:{copy_path}]")
+            except Exception as exc:
+                logger.exception(
+                    "Ошибка дополнительной анонимизации %s", copy_path)
+                files_report.append(f"- {copy_path} — ОШИБКА: {exc}")
+
+        reply_lines = [
+            "[ANONYMIZER] Дополнительная анонимизация выполнена: указанные "
+            "имена заменены плейсхолдерами. Запрос в облако НЕ отправлялся.",
+            "",
+            "Файлы:",
+            *files_report,
+        ]
+        if not_found_everywhere:
+            reply_lines.append("")
+            reply_lines.append(
+                "Не найдено в файлах (регистр не важен; укажите форму слова "
+                "как в файле): " + ", ".join(not_found_everywhere))
+        if unrecognized:
+            reply_lines.append(
+                "Не распознано как имена (исключено из обработки): "
+                + ", ".join(unrecognized))
+        reply_lines += [
+            "",
+            f"session_id: {default_sid}",
+            "Файл по-прежнему считается анонимизированным; исходный файл "
+            "не изменялся.",
+            *copy_markers,
+        ]
+        await self.store.log_request(
+            session_id=default_sid,
+            request_type="extra_anonymization",
+            original_content=", ".join(names),
+            anonymized_content=json.dumps(files_report, ensure_ascii=False),
+            response_content=None,
+            entities_found=[],
+            processing_time_ms=0.0,
+        )
+        return self._command_reply(
+            request, "\n".join(reply_lines), "extra_anonymize")
 
     async def handle_anonymize_file(
         self,
