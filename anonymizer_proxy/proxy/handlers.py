@@ -20,7 +20,7 @@ from ..anonymizer.replacer import (
     split_entities_by_segments,
 )
 from ..config import (
-    Mode, CURRENT_MODE, STORAGE, RESULT_BEGIN, RESULT_END, LOCAL_LLM,
+    Mode, CURRENT_MODE, STORAGE, LOCAL_LLM,
     COMMAND_CLASSIFIER, acting_cloud_provider, CLOUD_PROVIDERS,
 )
 from ..models.schemas import (
@@ -112,8 +112,7 @@ class PreparedRequest:
         self.anonymized_content = anonymized_content
         # Канонический результат: markdown-рендер анонимизированных сообщений.
         # Это проверяемая проекция контекста, отправляемого в облако:
-        # содержимое файла data/anonymized_files/... и текст между маркерами
-        # RESULT_BEGIN/RESULT_END идентичны canonical_result.
+        # содержимое файла data/anonymized_files/... идентично canonical_result.
         self.canonical_result = canonical_result
 
 
@@ -176,8 +175,8 @@ def _render_messages_markdown(anonymized_messages: list[dict]) -> str:
     Каноническое представление анонимизированного запроса (Markdown).
 
     Это ЕДИНСТВЕННОЕ представление результата анонимизации: оно пишется
-    в файл, возвращается между маркерами RESULT_BEGIN/RESULT_END и является
-    проверяемой проекцией контекста, реально отправляемого в облако.
+    в файл и является проверяемой проекцией контекста, реально
+    отправляемого в облако.
     """
     parts: list[str] = []
     for msg in anonymized_messages:
@@ -413,13 +412,7 @@ class RequestHandler:
         async def add_mapping(original_value: str, entity_type: str) -> str:
             return await self.store.add_mapping(session_id, original_value, entity_type)
 
-        # В режиме anonymize_only системные сообщения исключаются из
-        # анонимизации и результата: пользователю нужна только полезная часть
-        # запроса (без системных промптов), и это ускоряет NER
-        if request.mode == Mode.ANONYMIZE_ONLY:
-            messages = [m for m in request.messages if m.role != "system"]
-        else:
-            messages = request.messages
+        messages = request.messages
 
         # Подменяем блоки <file_content>, которые клиент не смог прочитать
         # (бинарные документы DOCX/XLSX и т.п.), текстом, извлечённым прокси
@@ -544,25 +537,6 @@ class RequestHandler:
         except Exception as e:
             logger.error("Не удалось сохранить анонимизированный файл: %s", e)
             return None
-
-    def _build_summary_line(
-        self,
-        mode: str,
-        session_id: str,
-        saved_path,
-        entities: list,
-        mappings_dict: dict,
-    ) -> str:
-        """
-        Одна служебная строка с минимумом техсведений о результате
-        анонимизации (для ответа anonymize_only).
-        """
-        file_info = str(saved_path) if saved_path else "не сохранён"
-        return (
-            f"[Режим: {mode}; session_id: {session_id}; "
-            f"файл: {file_info}; сущностей: {len(entities)}; "
-            f"маппингов: {len(mappings_dict)}]"
-        )
 
     async def _deanonymize_tool_calls(
         self,
@@ -1494,70 +1468,11 @@ class RequestHandler:
         anonymized_content = prepared.anonymized_content
         canonical_result = prepared.canonical_result
 
-        # В ОБОИХ режимах сохраняем канонический результат в файл:
-        # то, что ушло в облако (full) или видит пользователь
-        # (anonymize_only), всегда идентично содержимому файла
+        # Канонический результат сохраняется в файл: его содержимое —
+        # проверяемая проекция контекста, реально уходящего в облако
         saved_path = await self._save_anonymized_request(
             session_id, canonical_result
         )
-
-        # Режим "только анонимизация" — не отправляем в облако
-        if request.mode == Mode.ANONYMIZE_ONLY:
-            processing_time = (time.time() - start_time) * 1000
-
-            # Ответ: одна служебная строка техсведений + канонический
-            # markdown-результат между маркерами (out-of-band техинформация
-            # дублируется в anonymization_metadata)
-            summary_line = self._build_summary_line(
-                "anonymize_only", session_id, saved_path,
-                entities, mappings_dict,
-            )
-            content = (
-                f"{summary_line}\n\n"
-                f"{RESULT_BEGIN}\n"
-                f"{canonical_result}\n"
-                f"{RESULT_END}"
-            )
-
-            # Создаём "ответ" с анонимизированным контентом
-            response = ChatCompletionResponse(
-                id=f"anonymize-only-{session_id}",
-                created=int(time.time()),
-                model=request.model,
-                choices=[
-                    ChatCompletionChoice(
-                        index=0,
-                        message=ChatMessage(
-                            role="assistant",
-                            content=content,
-                        ),
-                        finish_reason="stop"
-                    )
-                ],
-                usage=UsageInfo(),
-                anonymization_metadata={
-                    "mode": "anonymize_only",
-                    "session_id": session_id,
-                    "anonymized_request_file": (
-                        str(saved_path) if saved_path else None
-                    ),
-                    "entities_found": len(entities),
-                    "mappings_count": len(mappings_dict),
-                }
-            )
-
-            # Логируем
-            await self.store.log_request(
-                session_id=session_id,
-                request_type="anonymize_only",
-                original_content=original_content,
-                anonymized_content=anonymized_content,
-                response_content=None,
-                entities_found=entities,
-                processing_time_ms=processing_time
-            )
-
-            return response, session_id
 
         # Отправляем анонимизированные сообщения в OpenRouter
         final_messages = anonymized_messages
@@ -1664,86 +1579,6 @@ class RequestHandler:
 
             raise
 
-    async def _stream_anonymize_only(
-        self,
-        request: ChatCompletionRequest,
-        prepared: PreparedRequest,
-        start_time: float,
-    ) -> AsyncIterator[str]:
-        """SSE-поток для режима anonymize_only"""
-        session_id = prepared.session_id
-        response_id = f"anonymize-only-{session_id}"
-        created = int(time.time())
-
-        # Сохраняем канонический анонимизированный результат в файл
-        saved_path = await self._save_anonymized_request(
-            session_id, prepared.canonical_result
-        )
-
-        chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": request.model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-        }
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-        # Стрим: служебная строка техсведений + канонический markdown
-        # между маркерами; техинформация дублируется в anonymization_metadata
-        # финального чанка
-        summary_line = self._build_summary_line(
-            "anonymize_only", session_id, saved_path,
-            prepared.entities, prepared.mappings_dict,
-        )
-        anon_text = (
-            f"{summary_line}\n\n"
-            f"{RESULT_BEGIN}\n"
-            f"{prepared.canonical_result}\n"
-            f"{RESULT_END}"
-        )
-        chunk_size = 50
-        for i in range(0, len(anon_text), chunk_size):
-            text_chunk = anon_text[i:i + chunk_size]
-            chunk = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-        chunk = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": request.model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "anonymization_metadata": {
-                "mode": "anonymize_only",
-                "session_id": session_id,
-                "anonymized_request_file": (
-                    str(saved_path) if saved_path else None
-                ),
-                "entities_found": len(prepared.entities),
-                "mappings_count": len(prepared.mappings_dict),
-            },
-        }
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-
-        processing_time = (time.time() - start_time) * 1000
-        await self.store.log_request(
-            session_id=session_id,
-            request_type="anonymize_only_stream",
-            original_content=prepared.original_content,
-            anonymized_content=prepared.anonymized_content,
-            response_content=None,
-            entities_found=prepared.entities,
-            processing_time_ms=processing_time
-        )
-
     async def stream_from_prepared(
         self,
         request: ChatCompletionRequest,
@@ -1758,17 +1593,7 @@ class RequestHandler:
         """
         start_time = time.time()
 
-        # Режим "только анонимизация"
-        if request.mode == Mode.ANONYMIZE_ONLY:
-            async for event in self._stream_anonymize_only(
-                request,
-                prepared,
-                start_time,
-            ):
-                yield event
-            return
-
-        # Режим "full" — стримим от OpenRouter.
+        # Стримим от OpenRouter.
         # Перед отправкой в облако сохраняем канонический результат в файл:
         # содержимое файла — проверяемая проекция контекста, который
         # реально уходит в OpenRouter (prepared.anonymized_messages)
@@ -2508,12 +2333,12 @@ class RequestHandler:
             yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-    async def handle_anonymize_only(
+    async def handle_anonymize(
         self,
         request: AnonymizeRequest
     ) -> AnonymizeResponse:
         """
-        Обработать запрос "только анонимизация"
+        Анонимизировать текст/файлы без отправки в облако (ручной сценарий).
         Поддерживает текст и файлы
         """
         start_time = time.time()
@@ -2603,7 +2428,7 @@ class RequestHandler:
         # Логируем
         await self.store.log_request(
             session_id=session_id,
-            request_type="anonymize_only",
+            request_type="anonymize",
             original_content=request.text or "",
             anonymized_content=anonymized_text or "",
             response_content=json.dumps({"files": len(anonymized_files)}, ensure_ascii=False),

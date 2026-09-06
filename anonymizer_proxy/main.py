@@ -546,7 +546,7 @@ async def anonymize(request: AnonymizeRequest):
     Поддерживает текст и файлы (base64)
     """
     try:
-        response = await request_handler.handle_anonymize_only(request)
+        response = await request_handler.handle_anonymize(request)
         return response
     except Exception:
         logger.exception("Внутренняя ошибка сервера")

@@ -448,8 +448,8 @@ class MappingStore:
         prefix: str = "anonymized_request"
     ) -> Path:
         """
-        Сохранить анонимизированный текст (например, запрос в режиме
-        anonymize_only) в data/anonymized_files/<session_id>/
+        Сохранить канонический анонимизированный текст запроса в
+        data/anonymized_files/<session_id>/
 
         Returns:
             Путь к сохранённому файлу

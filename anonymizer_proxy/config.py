@@ -207,10 +207,19 @@ STORAGE = {
 # Режимы работы
 class Mode:
     FULL = "full"                      # Полная обработка: анонимизация → облако → де-анонимизация
-    ANONYMIZE_ONLY = "anonymize_only"  # Только анонимизация без отправки в облако
     PASSTHROUGH = "passthrough"        # Passthrough (без анонимизации): явная схема управления
     
-CURRENT_MODE = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
+# Значение ANONYMIZER_MODE нормализуется: допустимы full и passthrough.
+# Устаревший режим anonymize_only удалён (v1.10.0): если он остался в чьём-то
+# .env, используется passthrough с предупреждением в логе (прокси не падает).
+_CURRENT_MODE_ENV = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
+if _CURRENT_MODE_ENV in (Mode.FULL, Mode.PASSTHROUGH):
+    CURRENT_MODE = _CURRENT_MODE_ENV
+else:
+    logger.warning(
+        "ANONYMIZER_MODE=%s не поддерживается (режим anonymize_only удалён) — "
+        "используется passthrough", _CURRENT_MODE_ENV)
+    CURRENT_MODE = Mode.PASSTHROUGH
 
 # ==================== Локальная LLM (LM Studio) ====================
 # LM Studio поднимает OpenAI-совместимый сервер (по умолчанию
@@ -321,7 +330,7 @@ def save_runtime_state() -> None:
 # FastAPI-приложении и баннере при старте). Увеличивайте при изменениях
 # кода: Python не перезагружает код в работающем сервере, и по /health
 # можно понять, выполняет ли процесс актуальную версию.
-PROXY_VERSION = "1.9.0"
+PROXY_VERSION = "1.10.0"
 
 # Категории PII для детекции
 PII_CATEGORIES = {
@@ -342,9 +351,3 @@ PII_CATEGORIES = {
 
 # TTL для маппингов (в секундах)
 MAPPING_TTL_SECONDS = 24 * 60 * 60  # 24 часа
-
-# Маркеры выделения канонического анонимизированного результата в ответе.
-# Результат между RESULT_BEGIN и RESULT_END идентичен содержимому файла
-# data/anonymized_files/<session_id>/anonymized_request_*.md
-RESULT_BEGIN = "<<<ANONYMIZED_RESULT>>>"
-RESULT_END = "<<<END_ANONYMIZED_RESULT>>>"

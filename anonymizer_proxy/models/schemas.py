@@ -81,9 +81,9 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[dict] = None
     # Дополнительные поля для управления анонимизацией
     anonymize: bool = Field(default=True, description="Включить анонимизацию")
-    mode: Literal["full", "anonymize_only", "passthrough"] = Field(
+    mode: Literal["full", "passthrough"] = Field(
         default=CURRENT_MODE, 
-        description="Режим: full - полная обработка, anonymize_only - только анонимизация, passthrough - без анонимизации (явное управление)"
+        description="Режим: full - полная обработка (анонимизация → облако → де-анонимизация), passthrough - без анонимизации (явное управление)"
     )
 
 
@@ -114,7 +114,7 @@ class ChatCompletionResponse(BaseModel):
 
 
 class AnonymizeRequest(BaseModel):
-    """Запрос на анонимизацию (режим anonymize_only)"""
+    """Запрос на анонимизацию текста/файлов без отправки в облако (ручной сценарий)"""
     text: Optional[str] = Field(None, description="Текст для анонимизации")
     files: Optional[list[dict]] = Field(None, description="Файлы для анонимизации")
     session_id: Optional[str] = Field(None, description="ID сессии для переиспользования маппингов")
@@ -199,7 +199,7 @@ class LogEntry(BaseModel):
     """Запись лога"""
     timestamp: datetime = Field(default_factory=datetime.now)
     session_id: str = Field(...)
-    request_type: str = Field(...)  # "chat_completion", "anonymize_only"
+    request_type: str = Field(...)  # "chat_completion", "files_*", "anonymize"
     original_content: Any = Field(...)
     anonymized_content: Any = Field(...)
     response_content: Optional[Any] = None
