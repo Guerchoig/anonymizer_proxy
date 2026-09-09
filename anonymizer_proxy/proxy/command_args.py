@@ -13,7 +13,7 @@
 import re
 from typing import List, Tuple
 
-from ..config import PII_CATEGORIES
+from ..config import PLACEHOLDER_TYPES
 
 # Один плейсхолдер: [PERSON_1] или PERSON_1 (регистр не важен); границы —
 # не буква/цифра/подчёркивание, чтобы не матчить внутри других слов
@@ -33,8 +33,12 @@ _RANGE_RE = re.compile(
 # Разделители перечня имён: запятая, точка с запятой, перевод строки,
 # союз «и» (регистрозависимо — чтобы не рвать инициалы «И.»)
 _ITEM_SPLIT_RE = re.compile(r"\s*(?:,|;|\n|\s+и\s+)\s*")
-# Допустимый элемент списка имён: буквы, точки (инициалы), дефис, пробелы
+# Допустимый элемент списка: ЛЮБАЯ строка, содержащая хотя бы одну
+# букву/цифру (имена, номера договоров, даты, суммы — пользователь сам
+# решает, что анонимизировать). Классификация «похоже на имя человека» —
+# is_name_like() (выбор типа плейсхолдера PERSON/MISC).
 _NAME_ITEM_RE = re.compile(r"^[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё.\- ]*$")
+_HAS_ALNUM_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]")
 # Упоминания путей/блоков файлов — не имена (вырезаются перед разбором)
 _PATH_NOISE_RE = re.compile(
     r"@file:\S+"
@@ -61,7 +65,7 @@ def parse_placeholder_spec(text: str) -> Tuple[List[str], List[str]]:
 
     def _add(etype: str, num: int, pos: int) -> None:
         etype = etype.upper()
-        if etype not in PII_CATEGORIES:
+        if etype not in PLACEHOLDER_TYPES:
             errors.append(f"{etype}_{num}: неизвестный тип плейсхолдера")
             return
         token = f"[{etype}_{num}]"
@@ -103,17 +107,31 @@ _FILLER_WORDS = {
 }
 
 
+def is_name_like(item: str) -> bool:
+    """Похоже ли значение на имя человека (буквы/точки/дефис/пробелы).
+
+    Используется для выбора типа плейсхолдера при дополнительной
+    анонимизации: имя → PERSON, прочее (номера, даты, суммы) → MISC.
+    """
+    return bool(_NAME_ITEM_RE.match(item))
+
+
 def parse_name_list(segment: str) -> Tuple[List[str], List[str]]:
-    """Разобрать перечень имён из текста ПОСЛЕ команды.
+    """Разобрать перечень значений из текста ПОСЛЕ команды.
 
     Разделители: запятая, точка с запятой, перевод строки, союз «и»
     (строчно — чтобы не рвать инициалы «И.»). Упоминания путей/блоков
-    файлов вырезаются: это не имена. Служебные слова между командой и
-    перечнем («следующих людей:») отбрасываются.
+    файлов вырезаются: это не значения. Служебные слова между командой
+    и перечнем («следующих людей:») отбрасываются.
+
+    Значением может быть ЛЮБАЯ строка, содержащая хотя бы одну букву/цифру:
+    имя человека, номер договора «0095/23/2.1/00075271/013/2023», дату
+    «27.12.2023» и т.п. — пользователь сам решает, что анонимизировать
+    (багрепорт 2026-09-09: номера/даты ошибочно отвергались как «не имена»).
 
     Returns:
-        (names, errors): names — имена без дубликатов (регистронезависимо);
-        errors — нераспознанные элементы (не фатальны, если есть имена).
+        (names, errors): names — значения без дубликатов (регистронезависимо);
+        errors — нераспознанные элементы (не фатальны, если есть значения).
     """
     cleaned = _PATH_NOISE_RE.sub(" ", segment)
     while True:
@@ -133,9 +151,9 @@ def parse_name_list(segment: str) -> Tuple[List[str], List[str]]:
         item = item.lstrip(":;—–-").strip(" \t")
         if not item:
             continue
-        if (len(item) < 2 or len(item) > 80
-                or len(item.split()) > 4
-                or not _NAME_ITEM_RE.match(item)):
+        if (len(item) < 2 or len(item) > 100
+                or len(item.split()) > 8
+                or not _HAS_ALNUM_RE.search(item)):
             errors.append(item)
             continue
         key = item.casefold()

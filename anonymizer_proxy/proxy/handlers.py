@@ -2,6 +2,7 @@
 Обработчики запросов для прокси-сервера
 Содержит основную логику анонимизации/де-анонимизации
 """
+import asyncio
 import base64
 import json
 import logging
@@ -12,7 +13,12 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from ..anonymizer.ner_service import NERService, NERUnavailableError
-from ..anonymizer.file_parser import FileParser, FileAssembler
+from ..anonymizer.file_parser import (
+    FileParser,
+    FileAssembler,
+    ANON_MARKER,
+    read_anon_marker,
+)
 from ..anonymizer.mapping_store import MappingStore
 from ..anonymizer.replacer import (
     TextReplacer,
@@ -36,7 +42,7 @@ from ..models.schemas import (
     SendAnonymizedRequest,
 )
 from .command_classifier import looks_like_command, classify_command_intent
-from .command_args import parse_name_list, parse_placeholder_spec
+from .command_args import is_name_like, parse_name_list, parse_placeholder_spec
 from .openrouter_client import OpenRouterClient
 from .utils import (
     FILE_CONTENT_BLOCK_RE,
@@ -225,6 +231,11 @@ def _render_messages_markdown(anonymized_messages: list[dict]) -> str:
 class RequestHandler:
     """Основной обработчик запросов с анонимизацией"""
 
+    # Сколько секунд хранить завершённую запись коалесценции анонимизации
+    # файла: поздние дубликаты запросов получают готовый результат мгновенно
+    _INFLIGHT_TTL_SECONDS = 600
+
+
     def __init__(
         self,
         ner_service: NERService,
@@ -238,6 +249,11 @@ class RequestHandler:
         self.file_assembler = FileAssembler()
         self.text_replacer = TextReplacer()
         self.message_anonymizer = MessageAnonymizer(self.text_replacer)
+        # Коалесценция параллельных анонимизаций одного файла (основной
+        # запрос + вспомогательные Hermes — title_generation и т.п. — с той
+        # же историей диалога): norm-путь -> (asyncio.Task, время создания).
+        # Багрепорт 2026-09-08: 4 полных NER-прогона одного файла.
+        self._file_anon_inflight: dict = {}
 
     async def _resolve_failed_file_contents(
         self,
@@ -676,6 +692,16 @@ class RequestHandler:
             # не обрабатывается
             if resolved.stem.lower().endswith(".anonymized"):
                 continue
+            # Временные lock-файлы Office (~$Имя.docx/.xlsx — «owner files»
+            # Word/Excel, ~160 байт с сигнатурой \x05Sas) существуют на диске
+            # и проходят по маске расширения, но документами не являются:
+            # их парсинг даёт BadZipFile и раньше ронял весь перехват
+            # (багрепорт 2026-09-08: «Provider error: File is not a zip
+            # file» при «анонимизируй файл» в Hermes, когда рядом с целевым
+            # документом в истории оказался lock-файл открытого в Word
+            # документа docs\~$_IRIS.result.docx).
+            if resolved.name.startswith("~$"):
+                continue
             if norm_fs_path(raw_path) in done:
                 continue
             if resolved_str in result:
@@ -720,6 +746,68 @@ class RequestHandler:
                 merged.update(mappings)
         return merged, session_ids
 
+    @staticmethod
+    def _reusable_copy(path: Path) -> Optional[Path]:
+        """
+        Путь к существующей анонимизированной копии, если она «свежее»
+        исходника (исходник не менялся с момента её создания). None —
+        переиспользовать нельзя: копии нет либо исходник был изменён
+        (в этом случае нужна повторная анонимизация).
+
+        Допуск 1 секунда — на округление времени в файловых системах.
+        """
+        if path.stem.lower().endswith(".anonymized"):
+            return None
+        target = path.with_name(f"{path.stem}.anonymized{path.suffix}")
+        try:
+            if (target.stat().st_mtime + 1.0) >= path.stat().st_mtime:
+                return target
+        except OSError:
+            pass
+        return None
+
+    async def _anonymize_file_dedup(
+        self,
+        file_path: str,
+        session_id: Optional[str],
+        allow_reuse: bool = True,
+    ) -> dict:
+        """
+        Анонимизация файла с коалесценцией параллельных дубликатов.
+
+        Hermes параллельно с основным запросом шлёт вспомогательные
+        (title_generation и т.п.) с той же историей диалога: без коалесценции
+        каждый такой запрос запускал полный NER-прогон того же файла заново
+        (багрепорт 2026-09-08: 4 анонимизации одного файла). Параллельные и
+        пришедшие чуть позже запросы дожидаются уже запущенной задачи и
+        переиспользуют её результат (и её сессию маппингов).
+
+        Завершённые записи хранятся _INFLIGHT_TTL_SECONDS: поздний дубликат
+        получает готовый результат мгновенно, без нового прогона.
+        """
+        key = f"{norm_fs_path(file_path)}|{bool(allow_reuse)}"
+        now = time.monotonic()
+        for stale in [
+            k for k, (_, ts) in self._file_anon_inflight.items()
+            if now - ts > self._INFLIGHT_TTL_SECONDS
+        ]:
+            self._file_anon_inflight.pop(stale, None)
+
+        entry = self._file_anon_inflight.get(key)
+        if entry is None:
+            task = asyncio.create_task(self.handle_anonymize_file(
+                file_path,
+                session_id=session_id,
+                create_review_md=False,
+                allow_reuse=allow_reuse,
+            ))
+            self._file_anon_inflight[key] = (task, now)
+        else:
+            task = entry[0]
+        # shield: если запрос-дубликат отвалился (таймаут клиента), общая
+        # задача анонимизации должна доработать для остальных
+        return await asyncio.shield(task)
+
     async def prepare_files_anonymization(
         self,
         request: ChatCompletionRequest,
@@ -737,25 +825,43 @@ class RequestHandler:
         start_time = time.time()
         session_id = await self.store.get_or_create_session(session_id)
 
+        # Смешанный набор (часть файлов уже анонимизирована, часть — нет):
+        # переиспользование даст корректные маппинги только для части файлов
+        # (у каждой копии свои токены своей сессии), поэтому в этом случае
+        # обрабатываем всё заново — консистентность важнее скорости.
+        reusable = [
+            self._reusable_copy(Path(fp)) is not None for fp in file_paths
+        ]
+        allow_reuse = not (any(reusable) and not all(reusable))
+
         files_info: list[dict] = []
         entities_total = 0
+        result_sids: list[str] = []
         for file_path in file_paths:
             try:
-                result = await self.handle_anonymize_file(
-                    file_path, session_id=session_id, create_review_md=False
+                result = await self._anonymize_file_dedup(
+                    file_path, session_id, allow_reuse
                 )
-                files_info.append({
+                result_sid = result.get("session_id") or session_id
+                result_sids.append(result_sid)
+                info = {
                     "original_file": result["original_file"],
                     "anonymized_file": result["anonymized_file"],
                     "entities_found": result["entities_found"],
-                })
-                # Связь файл → сессия (частичная де-анонимизация колонок)
+                }
+                if result.get("reused"):
+                    info["note"] = result.get("note")
+                files_info.append(info)
+                # Связь файл → сессия (частичная де-анонимизация колонок).
+                # Для переиспользованных/коалесцированных файлов регистрируем
+                # ИХ сессию (в ней живут маппинги, совпадающие с токенами
+                # копии на диске), а не сессию этого запроса.
                 anon_path = Path(result["anonymized_file"])
                 result_derived = Path(_result_path_for(str(anon_path)))
                 for reg_path in (Path(result["original_file"]), anon_path,
                                  result_derived):
                     await self.store.register_file_session(
-                        str(reg_path), session_id)
+                        str(reg_path), result_sid)
                 entities_total += result["entities_found"]
                 logger.info(
                     "Файл %s анонимизирован → %s (сущностей: %d)",
@@ -766,6 +872,34 @@ class RequestHandler:
                     "Не удалось анонимизировать файл %s: %s", file_path, e
                 )
                 files_info.append({"original_file": file_path, "error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                # Ошибка ОДНОГО файла (битый/недописанный DOCX/XLSX, lock-файл,
+                # отказ в доступе при чтении и т.п.) не должна ронять весь
+                # запрос: раньше BadZipFile отсюда улетал клиенту как
+                # «Provider error: File is not a zip file» и диалог ломался
+                # (багрепорт 2026-09-08). Сообщаем об ошибке файла в ответе
+                # (— ОШИБКА: …) и продолжаем остальные файлы.
+                logger.exception(
+                    "Не удалось анонимизировать файл %s", file_path
+                )
+                files_info.append({"original_file": file_path, "error": str(e)})
+
+        # Единая сессия ответа: если все файлы обработаны в одной другой
+        # сессии (коалесценция параллельных дубликатов / переиспользование
+        # копий), отвечаем от её имени — токены в копиях на диске
+        # соответствуют маппингам именно этой сессии, иначе де-анонимизация
+        # по маркерам этого ответа не найдёт значений.
+        if (result_sids
+                and all(s == result_sids[0] for s in result_sids)
+                and result_sids[0] != session_id):
+            session_id = result_sids[0]
+        elif any(s != session_id for s in result_sids):
+            logger.warning(
+                "Смешанные сессии анонимизации в одном запросе: %s "
+                "(ответ в сессии %s) — де-анонимизация файлов из чужих "
+                "сессий может потребовать повторной анонимизации",
+                sorted(set(result_sids)), session_id,
+            )
 
         mappings_dict = await self.store.get_all_mappings(session_id)
         response_text = self._build_files_anonymization_text(
@@ -813,10 +947,18 @@ class RequestHandler:
                 lines.append(f"- {info['original_file']} — ОШИБКА: {info['error']}")
                 continue
             result_file = _result_path_for(info["anonymized_file"])
-            lines.append(
-                f"- {info['original_file']} → {info['anonymized_file']} "
-                f"(сущностей: {info['entities_found']})"
-            )
+            if info.get("note"):
+                # Переиспользованная копия (исходник не менялся): NER не
+                # запускался, сущности не пересчитывались
+                lines.append(
+                    f"- {info['original_file']} → {info['anonymized_file']} — "
+                    f"{info['note']}"
+                )
+            else:
+                lines.append(
+                    f"- {info['original_file']} → {info['anonymized_file']} "
+                    f"(сущностей: {info['entities_found']})"
+                )
             lines.append(f"  [anonymizer:done:{info['original_file']}]")
             lines.append(f"  [anonymizer:copy:{info['anonymized_file']}]")
             lines.append(f"  [anonymizer:result:{result_file}]")
@@ -1340,12 +1482,9 @@ class RequestHandler:
                 "диапазон, например: деанонимизируй плейсхолдеры PERSON_1, "
                 "PERSON_3–PERSON_5. Запрос в облако НЕ отправлялся.")
         targets = self.detect_deanonymize_request(request)
-        if not targets:
-            return _help_command(
-                "[ANONYMIZER] Плейсхолдеры распознаны ("
-                + ", ".join(tokens) + "), но в диалоге не найдено файлов "
-                "результата (маркеров [anonymizer:result:…]). Сначала "
-                "выполните анонимизацию. Запрос в облако НЕ отправлялся.")
+        # Маркеров [anonymizer:result:…] в диалоге может не быть (новый чат),
+        # но маппинги и привязки файлов сохранены в БД прокси: цели найдёт
+        # фоллбек handle_deanonymize_placeholders по запрошенным токенам.
         return {
             "command": "deanon_placeholders",
             "tokens": tokens,
@@ -1370,13 +1509,13 @@ class RequestHandler:
         if not names:
             return _help_command(
                 "[ANONYMIZER] Команда дополнительной анонимизации распознана, "
-                "но имена не распознаны. Перечислите их через запятую: "
-                "дополнительно анонимизируй: Иванов, Петрова, Сидоров И. И. "
-                "Запрос в облако НЕ отправлялся.")
+                "но значения не распознаны. Перечислите их через запятую, "
+                "например: дополнительно анонимизируй: Иванов, 27.12.2023, "
+                "№0095/23. Запрос в облако НЕ отправлялся.")
         targets, default_sid = self._detect_extra_anonymize_targets(request)
         if not targets:
             return _help_command(
-                "[ANONYMIZER] Имена распознаны (" + ", ".join(names)
+                "[ANONYMIZER] Значения распознаны (" + ", ".join(names)
                 + "), но в диалоге не найдено анонимизированных копий "
                 "(маркеров [anonymizer:copy:…]). Сначала выполните "
                 "анонимизацию файлов. Запрос в облако НЕ отправлялся.")
@@ -2704,6 +2843,48 @@ class RequestHandler:
             "mappings_count": len(mappings_dict),
         }
 
+    async def _discover_placeholder_targets(
+        self, tokens: list[str]) -> list[dict]:
+        """
+        Фоллбек для «деанонимизируй плейсхолдеры…»: цели из хранилища маппингов.
+
+        Основной путь — маркеры [anonymizer:result:…] в диалоге; он не работает
+        в новом чате, хотя маппинги и привязки файлов сохранены в БД прокси.
+        Ищем сессии, содержащие запрошенные токены, и их зарегистрированные
+        файлы (предпочитаем файлы результата, затем копии; файл должен
+        существовать на диске).
+        (багрепорт 2026-09-09: «POSITION_128–129» из старого диалога не
+        деанонимизировались в новом чате)
+        """
+        targets: list[dict] = []
+        try:
+            sessions = await self.store.find_sessions_with_tokens(tokens)
+        except Exception as exc:
+            logger.warning("Поиск сессий по плейсхолдерам не удался: %s", exc)
+            return targets
+        for sid in sessions:
+            try:
+                files = await self.store.get_files_for_session(sid)
+            except Exception as exc:
+                logger.warning("Файлы сессии %s недоступны: %s", sid, exc)
+                continue
+            result_path = next(
+                (f for f in files if ".result." in Path(f).name.lower()), None)
+            copy_path = next(
+                (f for f in files if ".anonymized." in Path(f).name.lower()),
+                None)
+            if result_path and not Path(result_path).is_file():
+                result_path = None
+            if copy_path and not Path(copy_path).is_file():
+                copy_path = None
+            if result_path or copy_path:
+                targets.append({
+                    "session_id": sid,
+                    "result_path": result_path,
+                    "copy_path": copy_path,
+                })
+        return targets
+
     async def handle_deanonymize_placeholders(
         self,
         request: ChatCompletionRequest,
@@ -2715,6 +2896,10 @@ class RequestHandler:
         Команда «деанонимизируй плейсхолдеры …»: восстановить ТОЛЬКО указанные
         плейсхолдеры (список/диапазон) в файлах результата.
 
+        Цели: маркеры [anonymizer:result:…] из диалога; если их там нет
+        (например, плейсхолдеры созданы в другом чате) — фоллбек-поиск по
+        хранилищу маппингов (_discover_placeholder_targets).
+
         Гарантия статуса файла: результат ПО-ПРЕЖНЕМУ считается анонимизированным
         (даже если восстановлены все его плейсхолдеры): анонимизированная копия
         не изменяется, маппинги сессии сохраняются, никаких маркеров
@@ -2722,6 +2907,20 @@ class RequestHandler:
         «насовсем» — штатная команда «деанонимизируй файлы».
         """
         wanted = {t for t in tokens}
+        targets = list(targets or [])
+        if not targets:
+            targets = await self._discover_placeholder_targets(tokens)
+        if not targets:
+            return self._command_reply(
+                request,
+                "[ANONYMIZER] Плейсхолдеры "
+                + ", ".join(sorted(wanted))
+                + " не найдены ни в одной сессии маппингов. Возможно, "
+                "анонимизация ещё не выполнялась (модель загружает плейсхолдеры "
+                "только для файлов, прошедших анонимизацию). Запрос в облако "
+                "НЕ отправлялся.",
+                "placeholders_deanonymization",
+            )
         files_report: list[str] = []
         restored_pairs: list[str] = []
         unknown_tokens: set[str] = set()
@@ -2808,6 +3007,76 @@ class RequestHandler:
         return self._command_reply(
             request, "\n".join(reply_lines), "placeholders_deanonymization")
 
+    async def _extra_anonymize_one_file(
+        self, file_path: Path, names: list[str], sid: str,
+    ) -> tuple[list[str], set[str], int]:
+        """Заменить перечисленные значения в одном файле (атомарно).
+
+        Returns:
+            (строки отчёта, найденные значения, число замен)
+        """
+        ext = file_path.suffix.lower()
+        if ext in (".txt", ".md"):
+            original_bytes = None
+            structure = None
+            text = file_path.read_text(encoding="utf-8")
+        elif ext in (".docx", ".xlsx", ".xml"):
+            original_bytes = file_path.read_bytes()
+            parsed = await self.file_parser.parse(
+                original_bytes, file_path.name)
+            text = parsed.text
+            structure = parsed.structure
+        else:
+            raise ValueError(f"неподдерживаемый формат {ext}")
+
+        masked = PLACEHOLDER_TOKEN_RE.sub(
+            lambda m: " " * len(m.group(0)), text)
+        entities: list[Entity] = []
+        found: set[str] = set()
+        for name in names:
+            # Границы: не буква/цифра/подчёркивание — значения вида
+            # «27.12.2023» и «0095/23/…» не матчятся внутри более длинных
+            # номеров
+            pattern = re.compile(
+                r"(?<![A-Za-zА-Яа-яЁё0-9_])" + re.escape(name)
+                + r"(?![A-Za-zА-Яа-яЁё0-9_])", re.IGNORECASE)
+            for m in pattern.finditer(masked):
+                entities.append(Entity(
+                    text=text[m.start():m.end()],
+                    type="PERSON" if is_name_like(name) else "MISC",
+                    start=m.start(), end=m.end(), confidence=1.0))
+                found.add(name)
+
+        async def add_mapping(original_value, entity_type, _sid=sid):
+            return await self.store.add_mapping(
+                _sid, original_value, entity_type)
+
+        if entities:
+            anonymized_text, mapping_entries = (
+                await self.text_replacer.anonymize(
+                    text, entities, add_mapping))
+        else:
+            anonymized_text, mapping_entries = text, []
+
+        if ext in (".txt", ".md"):
+            _atomic_write_text(file_path, anonymized_text)
+        else:
+            assembled = await self.file_assembler.assemble(
+                original_bytes, file_path.name, anonymized_text,
+                structure, strip_hf_images=False, scrub_metadata=False)
+            _atomic_write_bytes(file_path, assembled)
+
+        lines = [f"- {file_path} — ОК (замен: {len(entities)})"]
+        seen_pairs: set[str] = set()
+        for entry in mapping_entries:
+            pair = f"{entry.original_value} → {entry.token}"
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                lines.append(f"  - {pair}")
+        if not mapping_entries:
+            lines.append("  - вхождения не найдены")
+        return lines, found, len(entities)
+
     async def handle_extra_anonymize(
         self,
         request: ChatCompletionRequest,
@@ -2815,14 +3084,20 @@ class RequestHandler:
         targets: list[dict],
         unrecognized: Optional[list[str]] = None,
     ) -> tuple[ChatCompletionResponse, str]:
-        """Команда «дополнительно анонимизируй имена…»: заменить в копиях
-        имена, пропущенные NER (перечислены пользователем).
+        """Команда «дополнительно анонимизируй значения…»: заменить в копиях
+        и файлах результата строки, пропущенные NER (перечислены
+        пользователем): имена, номера договоров, даты, суммы — любые строки
+        с буквой/цифрой.
 
         Детерминированно, без облака и без NER: вхождения — регистро-
         независимый поиск по маске (существующие плейсхолдеры исключены),
-        для каждой найденной формы — маппинг сессии. Копия перезаписывается
-        атомарно на месте (артефакт прокси); исходник не изменяется, файл
-        по-прежнему считается анонимизированным.
+        для каждой найденной формы — маппинг сессии. Файлы перезаписываются
+        атомарно на месте (артефакты прокси); исходник не изменяется, файл
+        по-прежнему считается анонимизированным. Тип плейсхолдера: PERSON
+        для значений, похожих на имя человека, MISC — для остальных
+        (номера, даты и т.п.). Значение, добавленное агентом после
+        анонимизации (есть только в result), заменяется в result — копия
+        остаётся снимком «оригинал минус PII».
         """
         default_sid = None
         for target in targets:
@@ -2846,69 +3121,44 @@ class RequestHandler:
             if not copy_path.is_file():
                 files_report.append(f"- {copy_path} — ОШИБКА: файл не найден")
                 continue
-            ext = copy_path.suffix.lower()
+
+            # Вариант A: замены применяются к ОБОИМ файлам — копии и файлу
+            # результата (если агент его уже создал). Значение, добавленное
+            # агентом после анонимизации, есть только в result — оно
+            # заменяется там; копия при этом остаётся консистентным снимком
+            # «оригинал минус PII».
+            result_path = Path(_result_path_for(str(copy_path)))
+            files_to_process = [copy_path]
+            if result_path.is_file():
+                files_to_process.append(result_path)
+
+            found_in_copy: set[str] = set()
+            found_overall: set[str] = set()
+            replaces_total = 0
             try:
-                if ext in (".txt", ".md"):
-                    original_bytes = None
-                    structure = None
-                    text = copy_path.read_text(encoding="utf-8")
-                elif ext in (".docx", ".xlsx", ".xml"):
-                    original_bytes = copy_path.read_bytes()
-                    parsed = await self.file_parser.parse(
-                        original_bytes, copy_path.name)
-                    text = parsed.text
-                    structure = parsed.structure
-                else:
+                for i, file_path in enumerate(files_to_process):
+                    lines, found, replaces = (
+                        await self._extra_anonymize_one_file(
+                            file_path, names, sid))
+                    files_report.extend(lines)
+                    found_overall |= found
+                    replaces_total += replaces
+                    if i == 0:
+                        found_in_copy = found
+
+                all_entities_count += replaces_total
+                # Честная пометка: значения, которых нет в копии (появились
+                # после анонимизации) — заменены только в файле результата
+                only_in_result = sorted(found_overall - found_in_copy)
+                if only_in_result:
                     files_report.append(
-                        f"- {copy_path} — ОШИБКА: неподдерживаемый формат {ext}")
-                    continue
-                masked = PLACEHOLDER_TOKEN_RE.sub(
-                    lambda m: " " * len(m.group(0)), text)
-                entities: list[Entity] = []
-                found_names: set[str] = set()
-                for name in names:
-                    pattern = re.compile(
-                        r"(?<![A-Za-zА-Яа-яЁё])" + re.escape(name)
-                        + r"(?![A-Za-zА-Яа-яЁё])", re.IGNORECASE)
-                    for m in pattern.finditer(masked):
-                        entities.append(Entity(
-                            text=text[m.start():m.end()], type="PERSON",
-                            start=m.start(), end=m.end(), confidence=1.0))
-                        found_names.add(name)
-                for name in found_names:
+                        "  - Примечание: " + ", ".join(only_in_result)
+                        + " — в анонимизированной копии отсутствуют "
+                        "(появились после анонимизации); заменены только "
+                        "в файле результата.")
+                for name in found_overall:
                     if name in not_found_everywhere:
                         not_found_everywhere.remove(name)
-
-                async def add_mapping(original_value, entity_type, _sid=sid):
-                    return await self.store.add_mapping(
-                        _sid, original_value, entity_type)
-
-                if entities:
-                    anonymized_text, mapping_entries = (
-                        await self.text_replacer.anonymize(
-                            text, entities, add_mapping))
-                else:
-                    anonymized_text, mapping_entries = text, []
-                all_entities_count += len(entities)
-
-                if ext in (".txt", ".md"):
-                    _atomic_write_text(copy_path, anonymized_text)
-                else:
-                    assembled = await self.file_assembler.assemble(
-                        original_bytes, copy_path.name, anonymized_text,
-                        structure, strip_hf_images=False, scrub_metadata=False)
-                    _atomic_write_bytes(copy_path, assembled)
-
-                lines = [f"- {copy_path} — ОК (замен: {len(entities)})"]
-                seen_pairs: set[str] = set()
-                for entry in mapping_entries:
-                    pair = f"{entry.original_value} → {entry.token}"
-                    if pair not in seen_pairs:
-                        seen_pairs.add(pair)
-                        lines.append(f"  - {pair}")
-                if not mapping_entries:
-                    lines.append("  - вхождения не найдены")
-                files_report.append("\n".join(lines))
                 copy_markers.append(f"[anonymizer:copy:{copy_path}]")
             except Exception as exc:
                 logger.exception(
@@ -2929,7 +3179,7 @@ class RequestHandler:
                 "как в файле): " + ", ".join(not_found_everywhere))
         if unrecognized:
             reply_lines.append(
-                "Не распознано как имена (исключено из обработки): "
+                "Не распознано как значения (исключено из обработки): "
                 + ", ".join(unrecognized))
         reply_lines += [
             "",
@@ -2956,6 +3206,7 @@ class RequestHandler:
         session_id: Optional[str] = None,
         output_path: Optional[str] = None,
         create_review_md: bool = True,
+        allow_reuse: bool = True,
     ) -> dict:
         """
         Анонимизировать локальный файл: создать анонимизированную копию
@@ -2963,6 +3214,11 @@ class RequestHandler:
 
         create_review_md=False — не сохранять .md-предпросмотр (перехват в
         passthrough-режиме: пользователь правит копию в исходном формате).
+
+        allow_reuse=False — не переиспользовать существующую копию, даже если
+        исходник не менялся (используется в смешанных запросах, где часть
+        файлов свежая, а часть уже анонимизирована: консистентность маппингов
+        одной сессии важнее экономии времени).
         """
         session_id = await self.store.get_or_create_session(session_id)
         path = Path(file_path)
@@ -2970,6 +3226,54 @@ class RequestHandler:
             raise FileNotFoundError(f"Файл не найден: {path}")
         if not FileParser.is_supported(path.name):
             raise ValueError(f"Неподдерживаемый формат файла: {path.name}")
+
+        # Переиспользование: копия уже существует и исходник с тех пор не
+        # менялся — повторный NER-прогон (десятки секунд на больших файлах)
+        # не нужен, возвращаем существующую копию в её исходной сессии.
+        # (багрепорт 2026-09-08: повторные запросы Hermes — основной чат +
+        # вспомогательные title_generation с той же историей — по 4 раза
+        # гоняли NER по одному и тому же файлу)
+        if allow_reuse and output_path is None:
+            reused = self._reusable_copy(path)
+            if reused is not None:
+                # Копия переиспользуется только если создана ТЕКУЩЕЙ версией
+                # парсера: копии, сделанные до обновления (например, без
+                # поддержки вложенных таблиц/комментариев), пересоздаются
+                marker = read_anon_marker(reused)
+                if path.suffix.lower() in (".docx", ".xlsx") \
+                        and marker != ANON_MARKER:
+                    logger.info(
+                        "Копия %s создана другой версией анонимизатора "
+                        "(маркер: %r) — требуется переанонимизация",
+                        reused, marker,
+                    )
+                else:
+                    old_sid = (
+                        await self.store.get_latest_session_for_file(str(path))
+                        or await self.store.get_latest_session_for_file(str(reused))
+                        or session_id
+                    )
+                    logger.info(
+                        "Файл %s уже анонимизирован (исходник не менялся) — "
+                        "копия %s переиспользуется (сессия %s)",
+                        path, reused, old_sid,
+                    )
+                    return {
+                        "session_id": old_sid,
+                        "original_file": str(path),
+                        "anonymized_file": str(reused),
+                        "review_file": None,
+                        "anonymized_markdown": "",
+                        "entities_found": 0,
+                        "mappings_count": len(
+                            await self.store.get_all_mappings(old_sid)
+                        ),
+                        "reused": True,
+                        "note": (
+                            "копия уже существовала, исходник не менялся — "
+                            "переиспользована без повторного NER-прогона"
+                        ),
+                    }
 
         content = path.read_bytes()
         parsed = await self.file_parser.parse(content, path.name)
@@ -2983,13 +3287,39 @@ class RequestHandler:
             parsed.text, use_llm=True
         )
         if llm_failed:
+            reason = getattr(self.ner, "last_error", "")
             raise NERUnavailableError(
-                "NER-модель не загрузилась или не вернула результат — "
-                "анонимизация файла не выполнена"
+                "NER-модель не загрузилась или не вернула результат"
+                + (f" ({reason})" if reason else "")
+                + " — анонимизация файла не выполнена"
             )
 
-        anon_text, mappings = await self.text_replacer.anonymize(
-            parsed.text, entities, add_mapping
+        # Анонимизируем ПОСЕГМЕНТНО: NER-сущность может пересекать границу
+        # строк склеенного текста (например, «Sasha\nА.В. Гершойг» — автор и
+        # текст комментария в соседних сегментах; «АП\nОбособленные
+        # подразделения» — многоабзацная ячейка). Замена такой сущности в
+        # склеенном тексте удаляет «\n», число строк анонимизированного
+        # текста перестаёт совпадать с числом сегментов, и хвост сегментов
+        # (вложенные таблицы, комментарии) оставался без замен — сборка
+        # идёт по строгому соответствию «строка ↔ сегмент» (zip).
+        # (багрепорт 2026-09-08: PII на титуле и в комментариях утекала,
+        # хотя маппинги были созданы)
+        segments = parsed.text.split("\n")
+        segment_entities = split_entities_by_segments(
+            entities, segments, separator="\n"
+        )
+        anon_lines: list[str] = []
+        mappings = []
+        for line, line_ents in zip(segments, segment_entities):
+            anon_line, line_maps = await self.text_replacer.anonymize(
+                line, line_ents, add_mapping
+            )
+            anon_lines.append(anon_line)
+            mappings.extend(line_maps)
+        anon_text = "\n".join(anon_lines)
+        anon_text = "\n".join(anon_lines)
+        anon_content = await self.file_assembler.assemble(
+            content, path.name, anon_text, parsed.structure
         )
         anon_content = await self.file_assembler.assemble(
             content, path.name, anon_text, parsed.structure

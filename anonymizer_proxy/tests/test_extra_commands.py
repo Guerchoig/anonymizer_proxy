@@ -90,10 +90,33 @@ def test_parse_name_list():
 
 
 def test_parse_name_list_garbage():
-    names, errors = parse_name_list(": Иванов, 12345, @@!!")
+    names, errors = parse_name_list(": Иванов, @@!!")
     assert names == ["Иванов"], names
-    assert len(errors) == 2, errors
+    assert errors == ["@@!!"], errors
     print("TEST 5 OK: parse_name_list — мусор в errors, имена в names")
+
+
+def test_parse_name_list_arbitrary_values():
+    """Регрессия 2026-09-09: значения НЕ обязаны быть именами людей —
+    номера договоров, даты, любые строки с буквой/цифрой."""
+    names, errors = parse_name_list(
+        ': "0095/23/2.1/00075271/013/2023", "27.12.2023"')
+    assert names == ["0095/23/2.1/00075271/013/2023", "27.12.2023"], names
+    assert errors == [], errors
+
+    # без кавычек, с «и», с числами внутри фразы
+    names2, errors2 = parse_name_list(
+        ": 0095/23/2.1/00075271/013/2023 и 27.12.2023 и Договор №123 от 01.02.2024")
+    assert names2 == ["0095/23/2.1/00075271/013/2023", "27.12.2023",
+                      "Договор №123 от 01.02.2024"], names2
+    assert errors2 == [], errors2
+
+    # мусор по-прежнему отсеивается
+    names3, errors3 = parse_name_list(": Иванов, !!!!")
+    assert names3 == ["Иванов"], names3
+    assert errors3 == ["!!!!"], errors3
+    print("TEST 5b OK: parse_name_list — произвольные значения (номера, "
+          "даты) принимаются")
 
 
 def test_resolve_placeholder_deanon():
@@ -274,6 +297,158 @@ def test_roundtrip_placeholders_partial_deanon():
           "повторные команды")
 
 
+def test_roundtrip_extra_anonymize_arbitrary_values():
+    """Регрессия 2026-09-09: дополнительная анонимизация ПРОИЗВОЛЬНЫХ
+    строк (номер договора, дата) — не только имён; тип плейсхолдера MISC;
+    точечная де-анонимизация по MISC-токену возвращает значение."""
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "doc.anonymized.txt"
+            copy.write_text(
+                "Договор 0095/23/2.1/00075271/013/2023 от 27.12.2023, "
+                "подписал Иванов.\n", encoding="utf-8")
+            result = Path(td) / "doc.result.txt"
+            store = FakeStoreWithLookup()
+            handler = _make_handler(store)
+            history = ("[ANONYMIZER] Файлы анонимизированы.\n"
+                       "session_id: sess-c1\n"
+                       f"[anonymizer:result:{result}]\n"
+                       f"[anonymizer:copy:{copy}]")
+            req = _request(
+                {"role": "assistant", "content": history},
+                {"role": "user", "content": (
+                    "Дополнительно анонимизируй: "
+                    "'0095/23/2.1/00075271/013/2023', '27.12.2023'")},
+            )
+            cmd = await handler.resolve_chat_command(req)
+            assert cmd["command"] == "extra_anonymize", cmd
+            assert cmd["names"] == [
+                "0095/23/2.1/00075271/013/2023", "27.12.2023"], cmd["names"]
+            response, kind = await handler.execute_chat_command(req, cmd)
+            assert kind == "extra_anonymize"
+
+            content = copy.read_text(encoding="utf-8")
+            assert "0095/23/2.1/00075271/013/2023" not in content, content
+            assert "27.12.2023" not in content, content
+            assert "[MISC_1]" in content and "[MISC_2]" in content, content
+            # Агент «перенёс» токенизированный текст в файл результата
+            result.write_text(content, encoding="utf-8")
+            text = response.choices[0].message.content
+            # Нумерация токенов идёт с конца текста: дата → MISC_1,
+            # номер → MISC_2
+            assert "27.12.2023 → [MISC_1]" in text, text
+            assert "0095/23/2.1/00075271/013/2023 → [MISC_2]" in text, text
+
+            # Точечная де-анонимизация по MISC-токену возвращает значение
+            req2 = _request(
+                {"role": "assistant", "content": history},
+                {"role": "user", "content":
+                    "деанонимизируй плейсхолдеры MISC_1"},
+            )
+            cmd2 = await handler.resolve_chat_command(req2)
+            assert cmd2["command"] == "deanon_placeholders", cmd2
+            await handler.execute_chat_command(req2, cmd2)
+            result2 = result.read_text(encoding="utf-8")
+            assert "27.12.2023" in result2, result2
+            assert "[MISC_1]" not in result2, result2
+            assert "[MISC_2]" in result2, result2  # номер не тронут
+            assert "0095/23/2.1/00075271/013/2023" not in result2, result2
+            # Копия осталась нетронутой (де-анонимизация — в файле результата)
+            assert copy.read_text(encoding="utf-8") == content, copy
+    asyncio.run(_run())
+    print("TEST 10 OK: roundtrip extra_anonymize — произвольные строки, "
+          "MISC-плейсхолдеры, точечная де-анонимизация")
+
+
+def test_placeholders_deanon_without_dialog_markers():
+    """Регрессия 2026-09-09: плейсхолдеры, созданные в ДРУГОМ чате,
+    деанонимизируются в новом чате — цели ищутся в хранилище маппингов,
+    даже если в диалоге нет маркеров [anonymizer:result:…]."""
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            result = Path(td) / "doc.result.txt"
+            result.write_text("Роль: [POSITION_1]\n[POSITION_2]",
+                              encoding="utf-8")
+            copy = Path(td) / "doc.anonymized.txt"
+            copy.write_text("Роль: [POSITION_1]\n[POSITION_2]",
+                            encoding="utf-8")
+            store = FakeStoreWithLookup()
+            # «Старый диалог»: маппинги и привязки файлов есть, маркеров
+            # [anonymizer:result:…] в ТЕКУЩЕМ чате нет
+            await store.add_mapping("sess-old", "Начальник отдела", "POSITION")
+            await store.add_mapping(
+                "sess-old", "Заместитель начальника", "POSITION")
+            await store.register_file_session(str(result), "sess-old")
+            await store.register_file_session(str(copy), "sess-old")
+            handler = _make_handler(store)
+            req = _request(
+                {"role": "user", "content":
+                    "деанонимизируй плейсхолдеры POSITION_1-POSITION_2"},
+            )
+            cmd = await handler.resolve_chat_command(req)
+            assert cmd["command"] == "deanon_placeholders", cmd
+            response, kind = await handler.execute_chat_command(req, cmd)
+            assert kind == "placeholders_deanonymization", kind
+            text = response.choices[0].message.content
+            assert "[POSITION_1] → Начальник отдела" in text, text
+            assert "[POSITION_2] → Заместитель начальника" in text, text
+            assert result.read_text(encoding="utf-8") == (
+                "Роль: Начальник отдела\nЗаместитель начальника")
+            assert copy.read_text(encoding="utf-8") == (
+                "Роль: [POSITION_1]\n[POSITION_2]")  # копия не тронута
+    asyncio.run(_run())
+    print("TEST 11 OK: деанонимизация плейсхолдеров из другого чата — "
+          "цели найдены в хранилище маппингов")
+
+
+def test_roundtrip_extra_anonymize_both_files():
+    """Вариант A: замены применяются к копии И файлу результата; значение,
+    добавленное агентом только в result, заменяется там (с честной пометкой
+    в отчёте)."""
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "doc.anonymized.txt"
+            copy.write_text("Договор подписал Иванов.\n", encoding="utf-8")
+            result = Path(td) / "doc.result.txt"
+            # Агент отредактировал result: добавил дату, которой нет в копии
+            result.write_text(
+                "Договор подписал Иванов. Дата: 27.12.2023.\n",
+                encoding="utf-8")
+            store = FakeStoreWithLookup()
+            handler = _make_handler(store)
+            history = ("[ANONYMIZER] Файлы анонимизированы.\n"
+                       "session_id: sess-d1\n"
+                       f"[anonymizer:result:{result}]\n"
+                       f"[anonymizer:copy:{copy}]")
+            req = _request(
+                {"role": "assistant", "content": history},
+                {"role": "user", "content":
+                    "дополнительно анонимизируй: Иванов, 27.12.2023"},
+            )
+            cmd = await handler.resolve_chat_command(req)
+            assert cmd["command"] == "extra_anonymize", cmd
+            response, kind = await handler.execute_chat_command(req, cmd)
+            assert kind == "extra_anonymize"
+
+            copy_text = copy.read_text(encoding="utf-8")
+            assert "Иванов" not in copy_text, copy_text
+            assert "[PERSON_1]" in copy_text, copy_text
+            assert "27.12.2023" not in copy_text  # в копии его и не было
+
+            result_text = result.read_text(encoding="utf-8")
+            assert "Иванов" not in result_text, result_text
+            assert "27.12.2023" not in result_text, result_text
+            assert "[MISC_1]" in result_text, result_text
+
+            text = response.choices[0].message.content
+            # Честная пометка про значение, которого нет в копии
+            assert "в анонимизированной копии отсутствуют" in text, text
+            assert "27.12.2023" in text, text
+    asyncio.run(_run())
+    print("TEST 12 OK: extra anonymize — замены в копии И результате, "
+          "значение из result помечается честно")
+
+
 if __name__ == "__main__":
     test_parse_placeholder_spec_lists_and_ranges()
     test_parse_placeholder_spec_range_forms()
@@ -283,7 +458,10 @@ if __name__ == "__main__":
     test_resolve_placeholder_deanon()
     test_resolve_extra_anonymize()
     test_roundtrip_extra_anonymize()
+    test_roundtrip_extra_anonymize_arbitrary_values()
     test_roundtrip_placeholders_partial_deanon()
+    test_placeholders_deanon_without_dialog_markers()
+    test_roundtrip_extra_anonymize_both_files()
     print("\nALL EXTRA COMMANDS TESTS PASSED")
 
 

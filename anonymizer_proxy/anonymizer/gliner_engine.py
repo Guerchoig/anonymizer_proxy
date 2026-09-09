@@ -223,12 +223,31 @@ class GlinerEngine:
         try:
             for rel_path in _ONNX_MODEL_FILES:
                 try:
-                    self._model = GLiNER.from_pretrained(
-                        self._model_name,
-                        load_tokenizer=True,
-                        load_onnx_model=True,
-                        onnx_model_file=rel_path,
-                    )
+                    try:
+                        # Сначала из локального кэша: сетевая проверка HuggingFace
+                        # (etag/rev) при отсутствии/нестабильности сети роняла
+                        # ленивую первую загрузку модели целиком — анонимизация
+                        # отдавала «NER-модель не загрузилась»
+                        # (багрепорт 2026-09-09).
+                        self._model = GLiNER.from_pretrained(
+                            self._model_name,
+                            load_tokenizer=True,
+                            load_onnx_model=True,
+                            onnx_model_file=rel_path,
+                            local_files_only=True,
+                        )
+                    except Exception as offline_exc:
+                        # Модели нет в кэше (первый запуск) — качаем из сети
+                        logger.info(
+                            "GLiNER: локальный кэш не пригоден (%s) — "
+                            "загрузка из сети", offline_exc,
+                        )
+                        self._model = GLiNER.from_pretrained(
+                            self._model_name,
+                            load_tokenizer=True,
+                            load_onnx_model=True,
+                            onnx_model_file=rel_path,
+                        )
                     break
                 except FileNotFoundError as exc:
                     last_error = exc
@@ -261,11 +280,25 @@ class GlinerEngine:
             self._model_name, self._device,
         )
         try:
-            self._model = GLiNER.from_pretrained(
-                self._model_name,
-                map_location=self._device,
-                load_tokenizer=True,
-            )
+            try:
+                # Сначала локальный кэш (устойчивость к недоступности
+                # HuggingFace — см. комментарий в _load_onnx)
+                self._model = GLiNER.from_pretrained(
+                    self._model_name,
+                    map_location=self._device,
+                    load_tokenizer=True,
+                    local_files_only=True,
+                )
+            except Exception as offline_exc:
+                logger.info(
+                    "GLiNER: локальный кэш не пригоден (%s) — "
+                    "загрузка из сети", offline_exc,
+                )
+                self._model = GLiNER.from_pretrained(
+                    self._model_name,
+                    map_location=self._device,
+                    load_tokenizer=True,
+                )
         except Exception as exc:
             self._load_error = str(exc)
             logger.error("Ошибка загрузки GLiNER-модели: %s", exc)

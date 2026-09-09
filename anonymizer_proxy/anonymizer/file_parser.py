@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
 
+from lxml import etree as _lxml
+
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
@@ -144,6 +146,149 @@ def _table_to_markdown(table) -> str:
             cells.append(_normalize_line(cell_text))
         rows.append(cells)
     return _rows_to_markdown(rows)
+
+
+def _table_to_markdown_deep(table) -> str:
+    """Markdown таблицы вместе с вложенными в её ячейки таблицами."""
+    parts = [_table_to_markdown(table)]
+    for row in table.rows:
+        for cell in row.cells:
+            for ntab in _cell_tables(cell):
+                parts.append(_table_to_markdown_deep(ntab))
+    return "\n\n".join(parts)
+
+
+def _cell_tables(cell) -> list:
+    """Вложенные таблицы ячейки (python-docx 1.2+: _Cell.tables).
+
+    Вложенные таблицы не видны ни doc.tables (только верхний уровень), ни
+    cell.paragraphs — титульные листы («УТВЕРЖДАЮ», шапки) оставались
+    неанонимизированными (багрепорт 2026-09-08).
+    """
+    try:
+        return list(cell.tables)
+    except Exception:  # noqa: BLE001 - битая вложенная таблица не роняет парсинг
+        return []
+
+
+def _emit_nested_cell_paras(cell, path, kind, part,
+                            segments, structure, paras_out=None) -> None:
+    """Рекурсивно добавить сегменты абзацев вложенных таблиц ячейки.
+
+    path — цепочка координат [[t, r, c], ...]: первый триплет — таблица
+    верхнего уровня (doc.tables / hf.tables) + строка + ячейка, каждый
+    следующий — вложенная таблица внутри текущей ячейки + строка + ячейка.
+    paras_out — куда дополнительно сложить тексты (entry["paras"] блока
+    markdown).
+    """
+    for nt_idx, ntab in enumerate(_cell_tables(cell)):
+        for r_idx, row in enumerate(ntab.rows):
+            for c_idx, ncell in enumerate(row.cells):
+                for p_idx, para in enumerate(ncell.paragraphs):
+                    text = _normalize_line(_p_element_text(para._p))
+                    if text:
+                        segments.append(text)
+                        seg = {
+                            "kind": kind,
+                            "path": path + [[nt_idx, r_idx, c_idx]],
+                            "para": p_idx,
+                        }
+                        if part is not None:
+                            seg["part"] = part
+                        structure["segments"].append(seg)
+                        if paras_out is not None:
+                            paras_out.append(text)
+                _emit_nested_cell_paras(
+                    ncell, path + [[nt_idx, r_idx, c_idx]],
+                    kind, part, segments, structure, paras_out)
+
+
+def _resolve_nested_cell(tables, path):
+    """Ячейка по цепочке координат вложенности (см. _emit_nested_cell_paras)."""
+    t, r, c = path[0]
+    cell = tables[t].rows[r].cells[c]
+    for t2, r2, c2 in path[1:]:
+        cell = _cell_tables(cell)[t2].rows[r2].cells[c2]
+    return cell
+
+
+# Namespace расширенных свойств комментариев Word (people.xml и пр.)
+_W15_NS = "http://schemas.microsoft.com/office/word/2012/wordml"
+
+
+def _comments_element(doc):
+    """Корень word/comments.xml или None, если части комментариев нет."""
+    for part in doc.part.package.iter_parts():
+        if str(part.partname) == "/word/comments.xml":
+            try:
+                return part.element
+            except AttributeError:
+                return None
+    return None
+
+
+def read_anon_marker(path) -> Optional[str]:
+    """Маркер версии анонимизатора из свойств копии (DOCX/XLSX).
+
+    None — маркера нет (копия создана старой версией или файл другого
+    формата): такую копию переиспользовать нельзя.
+    """
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == ".docx":
+            props = Document(str(path)).core_properties
+            return props.comments
+        if ext == ".xlsx":
+            wb = load_workbook(str(path), read_only=True)
+            try:
+                return wb.properties.keywords
+            finally:
+                wb.close()
+    except Exception:  # noqa: BLE001 - нечитаемая копия = переиспользовать нельзя
+        return None
+    return None
+
+
+def _scrub_people_xml(docx_bytes: bytes, author_tokens: dict) -> tuple[bytes, int]:
+    """Заменить имена авторов комментариев в word/people.xml их токенами.
+
+    Имена авторов живут не только в w:author/comments.xml, но и в
+    word/people.xml (w15:person) — без этого авторы утечут из
+    анонимизированной копии. Возвращает (новые байты пакета, число замен).
+    """
+    if not author_tokens:
+        return docx_bytes, 0
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zin:
+        infos = zin.infolist()
+        data = {i.filename: zin.read(i.filename) for i in infos}
+    name = "word/people.xml"
+    if name not in data:
+        return docx_bytes, 0
+    try:
+        root = _lxml.fromstring(data[name])
+    except Exception:  # noqa: BLE001 - битый people.xml не роняет сборку
+        return docx_bytes, 0
+    changed = 0
+    for person in root.iter(f"{{{_W15_NS}}}person"):
+        val = person.get(f"{{{_W15_NS}}}author")
+        if val in author_tokens:
+            person.set(f"{{{_W15_NS}}}author", author_tokens[val])
+            changed += 1
+        # userId в presenceInfo часто равен имени автора (логину) — тоже PII
+        for presence in person.iter(f"{{{_W15_NS}}}presenceInfo"):
+            uid = presence.get(f"{{{_W15_NS}}}userId")
+            if uid in author_tokens:
+                presence.set(f"{{{_W15_NS}}}userId", author_tokens[uid])
+                changed += 1
+    if not changed:
+        return docx_bytes, 0
+    data[name] = _lxml.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for i in infos:
+            zout.writestr(i, data[i.filename])
+    return buf.getvalue(), changed
 
 
 def _set_paragraph_text(para, text: str) -> None:
@@ -410,6 +555,17 @@ def _scrub_hyperlink_targets(docx_bytes: bytes) -> tuple[bytes, int]:
     return buf.getvalue(), changed
 
 
+# Версия экстрактора/сборщика. Записывается маркером в свойства
+# анонимизированной копии (DOCX: docProps/core.xml → comments;
+# XLSX: keywords). Повторная анонимизация по неизменённому исходнику
+# переиспользует копию ТОЛЬКО при совпадении версии — копии, созданные
+# другой версией парсера (например, до добавления поддержки вложенных
+# таблиц/комментариев), автоматически пересоздаются.
+PARSER_VERSION = "2"
+ANON_MARKER_PREFIX = "anonymizer_proxy/parser:"
+ANON_MARKER = ANON_MARKER_PREFIX + PARSER_VERSION
+
+
 class FileParser:
     """Парсер файлов различных форматов"""
     
@@ -509,6 +665,18 @@ class FileParser:
                 "data": table_data
             })
 
+        # Вложенные таблицы (w:tbl внутри ячеек): doc.tables видит только
+        # таблицы верхнего уровня тела, cell.paragraphs не спускается во
+        # вложенные — титульные листы («УТВЕРЖДАЮ» с ООО «Газпром нефтехим
+        # Салават» и подписантами) оставались неанонимизированными
+        # (багрепорт 2026-09-08).
+        for t_idx, table in enumerate(doc.tables):
+            for r_idx, row in enumerate(table.rows):
+                for c_idx, cell in enumerate(row.cells):
+                    _emit_nested_cell_paras(
+                        cell, [[t_idx, r_idx, c_idx]],
+                        "nested_cell_para", None, segments, structure)
+
         # Колонтитулы: абзацы и ячейки таблиц каждой уникальной части
         structure["headers_footers"] = []
         for hf in _docx_hf_objects(doc):
@@ -542,6 +710,10 @@ class FileParser:
                                     "cell": ci, "para": pi,
                                 })
                                 entry["paras"].append(text)
+                        _emit_nested_cell_paras(
+                            cell, [[ti, ri, ci]],
+                            "nested_hf_cell_para", pn,
+                            segments, structure, entry["paras"])
             if entry["paras"]:
                 structure["headers_footers"].append(entry)
 
@@ -568,9 +740,38 @@ class FileParser:
                 if shape_entry["paras"]:
                     structure["textboxes"].append(shape_entry)
 
+        # Комментарии (word/comments.xml): ни текст, ни авторы комментариев
+        # не попадают ни в тело, ни в python-docx-абзацы — раньше они
+        # неанонимизированными уходили в облако (багрепорт 2026-09-08:
+        # автор Sasha, текст комментария с ФИО). Автор — атрибут w:author:
+        # добавляем его отдельным сегментом, чтобы NER увидел значение, а
+        # сборка записала токен обратно в атрибут.
+        structure["comments"] = []
+        comments_root = _comments_element(doc)
+        if comments_root is not None:
+            for c_idx, c_el in enumerate(comments_root.findall(qn("w:comment"))):
+                entry = {"index": c_idx, "author": None, "paras": []}
+                author = (c_el.get(qn("w:author")) or "").strip()
+                if author:
+                    segments.append(author)
+                    structure["segments"].append(
+                        {"kind": "comment_author", "comment": c_idx})
+                    entry["author"] = author
+                for p_idx, p_el in enumerate(c_el.findall(qn("w:p"))):
+                    text = _normalize_line(_p_element_text(p_el))
+                    if text:
+                        segments.append(text)
+                        structure["segments"].append({
+                            "kind": "comment_para",
+                            "comment": c_idx, "para": p_idx,
+                        })
+                        entry["paras"].append(text)
+                if entry["author"] or entry["paras"]:
+                    structure["comments"].append(entry)
+
         # Markdown-представление с таблицами (для review и облака):
-        # абзацы и таблицы в порядке документа, таблицы -> markdown-таблицы;
-        # затем блоки колонтитулов и фигур, чтобы review отражал анонимизацию
+        # абзацы и таблицы в порядке документа, таблицы -> markdown-таблицы
+        # (включая вложенные); затем блоки колонтитулов, фигур и комментариев
         markdown_parts = []
         for child in doc.element.body.iterchildren():
             if child.tag == qn("w:p"):
@@ -579,7 +780,7 @@ class FileParser:
                     markdown_parts.append(text)
             elif child.tag == qn("w:tbl"):
                 table = Table(child, doc)
-                markdown_parts.append(_table_to_markdown(table))
+                markdown_parts.append(_table_to_markdown_deep(table))
 
         extra_md = []
         for entry in structure["headers_footers"]:
@@ -590,6 +791,12 @@ class FileParser:
             extra_md.append(
                 f"**[Фигура {entry['index']} ({entry['host']})]**\n"
                 + "\n".join(entry["paras"]))
+        for entry in structure["comments"]:
+            lines = [f"**[Комментарий {entry['index'] + 1}]**"]
+            if entry["author"]:
+                lines.append(f"Автор: {entry['author']}")
+            lines.extend(entry["paras"])
+            extra_md.append("\n".join(lines))
         if extra_md:
             markdown_parts.extend(extra_md)
 
@@ -604,6 +811,7 @@ class FileParser:
                 "tables_count": len(doc.tables),
                 "headers_footers_count": len(structure["headers_footers"]),
                 "textboxes_count": len(structure["textboxes"]),
+                "comments_count": len(structure["comments"]),
             },
             markdown=markdown,
         )
@@ -623,7 +831,7 @@ class FileParser:
 
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            sheet_data = {"name": sheet_name, "rows": []}
+            sheet_data = {"name": sheet_name, "rows": [], "comments": []}
 
             for row in ws.iter_rows():
                 row_values = []
@@ -640,13 +848,44 @@ class FileParser:
                         })
                     else:
                         row_values.append("")
+
+                    # Комментарий ячейки (примечание Excel): текст и автор
+                    # не видны в значениях ячеек — раньше не анонимизировались
+                    # (примечания поддерживаются openpyxl; тредовые комментарии
+                    # нового Excel openpyxl не читает — ограничение)
+                    comment = cell.comment
+                    if comment is not None:
+                        c_text = _normalize_line(comment.text or "")
+                        if c_text:
+                            segments.append(c_text)
+                            structure["segments"].append({
+                                "kind": "xlsx_comment",
+                                "sheet": sheet_name,
+                                "row": cell.row,
+                                "col": cell.column,
+                            })
+                            sheet_data["comments"].append({
+                                "ref": cell.coordinate,
+                                "author": (comment.author or "").strip(),
+                                "text": c_text,
+                            })
+                        author = (comment.author or "").strip()
+                        if author:
+                            segments.append(author)
+                            structure["segments"].append({
+                                "kind": "xlsx_comment_author",
+                                "sheet": sheet_name,
+                                "row": cell.row,
+                                "col": cell.column,
+                            })
                 sheet_data["rows"].append(row_values)
 
             structure["sheets"].append(sheet_data)
 
         # Markdown-представление: каждый лист -> markdown-таблица
         # (дисплейное представление через _fmt_cell_value: даты ISO,
-        # без _x000D_ — сегменты text остаются через _cell_to_line)
+        # без _x000D_ — сегменты text остаются через _cell_to_line);
+        # комментарии ячеек — отдельными блоками после таблицы листа
         markdown_parts = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -657,6 +896,15 @@ class FileParser:
                     continue
                 rows.append(cells)
             markdown_parts.append(f"## {sheet_name}\n\n{_rows_to_markdown(rows)}")
+            sheet_entry = next(
+                (s for s in structure["sheets"] if s["name"] == sheet_name),
+                None)
+            for c in (sheet_entry or {}).get("comments", []):
+                lines = [f"**[Комментарий {sheet_name}!{c['ref']}]**"]
+                if c.get("author"):
+                    lines.append(f"Автор: {c['author']}")
+                lines.append(c["text"])
+                markdown_parts.append("\n".join(lines))
         markdown = "\n\n".join(markdown_parts)
 
         return ParsedContent(
@@ -798,7 +1046,10 @@ class FileAssembler:
                 scrub_metadata=scrub_metadata,
             )
         elif ext == ".xlsx":
-            return self._assemble_xlsx(original_content, anonymized_text, structure)
+            return self._assemble_xlsx(
+                original_content, anonymized_text, structure,
+                scrub_metadata=scrub_metadata,
+            )
         elif ext == ".xml":
             return self._assemble_xml(original_content, anonymized_text, structure)
         elif ext in (".txt", ".md"):
@@ -832,6 +1083,14 @@ class FileAssembler:
             hf_by_part[pn] = hf
             hosts[pn] = hf.part.element
 
+        # Часть комментариев (python-docx её сериализует при doc.save)
+        comments_root = _comments_element(doc)
+        comment_elems = (
+            comments_root.findall(qn("w:comment"))
+            if comments_root is not None else []
+        )
+        author_tokens: dict = {}  # исходный автор -> токен (для people.xml)
+
         for seg, part in zip(segments, parts):
             kind = seg["kind"]
             if kind == "para":
@@ -839,6 +1098,15 @@ class FileAssembler:
             elif kind == "cell_para":
                 cell = doc.tables[seg["table"]].rows[seg["row"]].cells[seg["cell"]]
                 para = cell.paragraphs[seg["para"]]
+            elif kind == "nested_cell_para":
+                try:
+                    cell = _resolve_nested_cell(doc.tables, seg["path"])
+                    para = cell.paragraphs[seg["para"]]
+                except IndexError:
+                    logger.warning(
+                        "Пропущен сегмент вложенной таблицы: путь %s вне "
+                        "диапазона", seg.get("path"))
+                    continue
             elif kind == "hf_para":
                 hf = hf_by_part.get(seg["part"])
                 if hf is None:
@@ -856,6 +1124,21 @@ class FileAssembler:
                     continue
                 cell = hf.tables[seg["table"]].rows[seg["row"]].cells[seg["cell"]]
                 para = cell.paragraphs[seg["para"]]
+            elif kind == "nested_hf_cell_para":
+                hf = hf_by_part.get(seg.get("part"))
+                if hf is None:
+                    logger.warning(
+                        "Пропущен сегмент вложенной таблицы колонтитула %s: "
+                        "часть недоступна", seg.get("part"))
+                    continue
+                try:
+                    cell = _resolve_nested_cell(hf.tables, seg["path"])
+                    para = cell.paragraphs[seg["para"]]
+                except IndexError:
+                    logger.warning(
+                        "Пропущен сегмент вложенной таблицы колонтитула: "
+                        "путь %s вне диапазона", seg.get("path"))
+                    continue
             elif kind == "txbx_para":
                 boxes = _txbx_para_elements(hosts.get(seg["host"], doc.element))
                 try:
@@ -866,13 +1149,47 @@ class FileAssembler:
                         seg["host"], seg["txbx"])
                     continue
                 para = Paragraph(p_el, None)
+            elif kind == "comment_author":
+                try:
+                    comment_elems[seg["comment"]].set(qn("w:author"), part)
+                except IndexError:
+                    logger.warning(
+                        "Пропущен автор комментария %s: индекс вне диапазона",
+                        seg["comment"])
+                    continue
+                continue  # атрибут, не абзац — _set_paragraph_text не нужен
+            elif kind == "comment_para":
+                try:
+                    p_el = (comment_elems[seg["comment"]]
+                            .findall(qn("w:p"))[seg["para"]])
+                except IndexError:
+                    logger.warning(
+                        "Пропущен текст комментария %s/%s: индекс вне "
+                        "диапазона", seg["comment"], seg["para"])
+                    continue
+                para = Paragraph(p_el, None)
             else:
                 logger.warning("Неизвестный тип сегмента: %s", kind)
                 continue
             _set_paragraph_text(para, part)
 
+        # Запоминаем соответствие «исходный автор комментария -> токен»
+        # для чистки word/people.xml (имена авторов дублируются там)
+        for seg, part in zip(segments, parts):
+            if seg.get("kind") == "comment_author":
+                for entry in structure.get("comments", []):
+                    if (entry.get("index") == seg.get("comment")
+                            and entry.get("author")):
+                        author_tokens[entry["author"]] = part
+
         if scrub_metadata:
             _scrub_docx_metadata(doc)
+            # Маркер версии парсера: повторная анонимизация по неизменённому
+            # исходнику переиспользует копию только при совпадении версии
+            doc.core_properties.comments = ANON_MARKER
+        else:
+            # финальный (де-анонимизированный) файл не несёт служебный маркер
+            doc.core_properties.comments = ""
 
         # Удаляем картинки (логотипы) из колонтитулов и вымываем их
         # байты из пакета — иначе логотипы остаются в word/media/
@@ -885,6 +1202,15 @@ class FileAssembler:
         output = io.BytesIO()
         doc.save(output)
         result = output.getvalue()
+
+        if scrub_metadata and author_tokens:
+            # Имена авторов комментариев дублируются в word/people.xml —
+            # без чистки они утечут из анонимизированной копии
+            result, scrubbed_people = _scrub_people_xml(result, author_tokens)
+            if scrubbed_people:
+                logger.info(
+                    "Обезличено авторов комментариев в people.xml: %d",
+                    scrubbed_people)
 
         if scrub_metadata:
             # Внешние цели гиперссылок (адреса сайтов, mailto:) не должны
@@ -903,15 +1229,31 @@ class FileAssembler:
                 "пакета: %s)", removed_images, dropped)
         return result
 
-    def _assemble_xlsx(self, original_content: bytes, anonymized_text: str, structure: dict) -> bytes:
+    def _assemble_xlsx(self, original_content: bytes, anonymized_text: str, structure: dict, scrub_metadata: bool = True) -> bytes:
         """Сборка XLSX файла: значения записываются обратно по координатам,
         сохранённым при парсинге. Ячейки, чей текст не изменился, не
-        затрагиваются — это сохраняет формулы, числа и даты."""
+        затрагиваются — это сохраняет формулы, числа и даты. Комментарии
+        ячеек (текст и автор) восстанавливаются по своим координатам."""
         wb = load_workbook(io.BytesIO(original_content))
         parts = anonymized_text.split("\n")
         segments = structure.get("segments", [])
 
         for seg, part in zip(segments, parts):
+            if seg["kind"] in ("xlsx_comment", "xlsx_comment_author"):
+                ws = wb[seg["sheet"]]
+                cell = ws.cell(row=seg["row"], column=seg["col"])
+                comment = cell.comment
+                if comment is None:
+                    logger.warning(
+                        "Пропущен комментарий %s!%s: ячейка без комментария",
+                        seg["sheet"], cell.coordinate)
+                    continue
+                if seg["kind"] == "xlsx_comment_author":
+                    if (comment.author or "") != part:
+                        comment.author = part
+                elif _normalize_line(comment.text or "") != part:
+                    comment.text = part
+                continue
             ws = wb[seg["sheet"]]
             cell = ws.cell(row=seg["row"], column=seg["col"])
             if _cell_to_line(cell.value) != part:
@@ -919,7 +1261,18 @@ class FileAssembler:
 
         output = io.BytesIO()
         wb.save(output)
-        return output.getvalue()
+        result = output.getvalue()
+
+        if scrub_metadata:
+            # Маркер версии парсера в свойствах копии (см. PARSER_VERSION)
+            try:
+                wb.properties.keywords = ANON_MARKER
+                buf = io.BytesIO()
+                wb.save(buf)
+                result = buf.getvalue()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось записать маркер версии: %s", exc)
+        return result
 
     def _assemble_xml(self, original_content: bytes, anonymized_text: str, structure: dict) -> bytes:
         """Сборка XML файла"""

@@ -62,6 +62,7 @@ class FakeStore:
         self.counters = {}
         self.mappings = {}  # token -> original
         self.file_sessions = {}  # file_path -> session_id
+        self.token_sessions = {}  # token -> set(session_id)
 
     async def register_file_session(self, file_path, session_id):
         self.file_sessions[str(file_path)] = session_id
@@ -69,17 +70,32 @@ class FakeStore:
     async def get_latest_session_for_file(self, file_path):
         return self.file_sessions.get(str(file_path))
 
+    async def find_sessions_with_tokens(self, tokens):
+        seen, out = set(), []
+        for token in tokens:
+            for sid in self.token_sessions.get(token, []):
+                if sid not in seen:
+                    seen.add(sid)
+                    out.append(sid)
+        return out
+
+    async def get_files_for_session(self, session_id):
+        return [fp for fp, sid in self.file_sessions.items()
+                if sid == session_id]
+
     async def get_or_create_session(self, session_id=None):
         return session_id or "sess-test"
 
     async def add_mapping(self, session_id, original_value, entity_type):
         for token, value in self.mappings.items():
             if value == original_value:
+                self.token_sessions.setdefault(token, set()).add(session_id)
                 return token
         n = self.counters.get(entity_type, 0) + 1
         self.counters[entity_type] = n
         token = f"[{entity_type}_{n}]"
         self.mappings[token] = original_value
+        self.token_sessions.setdefault(token, set()).add(session_id)
         return token
 
     async def get_all_mappings(self, session_id):

@@ -19,6 +19,7 @@ import base64
 import io
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +44,77 @@ def make_docx(make) -> bytes:
     make(doc)
     buf = io.BytesIO()
     doc.save(buf)
+    return buf.getvalue()
+
+
+# Content types / rel types для инъекции частей в тестовый DOCX-пакет
+_CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CT_COMMENTS = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
+_RT_COMMENTS = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments")
+_CT_PEOPLE = "application/vnd.microsoft.office.word.people+xml"
+_RT_PEOPLE = "http://schemas.microsoft.com/office/2011/relationships/people"
+
+_COMMENTS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:comment w:id="1" w:author="Sasha" w:initials="S"'
+    ' w:date="2026-09-08T12:00:00Z">'
+    '<w:p><w:r><w:t>Согласовано: А.В. Гершойг</w:t></w:r></w:p>'
+    '</w:comment></w:comments>'
+)
+_PEOPLE_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<w15:people xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">'
+    '<w15:person w15:author="Sasha">'
+    '<w15:presenceInfo w15:providerId="None" w15:userId="Sasha"/>'
+    '</w15:person></w15:people>'
+)
+
+
+def _inject_parts(content: bytes, entries: dict) -> bytes:
+    """Добавить в DOCX-пакет дополнительные части (comments.xml, people.xml):
+    сами файлы, Override в [Content_Types].xml и Relationship в
+    word/_rels/document.xml.rels (python-docx 1.2 не умеет создавать
+    комментарии — читает их, поэтому собираем пакет вручную)."""
+    with zipfile.ZipFile(io.BytesIO(content)) as zin:
+        infos = zin.infolist()
+        data = {i.filename: zin.read(i.filename) for i in infos}
+
+    ct = ET.fromstring(data["[Content_Types].xml"])
+    rels = ET.fromstring(data["word/_rels/document.xml.rels"])
+    rid_n = 900
+    for name, (blob, ctype, rel_type) in entries.items():
+        data[name] = blob
+        override = ET.SubElement(ct, f"{{{_CT_NS}}}Override")
+        override.set("PartName", "/" + name)
+        override.set("ContentType", ctype)
+        rid_n += 1
+        rel = ET.SubElement(rels, f"{{{_RELS_NS}}}Relationship")
+        rel.set("Id", f"rIdInject{rid_n}")
+        rel.set("Type", rel_type)
+        rel.set("Target", name[len("word/"):] if name.startswith("word/")
+                else name)
+
+    ET.register_namespace("", _CT_NS)
+    data["[Content_Types].xml"] = ET.tostring(
+        ct, xml_declaration=True, encoding="UTF-8")
+    ET.register_namespace("", _RELS_NS)
+    data["word/_rels/document.xml.rels"] = ET.tostring(
+        rels, xml_declaration=True, encoding="UTF-8")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        written = set()
+        for i in infos:
+            zout.writestr(i, data[i.filename])
+            written.add(i.filename)
+        # новые части (комментарии, people) — их нет в исходном infolist
+        for name, blob in data.items():
+            if name not in written:
+                zout.writestr(name, blob)
     return buf.getvalue()
 
 
@@ -447,6 +519,123 @@ async def test_page_number_fields():
           "в неизменённом/восстановленном сохранены")
 
 
+async def test_docx_nested_tables_and_comments():
+    """Регрессия 2026-09-08: вложенные таблицы («УТВЕРЖДАЮ» на титульном
+    листе) и комментарии (текст + автор) анонимизируются и восстанавливаются
+    де-анонимизацией; имя автора вычищается и из word/people.xml."""
+    parser, fa = FileParser(), FileAssembler()
+
+    def make(doc):
+        doc.add_paragraph("Шапка документа")
+        table = doc.add_table(rows=1, cols=1)
+        cell = table.rows[0].cells[0]
+        cell.paragraphs[0].text = "Обёртка без PII"
+        nested = cell.add_table(rows=2, cols=1)
+        nested.rows[0].cells[0].paragraphs[0].text = (
+            "Заместитель генерального директора "
+            "ООО «Газпром нефтехим Салават»")
+        nested.rows[1].cells[0].paragraphs[0].text = "А.З. Ахметшин"
+        doc.add_paragraph("Подвал документа")
+
+    content = _inject_parts(
+        make_docx(make),
+        {
+            "word/comments.xml": (_COMMENTS_XML, _CT_COMMENTS, _RT_COMMENTS),
+            "word/people.xml": (_PEOPLE_XML, _CT_PEOPLE, _RT_PEOPLE),
+        },
+    )
+
+    parsed = await parser.parse(content, "t.docx")
+    kinds = {s["kind"] for s in parsed.structure["segments"]}
+    assert "nested_cell_para" in kinds, kinds
+    assert "comment_author" in kinds and "comment_para" in kinds, kinds
+    for needle in ("Газпром нефтехим Салават", "Ахметшин", "Гершойг", "Sasha"):
+        assert needle in parsed.text, needle
+
+    anon = (parsed.text
+            .replace("Газпром нефтехим Салават", "[ORG_1]")
+            .replace("Ахметшин", "[PERSON_1]")
+            .replace("Гершойг", "[PERSON_2]")
+            .replace("Sasha", "[PERSON_3]"))
+    out = await fa.assemble(content, "t.docx", anon, parsed.structure)
+
+    z = zipfile.ZipFile(io.BytesIO(out))
+    doc_xml = z.read("word/document.xml").decode("utf-8")
+    assert "Ахметшин" not in doc_xml, "PII осталась во вложенной таблице"
+    assert "Газпром нефтехим Салават" not in doc_xml
+    com_xml = z.read("word/comments.xml").decode("utf-8")
+    assert "Гершойг" not in com_xml, "PII осталась в тексте комментария"
+    assert "Sasha" not in com_xml, "автор комментария не обезличен"
+    assert "[PERSON_3]" in com_xml and "[PERSON_2]" in com_xml
+    ppl = z.read("word/people.xml").decode("utf-8")
+    assert "Sasha" not in ppl, "имя автора утекло через people.xml"
+    assert "[PERSON_3]" in ppl
+
+    # де-анонимизация: токены -> значения
+    parsed2 = await parser.parse(out, "t.docx")
+    restored = (parsed2.text
+                .replace("[ORG_1]", "Газпром нефтехим Салават")
+                .replace("[PERSON_1]", "Ахметшин")
+                .replace("[PERSON_2]", "Гершойг")
+                .replace("[PERSON_3]", "Sasha"))
+    out2 = await fa.assemble(
+        out, "t.docx", restored, parsed2.structure,
+        strip_hf_images=False, scrub_metadata=False)
+    parsed3 = await parser.parse(out2, "t.docx")
+    for needle in ("Газпром нефтехим Салават", "Ахметшин", "Гершойг", "Sasha"):
+        assert needle in parsed3.text, f"не восстановлено: {needle}"
+    com2 = zipfile.ZipFile(io.BytesIO(out2)).read(
+        "word/comments.xml").decode("utf-8")
+    assert "Гершойг" in com2 and "Sasha" in com2
+    print("TEST 8 OK: DOCX — вложенные таблицы и комментарии (текст, автор, "
+          "people.xml) анонимизируются и восстанавливаются")
+
+
+async def test_xlsx_comments_roundtrip():
+    """Регрессия 2026-09-08: комментарии ячеек XLSX (текст + автор)
+    анонимизируются и восстанавливаются де-анонимизацией."""
+    from openpyxl.comments import Comment
+
+    parser, fa = FileParser(), FileAssembler()
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Согласование"
+    ws["B2"] = 42
+    ws["A1"].comment = Comment(
+        "Согласовал: А.В. Гершойг\nЗамечаний нет", "Sasha")
+    buf = io.BytesIO()
+    wb.save(buf)
+    content = buf.getvalue()
+
+    parsed = await parser.parse(content, "t.xlsx")
+    kinds = {s["kind"] for s in parsed.structure["segments"]}
+    assert "xlsx_comment" in kinds and "xlsx_comment_author" in kinds, kinds
+    assert "Гершойг" in parsed.text and "Sasha" in parsed.text
+
+    anon = (parsed.text
+            .replace("Гершойг", "[PERSON_2]")
+            .replace("Sasha", "[PERSON_3]"))
+    out = await fa.assemble(content, "t.xlsx", anon, parsed.structure)
+
+    wb2 = load_workbook(io.BytesIO(out))
+    ws2 = wb2.active
+    c = ws2["A1"].comment
+    assert c is not None, "комментарий потерян при сборке"
+    assert "Гершойг" not in c.text and "[PERSON_2]" in c.text, c.text
+    assert c.author == "[PERSON_3]", c.author
+    assert ws2["B2"].value == 42, "чужая ячейка изменена"
+
+    parsed2 = await parser.parse(out, "t.xlsx")
+    restored = (parsed2.text
+                .replace("[PERSON_2]", "Гершойг")
+                .replace("[PERSON_3]", "Sasha"))
+    out2 = await fa.assemble(out, "t.xlsx", restored, parsed2.structure)
+    c3 = load_workbook(io.BytesIO(out2)).active["A1"].comment
+    assert "Гершойг" in c3.text and c3.author == "Sasha", (c3.text, c3.author)
+    print("TEST 9 OK: XLSX — комментарии ячеек (текст, автор) анонимизируются "
+          "и восстанавливаются")
+
+
 async def main():
     await test_docx_table_structure()
     await test_docx_multiparagraph_cell()
@@ -457,6 +646,8 @@ async def main():
     await check_docx_headers_footers_result(fa2, content, parsed2, anon, out)
     await test_hyperlink_targets_scrubbed()
     await test_page_number_fields()
+    await test_docx_nested_tables_and_comments()
+    await test_xlsx_comments_roundtrip()
     print("\nALL FILE PARSER TESTS PASSED")
 
 

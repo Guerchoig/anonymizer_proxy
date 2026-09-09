@@ -10,7 +10,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Sequence
 import aiosqlite
 
 from ..config import DB_PATH, MAPPING_TTL_SECONDS, MAPPINGS_DIR, ANONYMIZED_FILES_DIR
@@ -486,6 +486,45 @@ class MappingStore:
         )
         row = await cursor.fetchone()
         return row[0] if row else None
+
+    async def find_sessions_with_tokens(
+        self, tokens: Sequence[str]
+    ) -> List[str]:
+        """Сессии, в маппингах которых есть хотя бы один из токенов
+        (свежие первыми). Используется фоллбеком команды «деанонимизируй
+        плейсхолдеры…», когда в диалоге нет маркеров
+        [anonymizer:result:…] (багрепорт 2026-09-09: плейсхолдеры из старого
+        диалога не деанонимизировались в новом чате)."""
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return []
+        await self.initialize()
+        db = await self._get_db()
+        placeholders = ",".join("?" for _ in tokens)
+        cursor = await db.execute(
+            f"SELECT DISTINCT session_id FROM mappings "
+            f"WHERE token IN ({placeholders}) ORDER BY created_at DESC",
+            list(tokens),
+        )
+        rows = await cursor.fetchall()
+        seen: set = set()
+        ordered: List[str] = []
+        for (sid,) in rows:
+            if sid not in seen:
+                seen.add(sid)
+                ordered.append(sid)
+        return ordered
+
+    async def get_files_for_session(self, session_id: str) -> List[str]:
+        """Файлы, зарегистрированные за сессию (свежие первыми)."""
+        await self.initialize()
+        db = await self._get_db()
+        cursor = await db.execute(
+            "SELECT file_path FROM file_sessions "
+            "WHERE session_id = ? ORDER BY created_at DESC, id DESC",
+            (session_id,),
+        )
+        return [r[0] for r in await cursor.fetchall()]
 
     async def get_all_sessions(self) -> list[dict]:
         """Возвращает список активных сессий с количеством маппингов."""

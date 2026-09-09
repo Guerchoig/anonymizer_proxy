@@ -361,24 +361,24 @@ def split_entities_by_segments(
                     confidence=ent.confidence,
                 ))
                 break
-            # Сущность пересекает границу сегментов — пытаемся привязать
-            # по большему перекрытию
+            # Сущность пересекает границу сегментов — обрезанную часть
+            # добавляем В КАЖДЫЙ пересекаемый сегмент (не только в тот, где
+            # перекрытие ≥50%): сущности, найденные по склеенному тексту,
+            # могут содержать «\n» (например, «Sasha\nА.В. Гершойг» — автор
+            # и текст комментария в соседних сегментах). Каждая обрезанная
+            # часть анонимизируется в своём сегменте своим токеном —
+            # иначе PII в «меньшей» части утекает (багрепорт 2026-09-08).
             if ent.start < seg_end and ent.end > seg_start:
-                overlap = min(ent.end, seg_end) - max(ent.start, seg_start)
-                ent_len = ent.end - ent.start
-                if ent_len > 0 and overlap / ent_len >= 0.5:
-                    # Обрезаем до границ сегмента и пересчитываем текст
-                    local_start = max(ent.start, seg_start) - seg_start
-                    local_end = min(ent.end, seg_end) - seg_start
-                    local_text = segments[i][local_start:local_end]
-                    if local_text.strip():
-                        result[i].append(Entity(
-                            text=local_text,
-                            type=ent.type,
-                            start=local_start,
-                            end=local_end,
-                            confidence=ent.confidence * 0.8,
-                        ))
-                    break
+                local_start = max(ent.start, seg_start) - seg_start
+                local_end = min(ent.end, seg_end) - seg_start
+                local_text = segments[i][local_start:local_end]
+                if local_text.strip():
+                    result[i].append(Entity(
+                        text=local_text,
+                        type=ent.type,
+                        start=local_start,
+                        end=local_end,
+                        confidence=ent.confidence * 0.8,
+                    ))
 
     return result

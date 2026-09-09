@@ -19,8 +19,10 @@
 """
 import asyncio
 import json
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -609,6 +611,214 @@ async def test_hermes_backticked_attachments_system_prompt_excluded():
             agents_md.unlink(missing_ok=True)
 
 
+async def test_office_lock_file_skipped():
+    """Регрессия 2026-09-08: lock-файл Word (~$Имя.docx) не перехватывается.
+
+    «Owner file» Word/Excel (~160 байт, сигнатура \\x05Sas) существует на
+    диске и проходит по маске .docx; раньше попадал в кандидаты анонимизации,
+    парсинг давал BadZipFile и весь запрос падал с
+    «Provider error: File is not a zip file».
+    """
+    lock = Path(tempfile.gettempdir()) / "~$_тест_lock.docx"
+    lock.write_bytes(b"\x05Sas" + b"\x00" * 100)
+    try:
+        handler = make_handler()
+        request = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(role="user", content=(
+                f"анонимизируй файл\n\n"
+                f"It is available on disk at `{lock}`"
+            ))],
+        )
+        assert handler.detect_attached_files_anonymization(request) == [], \
+            "lock-файл Word не должен попадать в кандидаты анонимизации"
+        print("TEST 15 OK: ~$-lock-файл Word исключён из перехвата")
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+async def test_bad_zip_file_reported_not_fatal():
+    """Регрессия 2026-09-08: битый DOCX не роняет запрос — ответ с ОШИБКА.
+
+    Раньше один нечитаемый файл (BadZipFile) прерывал
+    prepare_files_anonymization, и клиент получал
+    «Provider error: File is not a zip file». Теперь ошибка файла попадает
+    в ответ (— ОШИБКА: …), остальные файлы обрабатываются как обычно.
+    """
+    bad = Path(tempfile.gettempdir()) / "anonymizer_bad_zip_тест.docx"
+    bad.write_bytes(b"\x05Sas" + b"\x00" * 100)  # не ZIP-архив
+    good = make_txt_file()
+    try:
+        handler = make_handler()
+        prepared = await handler.prepare_files_anonymization(
+            ChatCompletionRequest(
+                model="m", anonymize=True, stream=False,
+                messages=[ChatMessage(role="user",
+                                      content="анонимизируй файл")],
+            ),
+            [str(bad), str(good)],
+        )
+        errors = [f for f in prepared.files if "error" in f]
+        oks = [f for f in prepared.files if "error" not in f]
+        assert len(errors) == 1 and errors[0]["original_file"] == str(bad), \
+            prepared.files
+        assert len(oks) == 1 and oks[0]["original_file"] == str(good), \
+            prepared.files
+        assert "ОШИБКА" in prepared.response_text, prepared.response_text
+        assert "[anonymizer:done:" in prepared.response_text, \
+            prepared.response_text
+        print("TEST 16 OK: битый DOCX — ОШИБКА в ответе, "
+              "остальные файлы обработаны")
+    finally:
+        bad.unlink(missing_ok=True)
+        good.unlink(missing_ok=True)
+        good.with_name(
+            f"{good.stem}.anonymized{good.suffix}"
+        ).unlink(missing_ok=True)
+
+
+async def test_duplicate_requests_coalesce():
+    """Регрессия 2026-09-08: параллельные дубликаты запроса (основной чат +
+    вспомогательные title_generation Hermes с той же историей) выполняют
+    ОДНУ анонимизацию файла, а не по полной на каждый запрос.
+
+    Раньше каждый дубликат запускал свой NER-прогон: пользователь получал
+    несколько одинаковых сообщений «файл анонимизирован», а прокси молотил
+    впустую десятки секунд.
+    """
+    from anonymizer_proxy.tests.test_tools_passthrough import (
+        FakeOpenRouter, FakeStore,
+    )
+
+    class CountingNER(FakeNER):
+        def __init__(self, pii):
+            super().__init__(pii)
+            self.calls = 0
+
+        async def extract_entities_detailed(self, text, use_llm=True):
+            self.calls += 1
+            return await super().extract_entities_detailed(text, use_llm)
+
+    path = make_txt_file()
+    ner = CountingNER(PII)
+    handler = RequestHandler(
+        ner_service=ner,
+        mapping_store=FakeStore(),
+        openrouter_client=FakeOpenRouter(),
+    )
+    try:
+        req = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+        )
+        # Основной запрос + «вспомогательный» с другой сессией — одновременно
+        r_main, r_title = await asyncio.gather(
+            handler.prepare_files_anonymization(
+                req, [str(path)], session_id="s-main"),
+            handler.prepare_files_anonymization(
+                req, [str(path)], session_id="s-title"),
+        )
+        assert ner.calls == 1, f"NER-прогонов: {ner.calls}, ожидался 1"
+        # Оба ответа в одной сессии — маркеры и маппинги согласованы
+        # с копией на диске
+        assert r_main.session_id == r_title.session_id, (
+            r_main.session_id, r_title.session_id)
+        assert r_main.entities_total == r_title.entities_total == 2
+        print("TEST 17 OK: параллельные дубликаты — одна анонимизация, "
+              "одна сессия ответа")
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.anonymized{path.suffix}"
+        ).unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.result{path.suffix}"
+        ).unlink(missing_ok=True)
+
+
+async def test_rerun_reuses_unchanged_original():
+    """Повторная команда по НЕИЗМЕНЁННОМУ файлу: копия переиспользуется,
+    NER не запускается, ответ ссылается на исходную сессию (в ней маппинги,
+    согласованные с токенами копии на диске)."""
+    path = make_txt_file()
+    try:
+        handler = make_handler()
+        req = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+        )
+        first = await handler.prepare_files_anonymization(
+            req, [str(path)], session_id="s1")
+        assert first.entities_total == 2, first.entities_total
+        copy_path = path.with_name(f"{path.stem}.anonymized{path.suffix}")
+        assert copy_path.exists()
+        mtime_before = copy_path.stat().st_mtime
+
+        # Имитируем новый запрос спустя время (коалесцентный кэш протух)
+        handler._file_anon_inflight.clear()
+        second = await handler.prepare_files_anonymization(
+            req, [str(path)], session_id="s2")
+        assert second.entities_total == 0, second.entities_total
+        assert second.session_id == "s1", second.session_id
+        assert copy_path.stat().st_mtime == mtime_before, \
+            "копию нельзя переписывать при неизменном исходнике"
+        assert "переиспользована" in second.response_text, \
+            second.response_text
+        assert "[anonymizer:done:" in second.response_text
+        assert "[anonymizer:copy:" in second.response_text
+        assert "[anonymizer:result:" in second.response_text
+        print("TEST 18 OK: повтор по неизменённому файлу — переиспользование "
+              "копии, исходная сессия")
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.anonymized{path.suffix}"
+        ).unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.result{path.suffix}"
+        ).unlink(missing_ok=True)
+
+
+async def test_modified_original_reanonymized():
+    """Если исходник изменился после анонимизации — выполняется полный
+    повторный прогон (переиспользование только для неизменённых файлов)."""
+    path = make_txt_file()
+    try:
+        handler = make_handler()
+        req = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False,
+            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+        )
+        first = await handler.prepare_files_anonymization(
+            req, [str(path)], session_id="s1")
+        assert first.entities_total == 2
+        copy_path = path.with_name(f"{path.stem}.anonymized{path.suffix}")
+        mtime_before = copy_path.stat().st_mtime
+
+        # «Пользователь отредактировал исходник» — mtime новее копии
+        later = time.time() + 5
+        os.utime(path, (later, later))
+        handler._file_anon_inflight.clear()
+
+        second = await handler.prepare_files_anonymization(
+            req, [str(path)], session_id="s2")
+        assert second.entities_total == 2, second.entities_total
+        assert second.session_id == "s2", second.session_id
+        assert copy_path.stat().st_mtime != mtime_before, \
+            "копия должна быть пересоздана после изменения исходника"
+        assert "переиспользована" not in second.response_text
+        print("TEST 19 OK: изменённый исходник — полная повторная "
+              "анонимизация")
+    finally:
+        path.unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.anonymized{path.suffix}"
+        ).unlink(missing_ok=True)
+        path.with_name(
+            f"{path.stem}.result{path.suffix}"
+        ).unlink(missing_ok=True)
+
+
 async def main():
     await test_intercept_anonymizes_file_no_cloud()
     await test_no_intent_goes_to_cloud()
@@ -624,6 +834,11 @@ async def main():
     await test_path_mention_with_punctuation()
     await test_nonexistent_path_not_intercepted()
     await test_hermes_backticked_attachments_system_prompt_excluded()
+    await test_office_lock_file_skipped()
+    await test_bad_zip_file_reported_not_fatal()
+    await test_duplicate_requests_coalesce()
+    await test_rerun_reuses_unchanged_original()
+    await test_modified_original_reanonymized()
     print("\nALL FILES AUTO-ANONYMIZE TESTS PASSED")
 
 

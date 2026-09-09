@@ -118,12 +118,34 @@ def test_llm_offset_validation():
     print("TEST 7 OK: валидация оффсетов от LLM")
 
 
+def test_cross_segment_entity_split():
+    """Регрессия 2026-09-08: сущность, пересекающая границу сегментов
+    (в склеенном тексте содержит «\n»), режется на части В КАЖДЫЙ
+    пересекаемый сегмент — иначе PII в «меньшей» части утекает."""
+    seg1 = "Sasha"
+    seg2 = "А.В. Гершойг"
+    combined = seg1 + "\n" + seg2
+    ent = Entity(text=combined, type="PERSON",
+                 start=0, end=len(combined), confidence=0.9)
+
+    split = split_entities_by_segments([ent], [seg1, seg2])
+
+    assert len(split[0]) == 1, split
+    assert split[0][0].text == "Sasha", split[0]
+    assert seg1[split[0][0].start:split[0][0].end] == "Sasha"
+    assert len(split[1]) == 1, split
+    assert split[1][0].text == "А.В. Гершойг", split[1]
+    assert seg2[split[1][0].start:split[1][0].end] == "А.В. Гершойг"
+    print("TEST 8 OK: кросс-сегментная сущность режется во все сегменты")
+
+
 async def main():
     await test_segment_offsets()
     await test_safe_deanonymize()
     await test_stream_buffering()
     test_session_id_validation()
     test_llm_offset_validation()
+    test_cross_segment_entity_split()
     print("\nALL FUNCTIONAL TESTS PASSED")
 
 

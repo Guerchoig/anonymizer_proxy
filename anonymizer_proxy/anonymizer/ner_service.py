@@ -284,7 +284,10 @@ class NERService:
         try:
             entities = await self._engine.predict(text, categories)
         except Exception as exc:
-            logger.error("NER-движок недоступен или упал: %s", exc)
+            logger.error(
+                "NER-движок недоступен или упал: %s", exc, exc_info=True
+            )
+            self._last_engine_error = f"{type(exc).__name__}: {exc}"
             return [], True
 
         # Второй контур (Natasha/Slovnet): русский NER + детерминированные
@@ -561,6 +564,11 @@ class NERService:
             text, use_llm
         )
         return entities, processing_time
+
+    @property
+    def last_error(self) -> str:
+        """Текст последней ошибки NER-движка (для сообщений пользователю)."""
+        return getattr(self, "_last_engine_error", "")
 
     async def extract_entities_detailed(
         self,
