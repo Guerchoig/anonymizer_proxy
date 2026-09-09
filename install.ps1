@@ -179,6 +179,10 @@ try {
     $shortcut.WorkingDirectory = $PSScriptRoot
     $shortcut.WindowStyle = 7  # свёрнуто
     $shortcut.Description = "Локальный прокси анонимизации для Cline"
+    $iconPath = Join-Path $PSScriptRoot "icon.ico"
+    if (Test-Path $iconPath) {
+        $shortcut.IconLocation = "$iconPath, 0"
+    }
     $shortcut.Save()
     Write-Host "Ярлык создан: $shortcutPath"
 } catch {

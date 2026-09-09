@@ -72,11 +72,35 @@ open -a Terminal "$PROJ_DIR/start_proxy.command"
 EOF
 chmod +x "$BIN_DIR/AnonymizerProxy"
 
-# ---------- 4. Иконка (если есть) ----------
-# Кастомный значок: положите icon.icns в Resources (необязательно).
+# ---------- 4. Иконка ----------
+# Из icon.png (корень проекта) генерируется Resources/app.icns штатными
+# утилитами macOS (sips + iconutil); размеры больше исходника пропускаются.
+# Если icon.png нет — поддержан ручной вариант: готовый icon.icns в
+# Resources. Без иконки .app получает стандартный значок системы.
 if [ -f "$RES_DIR/icon.icns" ]; then
+    PLIST_ICON_SET=1
+elif [ -f "$PROJ_DIR/icon.png" ] && command -v sips >/dev/null 2>&1; then
+    ICONSET="$(mktemp -d)/app.iconset"
+    mkdir -p "$ICONSET"
+    W=$(sips -g pixelWidth "$PROJ_DIR/icon.png" | awk '/pixelWidth/{print $2}')
+    for pair in "16 icon_16x16.png" "32 icon_16x16@2x.png" \
+                "32 icon_32x32.png" "64 icon_32x32@2x.png" \
+                "128 icon_128x128.png" "256 icon_128x128@2x.png" \
+                "256 icon_256x256.png"; do
+        size=${pair%% *}
+        name=${pair#* }
+        [ "$size" -le "$W" ] || continue
+        sips -z "$size" "$size" "$PROJ_DIR/icon.png" \
+            --out "$ICONSET/$name" >/dev/null
+    done
+    if iconutil -c icns "$ICONSET" -o "$RES_DIR/app.icns" 2>/dev/null; then
+        PLIST_ICON_SET=1
+    fi
+    rm -rf "$(dirname "$ICONSET")"
+fi
+if [ "${PLIST_ICON_SET:-0}" = "1" ]; then
     /usr/libexec/PlistBuddy -c \
-        "Add :CFBundleIconFile string icon" "$APP_DIR/Contents/Info.plist" \
+        "Add :CFBundleIconFile string app" "$APP_DIR/Contents/Info.plist" \
         2>/dev/null || true
 fi
 
