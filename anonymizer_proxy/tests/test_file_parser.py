@@ -37,6 +37,7 @@ from anonymizer_proxy.anonymizer.file_parser import (
     FileAssembler,
     _txbx_para_elements,
 )
+from anonymizer_proxy.anonymizer.ner_service import NERService
 
 
 def make_docx(make) -> bytes:
@@ -636,6 +637,172 @@ async def test_xlsx_comments_roundtrip():
           "и восстанавливаются")
 
 
+async def test_xlsx_numeric_roundtrip():
+    """Регрессия 2026-09-10: числовая ячейка после анонимизации и
+    де-анонимизации должна остаться ЧИСЛОМ (а не строкой «386887.422»
+    с точкой). Анонимизация — полная замена значения ячейки токеном."""
+    buf = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Сумма"
+    ws["B1"] = 386887.422
+    ws["B2"] = 51903
+    ws["C1"] = "Иванов"
+    wb.save(buf)
+    data = buf.getvalue()
+
+    parser = FileParser()
+    assembler = FileAssembler()
+    parsed = await parser.parse(data, "t.xlsx")
+    lines = parsed.text.split("\n")
+    anon_lines = [
+        "[MONEY_1]" if ln == "386887.422" else ln for ln in lines]
+    anon = await assembler.assemble(
+        data, "t.xlsx", "\n".join(anon_lines), parsed.structure)
+    wb_anon = load_workbook(io.BytesIO(anon))
+    assert wb_anon.active["B1"].value == "[MONEY_1]"
+    assert wb_anon.active["B2"].value == 51903  # не тронута
+
+    # де-анонимизация: токен -> исходное значение
+    final_lines = [
+        "386887.422" if ln == "[MONEY_1]" else ln for ln in anon_lines]
+    final = await assembler.assemble(
+        data, "t.xlsx", "\n".join(final_lines), parsed.structure)
+    wb_final = load_workbook(io.BytesIO(final))
+    v = wb_final.active["B1"].value
+    assert isinstance(v, (int, float)), \
+        f"число стало {type(v).__name__}: {v!r}"
+    assert abs(v - 386887.422) < 1e-9, v
+    assert wb_final.active["B2"].value == 51903
+    assert wb_final.active["C1"].value == "Иванов"
+    print("TEST OK: xlsx numeric round-trip — число не превращается в строку")
+
+
+async def test_docx_money_roundtrip():
+    """Регрессия 2026-09-10 (аудит DOCX): суммы с запятой в абзацах и
+    ячейках таблиц DOCX не дробятся, восстанавливаются в исходной форме
+    (в DOCX все значения — текст, потерь числового типа нет по определению)."""
+    doc = Document()
+    doc.add_paragraph("Итого по договору: 386 887,422 руб.")
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Сумма"
+    table.cell(1, 0).text = "7 432 480,00"
+    table.cell(1, 1).text = "руб."
+    buf = io.BytesIO()
+    doc.save(buf)
+    data = buf.getvalue()
+
+    parser = FileParser()
+    assembler = FileAssembler()
+    parsed = await parser.parse(data, "t.docx")
+    # MONEY-значения присутствуют в тексте целиком (regex \d+ для дробной части)
+    assert "386 887,422" in parsed.text, parsed.text
+    assert "7 432 480,00" in parsed.text
+
+    lines = parsed.text.split("\n")
+    anon_lines = [
+        ln.replace("386 887,422", "[MONEY_1]")
+        .replace("7 432 480,00", "[MONEY_2]")
+        for ln in lines
+    ]
+    anon = await assembler.assemble(
+        data, "t.docx", "\n".join(anon_lines), parsed.structure)
+    doc_anon = Document(io.BytesIO(anon))
+    assert "[MONEY_1]" in doc_anon.paragraphs[0].text
+    assert doc_anon.tables[0].cell(1, 0).text.strip() == "[MONEY_2]"
+    assert doc_anon.tables[0].cell(1, 1).text.strip() == "руб."
+
+    final_lines = [
+        ln.replace("[MONEY_1]", "386 887,422")
+        .replace("[MONEY_2]", "7 432 480,00")
+        for ln in anon_lines
+    ]
+    final = await assembler.assemble(
+        data, "t.docx", "\n".join(final_lines), parsed.structure,
+        strip_hf_images=False, scrub_metadata=False)
+    doc_final = Document(io.BytesIO(final))
+    assert "386 887,422 руб." in doc_final.paragraphs[0].text
+    assert "7 432 480,00" in doc_final.tables[0].cell(1, 0).text
+    assert doc_final.tables[0].cell(1, 1).text.strip() == "руб."
+    print("TEST OK: docx money round-trip — суммы с запятой не искажаются")
+
+
+async def test_xlsx_financial_format_roundtrip():
+    """Багрепорт 2026-09-11 (сессия 5aecf575, формат «Финансовый»): числовые
+    ячейки с accounting-форматом (_-* #,##0.00₽) извлекаются как str(float)
+    («1586238.422») — без разрядов и валюты — и MONEY-regex их не ловил.
+    Теперь сегмент рендерится «как в Excel» (1 586 238,422 ₽), и все суммы
+    скрываются; после де-анонимизации ячейки остаются числами с исходными
+    значениями."""
+    fmt = '_-* #,##0.00\\ _₽_-;\\-* #,##0.00\\ _₽_-;_-* "-"??\\ _₽_-;_-@_-'
+    buf = io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Статья"
+    c1 = ws["B1"]
+    c1.value = 1586238.422
+    c1.number_format = fmt
+    c2 = ws["B2"]
+    c2.value = 793119.211
+    c2.number_format = fmt
+    c3 = ws["C1"]
+    c3.value = 1586238.422
+    c3.number_format = fmt
+    ws["A3"] = "ИНН"
+    ws["C3"] = 7701234567  # General — не трогаем
+    wb.save(buf)
+    data = buf.getvalue()
+
+    parser = FileParser()
+    assembler = FileAssembler()
+    parsed = await parser.parse(data, "t.xlsx")
+    # сегменты отрендерены «как в Excel» (группировка + запятая + валюта)
+    assert "1 586 238,422" in parsed.text, parsed.text
+    assert "793 119,211" in parsed.text, parsed.text
+    ner = NERService()
+    ents, _, failed = await ner.extract_entities_detailed(
+        parsed.text, use_llm=False)
+    money = [e for e in ents if e.type == "MONEY"]
+    # три ячейки с финансовым форматом; одинаковые значения в B1 и C1
+    # дают отдельные сущности-вхождения, но один токен
+    assert len(money) == 3, [e.text for e in money]
+    assert not failed
+
+    from anonymizer_proxy.anonymizer.replacer import TextReplacer
+    seq = {"n": 0}
+
+    async def add_mapping(value, etype):
+        seq["n"] += 1
+        return f"[{etype}_{seq['n']}]"
+
+    anon_text, mappings = await TextReplacer().anonymize(
+        parsed.text, money, add_mapping)
+    anon = await assembler.assemble(
+        data, "t.xlsx", anon_text, parsed.structure)
+    wb_anon = load_workbook(io.BytesIO(anon))
+    assert wb_anon.active["B1"].value.startswith("[MONEY_")
+    assert wb_anon.active["B2"].value.startswith("[MONEY_")
+    assert wb_anon.active["C1"].value.startswith("[MONEY_")
+    assert wb_anon.active["C3"].value == 7701234567  # General — не тронут
+
+    mapping_dict = {m.token: m.original_value for m in mappings}
+    assert len(mapping_dict) == 2  # B1 и C1 — одно значение
+    deanon_text = await TextReplacer().deanonymize(anon_text, mapping_dict)
+    final = await assembler.assemble(
+        data, "t.xlsx", deanon_text, parsed.structure)
+    wb_final = load_workbook(io.BytesIO(final))
+    ws_f = wb_final.active
+    assert isinstance(ws_f["B1"].value, float)
+    assert abs(ws_f["B1"].value - 1586238.422) < 1e-9
+    assert isinstance(ws_f["B2"].value, float)
+    assert abs(ws_f["B2"].value - 793119.211) < 1e-9
+    assert isinstance(ws_f["C1"].value, float)
+    assert abs(ws_f["C1"].value - 1586238.422) < 1e-9
+    assert ws_f["C3"].value == 7701234567
+    print("TEST OK: xlsx financial format round-trip — все суммы скрыты "
+          "и восстановлены числами")
+
+
 async def main():
     await test_docx_table_structure()
     await test_docx_multiparagraph_cell()
@@ -648,6 +815,9 @@ async def main():
     await test_page_number_fields()
     await test_docx_nested_tables_and_comments()
     await test_xlsx_comments_roundtrip()
+    await test_xlsx_numeric_roundtrip()
+    await test_docx_money_roundtrip()
+    await test_xlsx_financial_format_roundtrip()
     print("\nALL FILE PARSER TESTS PASSED")
 
 

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.models.schemas import SendAnonymizedRequest
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore, FakeOpenRouter
+from anonymizer_proxy.tests.test_tools_manual import FakeNER, FakeStore, FakeOpenRouter
 
 
 async def test_send_anonymized_no_stream():

@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from anonymizer_proxy.anonymizer.gliner_engine import (  # noqa: E402
     GlinerEngine, DEFAULT_LABEL_MAP, detect_onnx_providers,
@@ -222,5 +224,81 @@ async def test_predict_timeout():
     print("TEST 9 OK: таймаут инференса")
 
 
+def test_numeric_span_extension():
+    """Регрессия 2026-09-10 (аудит DOCX/XLSX сумм): частичный числовой спан
+    (например, GLiNER вернул «887» из «386 887,422») расширяется до полного
+    числа — десятичная часть и все разрядные группы; нечисловое окружение
+    не поглощается."""
+    from anonymizer_proxy.anonymizer.ner_service import NERService
+    from anonymizer_proxy.models.schemas import Entity
+
+    svc = NERService.__new__(NERService)
+    cases = [
+        # (текст, частичный спан, ожидаемое полное значение)
+        ("Сумма 7 432 480,00 итого", "480,00", "7 432 480,00"),
+        ("Сумма 7 432 480,00 итого", "432", "7 432 480,00"),
+        ("386 887,422", "887", "386 887,422"),
+        ("386887.422", "386887", "386887.422"),
+        ("Цена 1 500 000 руб.", "1 500", "1 500 000"),
+    ]
+    for text, part, expected in cases:
+        idx = text.find(part)
+        ents = [Entity(text=part, type="MONEY", start=idx,
+                       end=idx + len(part), confidence=0.9)]
+        expanded = svc._expand_all_occurrences(text, ents)
+        assert expanded and expanded[0].text == expected, \
+            (text, part, [e.text for e in expanded])
+    # Нечисловое окружение не поглощается
+    ents = [Entity(text="1500", type="MONEY", start=0, end=4,
+                   confidence=0.9)]
+    expanded = svc._expand_all_occurrences("1500 руб.", ents)
+    assert expanded and expanded[0].text == "1500"
+    print("TEST OK: числовой спан расширяется до полного числа")
+
+
+def test_currency_symbols_roundtrip():
+    """Багрепорт 2026-09-11 (аудит: ₽/$/€/¥/£ в форматах ячеек).
+    1. Символ валюты извлекается из кодов форматов [$€-407], \₽, «руб.».
+    2. Рендер «как в Excel» ловится MONEY-regex ЦЕЛИКОМ для всех валют.
+    3. Валюта в конце одной ячейки НЕ склеивается с числом соседней через
+       \\n (раньше '$' + '\\n' + '793...' давали спан через две ячейки)."""
+    from anonymizer_proxy.anonymizer.ner_service import NERService
+    from anonymizer_proxy.anonymizer.file_parser import _currency_from_format
+
+    fmt_cases = {
+        '_-* #,##0.00\\ _₽_-;\\-* #,##0.00\\ _₽_-': "₽",
+        '#,##0.00\\ [$€-407]': "€",
+        '[$$-409]#,##0.00': "$",
+        '_($* #,##0.00_);_($* "-"??_)': "$",
+        '#,##0.00\\ "руб."': "руб.",
+        '#,##0.00': "",
+    }
+    for fmt, expected in fmt_cases.items():
+        got = _currency_from_format(fmt)
+        assert got == expected, (fmt, got)
+
+    ner = NERService.__new__(NERService)
+    for symbol in ("₽", "$", "€", "¥", "£"):
+        rendered = f"1 586 238,422 {symbol}"
+        ents = ner._extract_regex_entities(rendered)
+        money = [e.text for e in ents if e.type == "MONEY"]
+        assert rendered in money, (symbol, money)
+        # символ валюты НЕ глотает \n: две соседние ячейки не склеиваются
+        glued = f"{rendered}\n793 119,211 {symbol}"
+        ents2 = ner._extract_regex_entities(glued)
+        spans = [(e.start, e.end) for e in ents2 if e.type == "MONEY"]
+        for e in ents2:
+            if e.type == "MONEY":
+                assert "\n" not in glued[e.start:e.end], \
+                    (symbol, glued[e.start:e.end])
+    # негатив: «51903.14 $» в DOCX-тексте ловится целиком
+    ents = ner._extract_regex_entities("Итого: 51903.14 $")
+    money = [e.text for e in ents if e.type == "MONEY"]
+    assert "51903.14 $" in money, money
+    print("TEST OK: валютные форматы $/€/¥/£ — детект и без склейки ячеек")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    test_numeric_span_extension()
+    test_currency_symbols_roundtrip()

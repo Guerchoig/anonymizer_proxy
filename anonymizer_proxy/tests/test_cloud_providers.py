@@ -39,9 +39,9 @@ from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
 from anonymizer_proxy.proxy.command_classifier import looks_like_command
-from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore
+from anonymizer_proxy.tests.test_tools_manual import FakeNER, FakeStore
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 
 def test_registry_sanity():

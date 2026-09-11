@@ -56,6 +56,7 @@ from .utils import (
     ANONYMIZER_DONE_MARKER_RE,
     SESSION_ID_LINE_RE,
     DEANONYMIZE_INTENT_RE,
+    REVEAL_INTENT_RE,
     RESTART_INTENT_RE,
     EXTRA_ANONYMIZE_INTENT_RE,
     PLACEHOLDER_DEANON_INTENT_RE,
@@ -89,18 +90,43 @@ def _help_command(text: str) -> dict:
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Атомарная перезапись файла (временный файл + os.replace)."""
     tmp = path.with_name(path.name + ".anonymizer-tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except PermissionError as exc:
+        # Файл занят: открыт в Word/LibreOffice — ОС запрещает замену.
+        # Текст осмысленный (не сырой PermissionError): он попадает в
+        # отчёт пользователю (багрепорт 2026-09-10).
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError(
+            f"не удалось записать файл: занят (вероятно, открыт в "
+            f"Word/LibreOffice) — {path.name}. Закройте его в редакторе "
+            "и повторите команду") from exc
+    except Exception:
+        # Не оставлять осиротевший tmp-файл после любого сбоя записи
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
 
 
+# Число-подобное значение из команды «скрой эти данные»: цифры, разрядные
+# пробелы, точка/запятая (десятичный разделитель), знак
+_NUMERIC_VALUE_RE = re.compile(r"[+-]?\d[\d \u00A0.,]*")
+
+
 class PreparedFilesAnonymization:
     """
     Результат автоматической анонимизации приложенных файлов
-    (passthrough-режим): файлы уже обработаны локальной NER-моделью,
+    (manual-режим): файлы уже обработаны локальной NER-моделью,
     осталось только отдать клиенту текстовый ответ (стримом или нет).
     """
 
@@ -375,7 +401,7 @@ class RequestHandler:
         если путь указывает на анонимизированную копию (<name>.anonymized.<ext>),
         текстом, извлечённым прокси из локального файла.
 
-        Обычные (не анонимизированные) файлы не трогаем — контракт passthrough:
+        Обычные (не анонимизированные) файлы не трогаем — контракт manual:
         их содержимое не должно самопроизвольно попадать в облако.
         """
         result: list[str] = []
@@ -608,11 +634,11 @@ class RequestHandler:
     ) -> list[str]:
         """
         Определить, нужно ли перехватить запрос для автоматической анонимизации
-        приложенных файлов (только passthrough-режим).
+        приложенных файлов (только manual-режим).
 
         Условия перехвата:
         1. В ТЕКУЩЕМ (последнем содержательном) user-сообщении есть команда
-           анонимизации («анонимиз…» / «anonymis/z…»). Команда из старых
+           анонимизации («скрой данные/всё…» / «anonymize…»). Команда из старых
            сообщений истории не считается: она остаётся там навсегда и без
            этого ограничения ложно перехватывает последующие запросы
            («сравни два файла», «составь отчёт» и т.п.);
@@ -637,8 +663,8 @@ class RequestHandler:
         for msg in request.messages:
             # Системный промпт (Hermes/Cline) — НЕ источник файлов для
             # анонимизации. Он всегда упоминает служебные файлы агента
-            # (AGENTS.md и т.п.): реальный кейс 2026-09-05 — «анонимизируй
-            # приложенные файлы» анонимизировал AGENTS.md из корня проекта
+            # (AGENTS.md и т.п.): реальный кейс 2026-09-05 — «скрой
+            # все данные» анонимизировало AGENTS.md из корня проекта
             # вместо приложенных docx, потому что путь AGENTS.md попал в
             # кандидаты из системного промпта.
             if (msg.role or "").lower() == "system":
@@ -667,7 +693,7 @@ class RequestHandler:
                     if raw_path and raw_path not in candidates:
                         candidates.append(raw_path)
                 # Пути к файлам, упомянутые в тексте сообщения
-                # («анонимизируй файл c:\docs\KP_IRIS.docx»)
+                # («скрой все данные c:\docs\KP_IRIS.docx»)
                 for match in PATH_MENTION_RE.finditer(text):
                     raw_path = match.group(0).strip()
                     if raw_path and raw_path not in candidates:
@@ -697,7 +723,7 @@ class RequestHandler:
             # и проходят по маске расширения, но документами не являются:
             # их парсинг даёт BadZipFile и раньше ронял весь перехват
             # (багрепорт 2026-09-08: «Provider error: File is not a zip
-            # file» при «анонимизируй файл» в Hermes, когда рядом с целевым
+            # file» при «скрой все данные» в Hermes, когда рядом с целевым
             # документом в истории оказался lock-файл открытого в Word
             # документа docs\~$_IRIS.result.docx).
             if resolved.name.startswith("~$"):
@@ -936,7 +962,7 @@ class RequestHandler:
         """
         lines = [
             "[ANONYMIZER] Приложенные файлы анонимизированы локальной "
-            "NER-моделью. Запрос в облако НЕ отправлялся (режим passthrough).",
+            "NER-моделью. Запрос в облако НЕ отправлялся (режим manual).",
             "",
             f"session_id: {session_id}",
             "",
@@ -972,14 +998,13 @@ class RequestHandler:
             "«составь резюме»). Отдельная команда отправки не нужна.",
             "3. ОБЯЗАТЕЛЬНО при изменении документа — правило цепочки правок: "
             "ПЕРВАЯ правка — --file <анонимизированная копия> --output "
-            "<файл результата> (путь в маркере [anonymizer:result:<путь>] "
-            "выше). ВСЕ ПОСЛЕДУЮЩИЕ правки — только с --file <файл "
+            "<файл результата> (путь — в маркере результата выше). "
+            "ВСЕ ПОСЛЕДУЮЩИЕ правки — только с --file <файл "
             "результата> и записью в него же (--output <файл результата> "
             "или --in-place): команда, начатая заново с копии, ЗАТРЁТ "
             "предыдущие правки. Анонимизированную копию не изменяйте — "
             "она исходник только для чтения (dump/list-tables).",
-            "4. В конце — де-анонимизация: напишите «деанонимизируй "
-            "упомянутые файлы».",
+            "4. В конце — де-анонимизация: напишите «раскрой все данные».",
         ]
         return "\n".join(lines)
 
@@ -1263,12 +1288,11 @@ class RequestHandler:
         if backend:
             return {"command": "backend", "backend": backend}
 
-        # 1b) Новые команды v1.11 (канонические формулировки, детерминированные
+        # 1b) Точечные команды (канонические формулировки, детерминированные
         #     правила + парсеры аргументов, БЕЗ моделей). Проверяются ДО
-        #     GLiNER-слоя и обобщённого deanon_files: «деанонимизируй
-        #     плейсхолдеры…» содержит «деанонимиз», «дополнительно
-        #     анонимизируй…» — «анонимиз», и иначе перехватились бы
-        #     полной деанонимизацией / whole-file NER соответственно.
+        #     GLiNER-слоя и обобщённого deanon_files: «Раскрой эти данные…»
+        #     и «Скрой эти данные…» иначе перехватились бы полной
+        #     деанонимизацией / whole-file NER соответственно.
         if content_commands:
             cmd = self._resolve_placeholder_deanon_command(request, joined)
             if cmd:
@@ -1292,7 +1316,7 @@ class RequestHandler:
                 # Целей нет — идёт обычным порядком (не команда)
 
         # 3) GLiNER недоступна/не распознала — regex-фоллбек полной
-        #    де-анонимизации (прежнее поведение «деанонимизируй файлы»)
+        #    де-анонимизации (каноническая команда «раскрой все данные»)
         if content_commands:
             targets = self.detect_deanonymize_request(request)
             if targets:
@@ -1371,11 +1395,15 @@ class RequestHandler:
     ) -> list[dict]:
         """
         Определить, нужно ли перехватить запрос для де-анонимизации файлов
-        по естественной команде («деанонимизируй файлы…»).
+        по естественной команде («Раскрой все данные…»).
 
         Условия: в ТЕКУЩЕМ (последнем содержательном) user-сообщении есть
-        команда де-анонимизации (команда из старых сообщений истории не
-        считается — см. detect_attached_files_anonymization), и в истории
+        команда де-анонимизации — полная («раскрой все данные») или краткая
+        «раскрой …» (REVEAL_INTENT_RE; краткая форма безопасна здесь: полный
+        перехват вызывается только после более строгих проверок команды,
+        а точечная выборочная деанонимизация проверяется раньше; команда из
+        старых сообщений истории не считается — см.
+        detect_attached_files_anonymization), и в истории
         диалога есть маркеры [anonymizer:result:<путь>] с session_id.
         Основной источник — файл результата; если модель его не создала,
         де-анонимизируется анонимизированная копия (fallback).
@@ -1386,6 +1414,7 @@ class RequestHandler:
         """
         has_intent = any(
             DEANONYMIZE_INTENT_RE.search(text)
+            or REVEAL_INTENT_RE.search(text)
             for text in last_user_message_texts(request.messages)
         )
         if not has_intent:
@@ -1401,13 +1430,27 @@ class RequestHandler:
                 if not sids:
                     continue
                 sid = sids[0]
+                # Литеральные «пути» из подсказок (старые ответы содержали
+                # «[anonymizer:result:<путь>]» как ТЕКСТ инструкции) не
+                # являются целями: в реальных путях < и > не встречаются
+                # (багрепорт 2026-09-10: фантомная цель «файл не найден»
+                # из подсказки «Дальнейшие шаги» в истории диалога).
+                def _real_marker_path(raw: str) -> bool:
+                    p = raw.strip()
+                    # Реальные пути абсолютные и не содержат < >; литералы
+                    # из подсказок/пересказов («<путь>», «…») отсекаются
+                    return (bool(p) and "<" not in p and ">" not in p
+                            and ("\\" in p or "/" in p))
+
                 result_paths = [
                     m.group("path").strip()
                     for m in ANONYMIZER_RESULT_MARKER_RE.finditer(text)
+                    if _real_marker_path(m.group("path"))
                 ]
                 copy_paths = [
                     m.group("path").strip()
                     for m in ANONYMIZER_COPY_MARKER_RE.finditer(text)
+                    if _real_marker_path(m.group("path"))
                 ]
                 for i, result_path in enumerate(result_paths):
                     key = f"{sid}|{result_path}"
@@ -1423,10 +1466,29 @@ class RequestHandler:
 
     @staticmethod
     def _build_deanonymize_text(files_info: list[dict]) -> str:
-        """Текст подтверждения после де-анонимизации файлов результата."""
+        """Текст подтверждения после де-анонимизации файлов результата.
+
+        Заголовок вычисляется из фактических результатов: ошибки записи
+        не «прячутся» за словом «де-анонимизированы» (багрепорт 2026-09-10).
+        """
+        errors = [i for i in files_info if "error" in i]
+        if not files_info:
+            header = ("[ANONYMIZER] Де-анонимизация НЕ ВЫПОЛНЕНА: не "
+                      "найдено ни одного файла результата. Запрос в облако "
+                      "НЕ отправлялся.")
+        elif not errors:
+            header = ("[ANONYMIZER] Файлы результата де-анонимизированы: "
+                      "плейсхолдеры заменены реальными значениями. Запрос "
+                      "в облако НЕ отправлялся.")
+        elif len(errors) < len(files_info):
+            header = ("[ANONYMIZER] Де-анонимизация выполнена ЧАСТИЧНО: "
+                      "часть файлов НЕ обновлена (см. ошибки ниже). Запрос "
+                      "в облако НЕ отправлялся.")
+        else:
+            header = ("[ANONYMIZER] Де-анонимизация НЕ ВЫПОЛНЕНА (см. "
+                      "ошибки ниже). Запрос в облако НЕ отправлялся.")
         lines = [
-            "[ANONYMIZER] Файлы результата де-анонимизированы: плейсхолдеры "
-            "заменены реальными значениями. Запрос в облако НЕ отправлялся.",
+            header,
             "",
             "Файлы:",
         ]
@@ -1457,15 +1519,16 @@ class RequestHandler:
         self, request: ChatCompletionRequest, joined: str,
     ) -> Optional[dict]:
         """
-        Команда «деанонимизируй плейсхолдеры PERSON_1, PERSON_3–PERSON_5».
+        Команда «Раскрой эти данные PERSON_1, PERSON_3–PERSON_5».
 
-        Проверяется ДО обобщённого deanon_files: «деанонимизируй
-        плейсхолдеры…» содержит «деанонимиз» и иначе перехватился бы ПОЛНОЙ
-        деанонимизацией файлов (восстановить больше PII, чем попросил
-        пользователь, нельзя). Anti-fallthrough: интент есть, а токены не
-        распознаны — служебная подсказка вместо провала в полную
-        деанонимизацию. Ловит и «деанонимизируй PERSON_1…» без слова
-        «плейсхолдеры»: частичная деанонимизация безопаснее полной.
+        Проверяется ДО обобщённого deanon_files: команда с указательным
+        местоимением («эти/следующие/указанные/приведенные данные») иначе
+        перехватилась бы ПОЛНОЙ деанонимизацией файлов (восстановить больше
+        PII, чем попросил пользователь, нельзя). Anti-fallthrough: интент
+        есть, а токены не распознаны — служебная подсказка вместо провала в
+        полную деанонимизацию. Ловит и краткую форму «Раскрой PERSON_1…»
+        (REVEAL_INTENT_RE, без слова «данные»): частичная деанонимизация
+        безопаснее полной.
         """
         texts = last_user_message_texts(request.messages)
         explicit = any(
@@ -1473,14 +1536,16 @@ class RequestHandler:
         tokens, errors = parse_placeholder_spec(joined)
         if not explicit and not (
                 tokens
-                and any(DEANONYMIZE_INTENT_RE.search(t) for t in texts)):
+                and any(DEANONYMIZE_INTENT_RE.search(t)
+                        or REVEAL_INTENT_RE.search(t) for t in texts)):
             return None
         if not tokens:
             return _help_command(
                 "[ANONYMIZER] Команда деанонимизации плейсхолдеров распознана, "
                 "но ни одного плейсхолдера не распознано. Укажите список или "
-                "диапазон, например: деанонимизируй плейсхолдеры PERSON_1, "
-                "PERSON_3–PERSON_5. Запрос в облако НЕ отправлялся.")
+                "диапазон, например: раскрой эти данные PERSON_1, "
+                "PERSON_3–PERSON_5. Если нужна ПОЛНАЯ деанонимизация файлов — "
+                "напишите «раскрой все данные». Запрос в облако НЕ отправлялся.")
         targets = self.detect_deanonymize_request(request)
         # Маркеров [anonymizer:result:…] в диалоге может не быть (новый чат),
         # но маппинги и привязки файлов сохранены в БД прокси: цели найдёт
@@ -1496,11 +1561,12 @@ class RequestHandler:
         self, request: ChatCompletionRequest, joined: str,
     ) -> Optional[dict]:
         """
-        Команда «дополнительно анонимизируй: Иванов, Петрова».
+        Команда «Скрой эти данные: Иванов, Петрова».
 
-        Проверяется до перехвата авто-анонимизации приложенных файлов:
-        «дополнительно анонимизируй…» содержит «анонимиз». Anti-fallthrough:
-        интент есть, а имена не распознаны — подсказка, а не whole-file NER.
+        Проверяется до перехвата авто-анонимизации приложенных файлов: у обеих
+        команд общий глагол «скрой», и без приоритета точечной команды файлы
+        ушли бы в whole-file NER. Anti-fallthrough: интент есть, а значения
+        не распознаны — подсказка, а не whole-file NER.
         """
         match = EXTRA_ANONYMIZE_INTENT_RE.search(joined)
         if not match:
@@ -1510,8 +1576,10 @@ class RequestHandler:
             return _help_command(
                 "[ANONYMIZER] Команда дополнительной анонимизации распознана, "
                 "но значения не распознаны. Перечислите их через запятую, "
-                "например: дополнительно анонимизируй: Иванов, 27.12.2023, "
-                "№0095/23. Запрос в облако НЕ отправлялся.")
+                "например: скрой эти данные: Иванов, 27.12.2023, "
+                "№0095/23. Если вы хотели анонимизировать приложенные файлы "
+                "целиком — напишите «скрой все данные». Запрос в облако НЕ "
+                "отправлялся.")
         targets, default_sid = self._detect_extra_anonymize_targets(request)
         if not targets:
             return _help_command(
@@ -1531,7 +1599,7 @@ class RequestHandler:
         self, request: ChatCompletionRequest,
     ) -> tuple[list[dict], Optional[str]]:
         """
-        Цели команды «дополнительно анонимизируй…»: анонимизированные копии.
+        Цели команды «Скрой эти данные…»: анонимизированные копии.
 
         1) явные пути в ТЕКУЩЕМ сообщении (копия используется напрямую; для
            оригинала берётся одноимённая копия <name>.anonymized.<ext>, если
@@ -1585,7 +1653,14 @@ class RequestHandler:
                 if sid and not default_sid:
                     default_sid = sid
                 for m in ANONYMIZER_COPY_MARKER_RE.finditer(text):
-                    _add(m.group("path").strip(), sid)
+                    raw = m.group("path").strip()
+                    # Литеральные «<путь>»/«…» из подсказок и пересказов —
+                    # не цели (см. detect_deanonymize_request,
+                    # багрепорт 2026-09-10)
+                    if not ("<" not in raw and ">" not in raw
+                            and ("\\" in raw or "/" in raw)):
+                        continue
+                    _add(raw, sid)
 
         return targets, default_sid
 
@@ -1779,11 +1854,11 @@ class RequestHandler:
         if command:
             return await self.execute_chat_command(request, command)
 
-        # Passthrough: anonymize=False или режим passthrough по умолчанию
-        if not request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
-            if request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+        # Manual: anonymize=False или режим manual по умолчанию
+        if not request.anonymize or CURRENT_MODE == Mode.MANUAL:
+            if request.anonymize and CURRENT_MODE == Mode.MANUAL:
                 # Автоматическая анонимизация приложенных файлов по явной команде
-                # («Анонимизируй файл…») — локальной NER-моделью, без облака.
+                # («Скрой все данные…») — локальной NER-моделью, без облака.
                 # Явное anonymize=false отключает и перехват тоже.
                 # На локальном бэкенде (LM Studio) перехват отключён:
                 # данные не покидают машину, маскировать незачем.
@@ -1794,7 +1869,7 @@ class RequestHandler:
                     return await self.handle_files_anonymization(
                         request, file_paths, session_id
                     )
-            return await self._handle_passthrough(request, session_id)
+            return await self._handle_manual(request, session_id)
 
         # Переиспользуем prepare_chat_request (нет дублирования логики)
         prepared = await self.prepare_chat_request(request, session_id)
@@ -2372,13 +2447,13 @@ class RequestHandler:
             messages.insert(0, ChatMessage(role="system", content=hint))
         return messages
 
-    async def _handle_passthrough(
+    async def _handle_manual(
         self,
         request: ChatCompletionRequest,
         session_id: Optional[str] = None,
     ) -> tuple[ChatCompletionResponse, str]:
         """
-        Passthrough-режим (anonymize=False): отправить запрос в OpenRouter
+        Manual-режим (anonymize=False): отправить запрос в OpenRouter
         БЕЗ анонимизации и де-анонимизации (обычный прокси).
 
         Исключение (выборочная де-анонимизация): если в истории диалога есть
@@ -2445,30 +2520,30 @@ class RequestHandler:
                 )
             )
 
-        metadata: dict = {"mode": "passthrough"}
+        metadata: dict = {"mode": "manual"}
         if mappings_dict:
             metadata = {
-                "mode": "passthrough_deanonymized",
+                "mode": "manual_deanonymized",
                 "sessions": history_sessions,
                 "mappings_count": len(mappings_dict),
             }
 
         response = ChatCompletionResponse(
-            id=cloud_response.get("id", f"passthrough-{int(time.time())}"),
+            id=cloud_response.get("id", f"manual-{int(time.time())}"),
             created=cloud_response.get("created", int(time.time())),
             model=cloud_response.get("model", request.model),
             choices=choices,
             usage=UsageInfo(**cloud_response.get("usage", {})),
             anonymization_metadata=metadata,
         )
-        return response, session_id or "passthrough"
+        return response, session_id or "manual"
 
-    async def stream_passthrough(
+    async def stream_manual(
         self,
         request: ChatCompletionRequest,
     ) -> AsyncIterator[str]:
         """
-        Стриминг passthrough (anonymize=False): без анонимизации и
+        Стриминг manual (anonymize=False): без анонимизации и
         де-анонимизации (обычный прокси-стрим).
 
         Исключение (выборочная де-анонимизация): если в истории диалога есть
@@ -2517,7 +2592,7 @@ class RequestHandler:
                 tail = await deano.flush()
                 if tail:
                     tail_chunk = {
-                        "id": f"passthrough-{int(time.time())}",
+                        "id": f"manual-{int(time.time())}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": request.model,
@@ -2806,7 +2881,7 @@ class RequestHandler:
 
         mappings_subset — необязательное ограничение набора токенов
         (token -> original_value) для ВЫБОРОЧНОЙ де-анонимизации (команда
-        «деанонимизируй плейсхолдеры…»); None — все маппинги сессии.
+        «раскрой эти данные…»); None — все маппинги сессии.
         """
         if mappings_subset is None:
             mappings_dict = await self.store.get_all_mappings(session_id)
@@ -2846,7 +2921,7 @@ class RequestHandler:
     async def _discover_placeholder_targets(
         self, tokens: list[str]) -> list[dict]:
         """
-        Фоллбек для «деанонимизируй плейсхолдеры…»: цели из хранилища маппингов.
+        Фоллбек для «раскрой эти данные…»: цели из хранилища маппингов.
 
         Основной путь — маркеры [anonymizer:result:…] в диалоге; он не работает
         в новом чате, хотя маппинги и привязки файлов сохранены в БД прокси.
@@ -2893,7 +2968,7 @@ class RequestHandler:
         unrecognized: Optional[list[str]] = None,
     ) -> tuple[ChatCompletionResponse, str]:
         """
-        Команда «деанонимизируй плейсхолдеры …»: восстановить ТОЛЬКО указанные
+        Команда «раскрой эти данные …»: восстановить ТОЛЬКО указанные
         плейсхолдеры (список/диапазон) в файлах результата.
 
         Цели: маркеры [anonymizer:result:…] из диалога; если их там нет
@@ -2904,7 +2979,7 @@ class RequestHandler:
         (даже если восстановлены все его плейсхолдеры): анонимизированная копия
         не изменяется, маппинги сессии сохраняются, никаких маркеров
         «полностью деанонимизирован» не выставляется. Полная деанонимизация
-        «насовсем» — штатная команда «деанонимизируй файлы».
+        «насовсем» — штатная команда «раскрой все данные».
         """
         wanted = {t for t in tokens}
         targets = list(targets or [])
@@ -2971,9 +3046,19 @@ class RequestHandler:
                 restored_pairs.append(f"{token} → {subset[token]}")
 
         unknown_sorted = sorted(unknown_tokens)
+        # Заголовок вычисляется из фактических результатов: если по всем
+        # целям только ошибки/отсутствия, слова «деанонимизированы» в
+        # заголовке быть не должно (багрепорт 2026-09-10)
+        restored_any = bool(restored_pairs)
+        if restored_any:
+            header = ("[ANONYMIZER] Деанонимизированы указанные "
+                      "плейсхолдеры. Запрос в облако НЕ отправлялся.")
+        else:
+            header = ("[ANONYMIZER] Деанонимизация НЕ ВЫПОЛНЕНА: ни один "
+                      "из указанных плейсхолдеров не восстановлен (см. "
+                      "детали ниже). Запрос в облако НЕ отправлялся.")
         reply_lines = [
-            "[ANONYMIZER] Деанонимизированы указанные плейсхолдеры. Запрос в "
-            "облако НЕ отправлялся.",
+            header,
             "",
             "Файлы:",
             *files_report,
@@ -2990,8 +3075,8 @@ class RequestHandler:
             "Важно: файл результата по-прежнему считается анонимизированным — "
             "восстановлены только перечисленные плейсхолдеры (даже если это "
             "все плейсхолдеры файла). Анонимизированная копия не изменялась; "
-            "полная деанонимизация «насовсем» — командой «деанонимизируй "
-            "файлы».",
+            "полная деанонимизация «насовсем» — командой «раскрой "
+            "все данные».",
         ]
         sid_for_log = (targets[0].get("session_id")
                        if targets else "deanonymize")
@@ -3033,19 +3118,50 @@ class RequestHandler:
             lambda m: " " * len(m.group(0)), text)
         entities: list[Entity] = []
         found: set[str] = set()
+        covered_spans: set[tuple[int, int]] = set()
+
+        def _numeric_patterns(name: str) -> list[re.Pattern]:
+            """Паттерны поиска числа-подобного значения в тексте.
+
+            Текст ячейки может отличаться от пользовательской записи формы:
+            «51 903,14» в файле с числовой ячейкой — «51903.14» (str(float)).
+            Перебираем варианты записи (без разрядных пробелов, запятая↔точка)
+            и поглощаем дробную часть: «386887» в «386887,42» матчит ВСЁ
+            число, а не оставляет обрубок «386887.[MISC_5]»
+            (багрепорт 2026-09-10)."""
+            pats = []
+            variants = {name,
+                        name.replace(" ", "").replace("\u00A0", ""),
+                        name.replace(",", "."),
+                        name.replace(" ", "").replace("\u00A0", "")
+                        .replace(",", ".")}
+            for v in variants:
+                pats.append(re.compile(
+                    r"(?<![0-9.,])" + re.escape(v) + r"(?:[.,]\d+)?(?![0-9])"))
+            return pats
+
         for name in names:
             # Границы: не буква/цифра/подчёркивание — значения вида
             # «27.12.2023» и «0095/23/…» не матчятся внутри более длинных
-            # номеров
-            pattern = re.compile(
-                r"(?<![A-Za-zА-Яа-яЁё0-9_])" + re.escape(name)
-                + r"(?![A-Za-zА-Яа-яЁё0-9_])", re.IGNORECASE)
-            for m in pattern.finditer(masked):
-                entities.append(Entity(
-                    text=text[m.start():m.end()],
-                    type="PERSON" if is_name_like(name) else "MISC",
-                    start=m.start(), end=m.end(), confidence=1.0))
-                found.add(name)
+            # номеров. Для чисел — свой набор паттернов (см. выше):
+            # частичное замещение числа недопустимо
+            if _NUMERIC_VALUE_RE.fullmatch(name):
+                patterns = _numeric_patterns(name)
+            else:
+                patterns = [re.compile(
+                    r"(?<![A-Za-zА-Яа-яЁё0-9_])" + re.escape(name)
+                    + r"(?![A-Za-zА-Яа-яЁё0-9_])", re.IGNORECASE)]
+            for pattern in patterns:
+                for m in pattern.finditer(masked):
+                    start, end = m.start(), m.end()
+                    if any(s < end and e > start for s, e in covered_spans):
+                        continue  # совпадение уже покрыто другим вариантом
+                    covered_spans.add((start, end))
+                    entities.append(Entity(
+                        text=text[start:end],
+                        type="PERSON" if is_name_like(name) else "MISC",
+                        start=start, end=end, confidence=1.0))
+                    found.add(name)
 
         async def add_mapping(original_value, entity_type, _sid=sid):
             return await self.store.add_mapping(
@@ -3084,7 +3200,7 @@ class RequestHandler:
         targets: list[dict],
         unrecognized: Optional[list[str]] = None,
     ) -> tuple[ChatCompletionResponse, str]:
-        """Команда «дополнительно анонимизируй значения…»: заменить в копиях
+        """Команда «скрой эти данные: …»: заменить в копиях
         и файлах результата строки, пропущенные NER (перечислены
         пользователем): имена, номера договоров, даты, суммы — любые строки
         с буквой/цифрой.
@@ -3114,12 +3230,17 @@ class RequestHandler:
         copy_markers: list[str] = []
         not_found_everywhere = list(names)
         all_entities_count = 0
+        # Файловый уровень успеха/провала — заголовок считается по ФАЙЛАМ:
+        # «копия ОК + занятый result» — это ЧАСТИЧНЫЙ успех, а не провал
+        any_file_ok = False
+        any_file_failed = False
 
         for target in targets:
             copy_path = Path(target["copy_path"])
             sid = target.get("session_id") or default_sid
             if not copy_path.is_file():
                 files_report.append(f"- {copy_path} — ОШИБКА: файл не найден")
+                any_file_failed = True
                 continue
 
             # Вариант A: замены применяются к ОБОИМ файлам — копии и файлу
@@ -3135,17 +3256,38 @@ class RequestHandler:
             found_in_copy: set[str] = set()
             found_overall: set[str] = set()
             replaces_total = 0
-            try:
-                for i, file_path in enumerate(files_to_process):
+            failed_files: list[Path] = []
+            for i, file_path in enumerate(files_to_process):
+                try:
                     lines, found, replaces = (
                         await self._extra_anonymize_one_file(
                             file_path, names, sid))
-                    files_report.extend(lines)
-                    found_overall |= found
-                    replaces_total += replaces
-                    if i == 0:
-                        found_in_copy = found
+                except Exception as exc:
+                    # Ошибка одного файла не глотается молча и не валит
+                    # остальные: честная строка в отчёте по каждому файлу
+                    # (багрепорт 2026-09-10: занятый Word-ом result давал
+                    # ответ «выполнена» при незаписанном файле)
+                    logger.exception(
+                        "Ошибка дополнительной анонимизации %s", file_path)
+                    files_report.append(f"- {file_path} — ОШИБКА: {exc}")
+                    failed_files.append(file_path)
+                    continue
+                files_report.extend(lines)
+                found_overall |= found
+                replaces_total += replaces
+                if i == 0:
+                    found_in_copy = found
 
+            if failed_files:
+                any_file_failed = True
+                if len(failed_files) < len(files_to_process):
+                    any_file_ok = True
+                    files_report.append(
+                        "  - ВНИМАНИЕ: обновлены не все файлы (см. ошибки "
+                        "выше) — состояние файлов НЕконсистентно, повторите "
+                        "команду после устранения причины")
+            else:
+                any_file_ok = True
                 all_entities_count += replaces_total
                 # Честная пометка: значения, которых нет в копии (появились
                 # после анонимизации) — заменены только в файле результата
@@ -3160,14 +3302,29 @@ class RequestHandler:
                     if name in not_found_everywhere:
                         not_found_everywhere.remove(name)
                 copy_markers.append(f"[anonymizer:copy:{copy_path}]")
-            except Exception as exc:
-                logger.exception(
-                    "Ошибка дополнительной анонимизации %s", copy_path)
-                files_report.append(f"- {copy_path} — ОШИБКА: {exc}")
+
+        # Заголовок вычисляется из фактических результатов, а не пишется
+        # константой: иначе ошибки записи «прячутся» за словом «выполнена»
+        if any_file_failed and any_file_ok:
+            header = ("[ANONYMIZER] Дополнительная анонимизация выполнена "
+                      "ЧАСТИЧНО: часть файлов НЕ обновлена (см. ошибки "
+                      "ниже). Запрос в облако НЕ отправлялся.")
+        elif any_file_failed:
+            header = ("[ANONYMIZER] Дополнительная анонимизация НЕ "
+                      "ВЫПОЛНЕНА (см. ошибки ниже). Запрос в облако НЕ "
+                      "отправлялся.")
+        elif all_entities_count > 0:
+            header = ("[ANONYMIZER] Дополнительная анонимизация "
+                      "выполнена: указанные значения заменены "
+                      "плейсхолдерами. Запрос в облако НЕ отправлялся.")
+        else:
+            header = ("[ANONYMIZER] Дополнительная анонимизация "
+                      "завершена, но ни одно из указанных значений не "
+                      "найдено в файлах — замены не выполнялись. "
+                      "Запрос в облако НЕ отправлялся.")
 
         reply_lines = [
-            "[ANONYMIZER] Дополнительная анонимизация выполнена: указанные "
-            "имена заменены плейсхолдерами. Запрос в облако НЕ отправлялся.",
+            header,
             "",
             "Файлы:",
             *files_report,
@@ -3213,7 +3370,7 @@ class RequestHandler:
         (структура/таблицы сохраняются) рядом с оригиналом.
 
         create_review_md=False — не сохранять .md-предпросмотр (перехват в
-        passthrough-режиме: пользователь правит копию в исходном формате).
+        manual-режиме: пользователь правит копию в исходном формате).
 
         allow_reuse=False — не переиспользовать существующую копию, даже если
         исходник не менялся (используется в смешанных запросах, где часть

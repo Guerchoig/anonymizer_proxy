@@ -5,7 +5,7 @@
 (без python-docx скриптов): обзор структуры, dump/apply round-trip,
 точечные замены с сохранением форматирования, правка ячеек, добавление
 строк и столбцов (DOCX), значения и строки (XLSX), а также инъекцию
-«шпаргалки» office_ops в системный промпт passthrough-прокси.
+«шпаргалки» office_ops в системный промпт manual-прокси.
 
 Запуск: python anonymizer_proxy\\tests\\test_office_ops.py (из корня проекта)
 """
@@ -26,11 +26,11 @@ from openpyxl import Workbook, load_workbook
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import (
+from anonymizer_proxy.tests.test_tools_manual import (
     FakeNER, FakeStore, FakeOpenRouter,
 )
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 CLOUD_RESPONSE = {
     "id": "c-1", "created": 1, "model": "m",
@@ -266,7 +266,7 @@ def test_office_ops_hint_injection() -> None:
         assert msgs[0]["role"] == "system", msgs[0]["role"]
         assert "office_ops" in msgs[0]["content"], msgs[0]["content"][:200]
         assert "python -m anonymizer_proxy.office_ops" in msgs[0]["content"]
-        assert resp.anonymization_metadata["mode"] == "passthrough"
+        assert resp.anonymization_metadata["mode"] == "manual"
 
         tmp = tempfile.NamedTemporaryFile(
             suffix=".txt", delete=False, mode="w", encoding="utf-8")

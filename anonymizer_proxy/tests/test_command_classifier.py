@@ -96,8 +96,10 @@ def test_regex_rules() -> None:
 
     check("COMMAND_TRIGGER_RE: обычный запрос мимо префильтра",
           not COMMAND_TRIGGER_RE.search("сравни два файла и составь отчёт"))
-    check("COMMAND_TRIGGER_RE: «анонимизируй файл» мимо префильтра",
-          not COMMAND_TRIGGER_RE.search("анонимизируй файл отчет.docx"))
+    check("COMMAND_TRIGGER_RE: «скрой все данные» проходит префильтр",
+          bool(COMMAND_TRIGGER_RE.search("скрой все данные отчет.docx")))
+    check("COMMAND_TRIGGER_RE: «раскрой все данные» проходит префильтр",
+          bool(COMMAND_TRIGGER_RE.search("раскрой все данные")))
 
 
 # ==================== 2. GLiNER-слой ====================
@@ -201,7 +203,7 @@ async def test_resolve_chat_command() -> None:
             "[anonymizer:copy:C:/x/КП.anonymized.docx]\n"))]
         handler = make_handler(FakeGliner(error=RuntimeError("нет модели")))
         cmd = await handler.resolve_chat_command(make_request(
-            "деанонимизируй упомянутые файлы", history))
+            "раскрой все данные", history))
         check("GLiNER упала -> фоллбек deanon_files",
               bool(cmd) and cmd.get("command") == "deanon_files",
               f"получено {cmd}")
@@ -215,7 +217,7 @@ async def test_resolve_chat_command() -> None:
         # прокси не вмешивается в контент (контракт test_deanonymize_intercept)
         handler = make_handler(FakeGliner([]))
         cmd = await handler.resolve_chat_command(make_request(
-            "деанонимизируй упомянутые файлы", history, anonymize=False))
+            "раскрой все данные", history, anonymize=False))
         check("anonymize=false: контентная команда не перехватывается",
               cmd is None, f"получено {cmd}")
 

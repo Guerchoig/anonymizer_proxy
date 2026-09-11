@@ -46,6 +46,34 @@ def _cell_to_line(value) -> str:
     return _normalize_line(str(value))
 
 
+def _restore_cell_value(original, part: str):
+    """Значение для записи обратно в ячейку XLSX при сборке.
+
+    Если исходная ячейка была ЧИСЛОВОЙ (int/float, не bool/дата), а новый
+    текст парсится как число — записываем число, а не строку: иначе после
+    де-анонимизации суммы превращаются в текст («386887.422» строкой,
+    точка вместо локальной запятой, сортировка/формулы ломаются;
+    багрепорт 2026-09-10). Допускаются: разрядные пробелы, запятая как
+    десятичный разделитель и символы валют (₽/$/€/«руб.» — в том числе
+    от рендера «как в Excel», см. _render_numeric_cell).
+    Во всех остальных случаях возвращаем текст как есть."""
+    if isinstance(original, (int, float)) and not isinstance(original, bool):
+        cleaned = part.strip()
+        for ch in ("\u00A0", " ", "\u2009"):
+            cleaned = cleaned.replace(ch, "")
+        cleaned = re.sub(r"(?i)[₽$€¥£]|руб\w*|р\.", "", cleaned)
+        if cleaned:
+            normalized = cleaned.replace(",", ".")
+            try:
+                num = float(normalized)
+            except ValueError:
+                return part
+            if num.is_integer() and "." not in cleaned and "," not in cleaned:
+                return int(num)
+            return num
+    return part
+
+
 def _fmt_cell_value(value) -> str:
     """Значение ячейки Excel в читаемом виде (markdown, read-column).
 
@@ -65,6 +93,83 @@ def _fmt_cell_value(value) -> str:
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")
     return _normalize_line(re.sub(r"_x000D_", "", str(value)))
+
+
+# Символы валют в кодах форматов Excel: [$₽-419], \$, _₽, литералы
+# «руб»/«р.»; учётные (Accounting/«Финансовый») и денежные (Currency)
+# форматы — именно они обозначают суммы (см. справку Microsoft:
+# Accounting/Currency formats; коды вида _-* #,##0.00\ _₽_-)
+_CURRENCY_IN_FORMAT_RE = re.compile(
+    r"\[\$([^\]-]+)[^\]]*\]"       # [$€-407] / [$₽-419]
+    r"|\\([₽$€¥£])"                # \₽ (экранированный символ)
+    r"|(?<![0-9#])(₽|\$|€|¥|£)"    # одиночный символ
+    r"|\"((?:руб|р)\.?|руб\w*|RUB)\"",  # текстовый литерал «руб.»/"руб"
+)
+
+
+def _currency_from_format(fmt: str) -> str:
+    """Извлечь символ валюты из кода формата ячейки ('' — не денежный)."""
+    if not fmt:
+        return ""
+    m = _CURRENCY_IN_FORMAT_RE.search(fmt)
+    if not m:
+        return ""
+    return next(g for g in m.groups() if g)
+
+
+def _group_digits(int_part: str) -> str:
+    """Разрядная группировка целой части пробелами: 1586238 → 1 586 238."""
+    out = []
+    while len(int_part) > 3:
+        out.append(int_part[-3:])
+        int_part = int_part[:-3]
+    out.append(int_part)
+    return " ".join(reversed(out))
+
+
+def _render_numeric_cell(value, number_format: str) -> Optional[str]:
+    """Текстовое представление числовой ячейки «как в Excel».
+
+    Для ячеек с денежным (Accounting/«Финансовый», Currency) или
+    группированным форматом значение рендерится с разрядными пробелами,
+    запятой-разделителем и символом валюты: str(float) («1586238.422»)
+    не матчится ни одним MONEY-паттерном (нет ни группировки, ни валюты),
+    и такие суммы не анонимизируются (багрепорт 2026-09-11, формат
+    «Финансовый»: из 9 сумм скрылись только 2, пойманные GLiNER).
+    Returns None, если рендер к деньгам/группировке не применим."""
+    if isinstance(value, bool) or isinstance(value, (datetime, date)):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    fmt = (number_format or "").lower()
+    has_currency = bool(_currency_from_format(fmt))
+    has_grouping = "#,##" in fmt or "# ##" in fmt
+    if not (has_currency or has_grouping):
+        return None
+    negative = value < 0
+    s = repr(abs(value)) if isinstance(value, float) else str(abs(value))
+    if "e" in s or "E" in s:  # экспоненциальная запись — не рендерим
+        return None
+    int_part, _, frac_part = s.partition(".")
+    grouped = _group_digits(int_part)
+    text = f"{grouped},{frac_part}" if frac_part else grouped
+    if negative:
+        text = "-" + text
+    currency = _currency_from_format(fmt)
+    if currency:
+        text = f"{text} {currency}"
+    return text
+
+
+def _xlsx_cell_text(cell) -> str:
+    """Текст сегмента XLSX-ячейки: числа с денежным/группированным
+    форматом — «как в Excel» (см. _render_numeric_cell), остальное —
+    как раньше (_cell_to_line). Используется и в parse, и в assemble —
+    сравнение 1:1 остаётся консистентным."""
+    rendered = _render_numeric_cell(cell.value, cell.number_format or "")
+    if rendered is not None:
+        return rendered
+    return _cell_to_line(cell.value)
 
 
 def _rows_to_markdown(rows: list[list[str]]) -> str:
@@ -561,7 +666,7 @@ def _scrub_hyperlink_targets(docx_bytes: bytes) -> tuple[bytes, int]:
 # переиспользует копию ТОЛЬКО при совпадении версии — копии, созданные
 # другой версией парсера (например, до добавления поддержки вложенных
 # таблиц/комментариев), автоматически пересоздаются.
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 ANON_MARKER_PREFIX = "anonymizer_proxy/parser:"
 ANON_MARKER = ANON_MARKER_PREFIX + PARSER_VERSION
 
@@ -836,7 +941,7 @@ class FileParser:
             for row in ws.iter_rows():
                 row_values = []
                 for cell in row:
-                    cell_str = _cell_to_line(cell.value)
+                    cell_str = _xlsx_cell_text(cell)
                     if cell_str:
                         row_values.append(cell_str)
                         segments.append(cell_str)
@@ -1256,8 +1361,8 @@ class FileAssembler:
                 continue
             ws = wb[seg["sheet"]]
             cell = ws.cell(row=seg["row"], column=seg["col"])
-            if _cell_to_line(cell.value) != part:
-                cell.value = part
+            if _xlsx_cell_text(cell) != part:
+                cell.value = _restore_cell_value(cell.value, part)
 
         output = io.BytesIO()
         wb.save(output)

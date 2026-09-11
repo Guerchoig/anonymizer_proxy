@@ -1,13 +1,13 @@
 """
 Функциональные тесты авто-де-анонимизации файлов по естественной команде
-в passthrough-режиме («деанонимизируй упомянутые файлы»).
+в manual-режиме («раскрой все данные»).
 
 Проверяют, что когда в истории диалога есть маркер анонимизации
 ([anonymizer:result:<путь>] + session_id), а пользователь просит
 де-анонимизировать файлы:
 1. Де-анонимизируется ФАЙЛ РЕЗУЛЬТАТА (плейсхолдеры → реальные значения),
    облако НЕ вызывается; анонимизированная копия остаётся нетронутой.
-2. Без команды де-анонимизации — обычный passthrough.
+2. Без команды де-анонимизации — обычный manual.
 3. anonymize=false отключает перехват.
 4. Если файл результата не создан — информационное сообщение, без падения.
 
@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler, _result_path_for
-from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore, FakeOpenRouter
+from anonymizer_proxy.tests.test_tools_manual import FakeNER, FakeStore, FakeOpenRouter
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 CLOUD_RESPONSE = {
     "id": "c-1", "created": 1, "model": "m",
@@ -50,7 +50,7 @@ def make_handler(mappings=None):
 
 def make_history(copy_path, result_path, command, anonymize=True) -> ChatCompletionRequest:
     messages = [
-        ChatMessage(role="user", content="Анонимизируй приложенный файл"),
+        ChatMessage(role="user", content="Скрой все данные"),
         ChatMessage(role="assistant", content=(
             "[ANONYMIZER] Приложенные файлы анонимизированы локальной "
             "NER-моделью.\n\n"
@@ -92,7 +92,7 @@ async def test_deanonymize_result_file():
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
+            make_history(copy_path, result_path, "Раскрой все данные")
         )
         assert not handler.openrouter.captured, "облако вызвано"
         assert result_path.read_text(encoding="utf-8") == "Подписант: Иван Петров"
@@ -104,8 +104,55 @@ async def test_deanonymize_result_file():
         result_path.unlink(missing_ok=True)
 
 
-async def test_no_command_passthrough():
-    """Без команды де-анонимизации — обычный passthrough в облако"""
+async def test_literal_marker_hint_not_a_target():
+    """Регрессия 2026-09-10: литеральные маркеры из подсказки прокси
+    («[anonymizer:result:<путь>]» в старых ответах) не должны становиться
+    целями де-анонимизации — раньше они давали фантомную строку
+    «<путь> — ОШИБКА: файл не найден» при корректном результате."""
+    copy_path = make_copy_file()
+    result_path = make_result_file(copy_path)
+    try:
+        handler = make_handler()
+        # История как в реальном старом диалоге: блок [ANONYMIZER] с
+        # настоящими маркерами И подсказкой с литералом «<путь>»
+        messages = [
+            ChatMessage(role="user", content="Скрой все данные"),
+            ChatMessage(role="assistant", content=(
+                "[ANONYMIZER] Приложенные файлы анонимизированы локальной "
+                "NER-моделью.\n\n"
+                "session_id: sess-test\n\n"
+                "Файлы:\n"
+                f"- C:/orig.docx → {copy_path} (сущностей: 1)\n"
+                "  [anonymizer:done:C:/orig.docx]\n"
+                f"  [anonymizer:copy:{copy_path}]\n"
+                f"  [anonymizer:result:{result_path}]\n"
+                "Дальнейшие шаги:\n"
+                "3. ПЕРВАЯ правка — --file <копия> --output <результат> "
+                "(путь в маркере [anonymizer:result:<путь>] выше).\n"
+                "- [anonymizer:copy:<путь>] — путь к копии;\n"
+                "- [anonymizer:result:<путь>] — путь к файлу результата."
+            )),
+            ChatMessage(role="user", content="раскрой это PERSON_1"),
+        ]
+        req = ChatCompletionRequest(
+            model="m", anonymize=True, stream=False, messages=messages)
+        cmd = await handler.resolve_chat_command(req)
+        assert cmd["command"] == "deanon_placeholders", cmd
+        assert len(cmd["targets"]) == 1, cmd["targets"]
+        resp, _ = await handler.execute_chat_command(req, cmd)
+        text = resp.choices[0].message.content
+        assert "файл не найден" not in text, text
+        assert "<путь>" not in text, text
+        assert "ОК (восстановлено: 1)" in text, text
+        print("TEST 6 OK: литеральный «[anonymizer:result:<путь>]» из "
+              "подсказки не стал фантомной целью")
+    finally:
+        copy_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+
+async def test_no_command_manual():
+    """Без команды де-анонимизации — обычный manual в облако"""
     copy_path = make_copy_file()
     result_path = make_result_file(copy_path)
     try:
@@ -114,9 +161,9 @@ async def test_no_command_passthrough():
             make_history(copy_path, result_path, "Составь резюме")
         )
         assert handler.openrouter.captured, "облако не вызвано"
-        assert resp.anonymization_metadata["mode"] == "passthrough_deanonymized"
+        assert resp.anonymization_metadata["mode"] == "manual_deanonymized"
         assert result_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]"
-        print("TEST 2 OK: без команды — passthrough, файл результата не де-анонимизирован")
+        print("TEST 2 OK: без команды — manual, файл результата не де-анонимизирован")
     finally:
         copy_path.unlink(missing_ok=True)
         result_path.unlink(missing_ok=True)
@@ -129,10 +176,10 @@ async def test_anonymize_false_disables():
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(copy_path, result_path, "Деанонимизируй файлы", anonymize=False)
+            make_history(copy_path, result_path, "Раскрой все данные", anonymize=False)
         )
         assert handler.openrouter.captured, "облако не вызвано"
-        assert resp.anonymization_metadata["mode"] == "passthrough"
+        assert resp.anonymization_metadata["mode"] == "manual"
         assert result_path.read_text(encoding="utf-8") == "Подписант: [PERSON_1]"
         print("TEST 3 OK: anonymize=false — перехват де-анонимизации отключён")
     finally:
@@ -151,7 +198,7 @@ async def test_fallback_to_copy():
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
+            make_history(copy_path, result_path, "Раскрой все данные")
         )
         assert not handler.openrouter.captured, "облако вызвано"
         # fallback: копия НЕ тронута, результат — в отдельном файле
@@ -172,7 +219,7 @@ async def test_both_missing_note():
     try:
         handler = make_handler()
         resp, _ = await handler.handle_chat_completion(
-            make_history(copy_path, result_path, "Деанонимизируй упомянутые файлы")
+            make_history(copy_path, result_path, "Раскрой все данные")
         )
         assert not handler.openrouter.captured, "облако вызвано"
         assert "файл результата не найден" in resp.choices[0].message.content
@@ -183,10 +230,11 @@ async def test_both_missing_note():
 
 async def main():
     await test_deanonymize_result_file()
-    await test_no_command_passthrough()
+    await test_no_command_manual()
     await test_anonymize_false_disables()
     await test_fallback_to_copy()
     await test_both_missing_note()
+    await test_literal_marker_hint_not_a_target()
     print("\nALL DEANONYMIZE INTERCEPT TESTS PASSED")
 
 

@@ -81,9 +81,9 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[dict] = None
     # Дополнительные поля для управления анонимизацией
     anonymize: bool = Field(default=True, description="Включить анонимизацию")
-    mode: Literal["full", "passthrough"] = Field(
+    mode: Literal["full", "manual"] = Field(
         default=CURRENT_MODE, 
-        description="Режим: full - полная обработка (анонимизация → облако → де-анонимизация), passthrough - без анонимизации (явное управление)"
+        description="Режим: full - полная обработка (анонимизация → облако → де-анонимизация), manual - без анонимизации (явное управление)"
     )
 
 

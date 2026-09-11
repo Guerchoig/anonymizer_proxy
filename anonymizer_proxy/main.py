@@ -415,12 +415,12 @@ async def chat_completions(
                         "X-Accel-Buffering": "no",  # Для nginx
                     }
                 )
-            # Passthrough: anonymize=False или режим passthrough по умолчанию
-            if not chat_request.anonymize or CURRENT_MODE == Mode.PASSTHROUGH:
+            # Manual: anonymize=False или режим manual по умолчанию
+            if not chat_request.anonymize or CURRENT_MODE == Mode.MANUAL:
                 # Автоматическая анонимизация приложенных файлов по явной
-                # команде («Анонимизируй файл…») — локальной NER-моделью,
+                # команде («Скрой все данные…») — локальной NER-моделью,
                 # без облака. Явное anonymize=false отключает и перехват.
-                if chat_request.anonymize and CURRENT_MODE == Mode.PASSTHROUGH:
+                if chat_request.anonymize and CURRENT_MODE == Mode.MANUAL:
                     file_paths = request_handler.detect_attached_files_anonymization(
                         chat_request
                     )
@@ -455,7 +455,7 @@ async def chat_completions(
                             }
                         )
                 return StreamingResponse(
-                    request_handler.stream_passthrough(chat_request),
+                    request_handler.stream_manual(chat_request),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",

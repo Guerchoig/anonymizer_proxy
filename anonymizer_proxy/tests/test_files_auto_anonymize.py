@@ -1,14 +1,14 @@
 """
 Функциональные тесты автоматической анонимизации приложенных файлов
-в passthrough-режиме («Анонимизируй приложенный файл…»).
+в manual-режиме («Скрой все данные…»).
 
-Проверяют, что в passthrough-режиме запрос с командой анонимизации и блоком
+Проверяют, что в manual-режиме запрос с командой анонимизации и блоком
 <file_content path="...">:
 1. Перехватывается прокси: файл анонимизируется локальной NER-моделью,
    в облако запрос НЕ уходит, создаётся копия <name>.anonymized.<ext>.
 2. Ответ содержит session_id, пути к копии/review и маркер
    [anonymizer:done:<путь>].
-3. Запрос без команды анонимизации идёт в облако как обычно (passthrough).
+3. Запрос без команды анонимизации идёт в облако как обычно (manual).
 4. Запрос с командой, но без файлов идёт в облако (нечего анонимизировать).
 5. Повторный запрос в том же диалоге (маркер done в истории) НЕ
    перехватывается — защита от зацикливания агента.
@@ -30,13 +30,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import (
+from anonymizer_proxy.tests.test_tools_manual import (
     FakeNER, FakeStore, FakeOpenRouter,
 )
 
-# Перехват активен только в passthrough-режиме — фиксируем его детерминированно,
+# Перехват активен только в manual-режиме — фиксируем его детерминированно,
 # независимо от ANONYMIZER_MODE в .env
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 PII = {"Иван Петров": "PERSON", "+7-900-111-22-33": "PHONE"}
 FILE_TEXT = "Договор подготовил Иван Петров, телефон +7-900-111-22-33."
@@ -86,7 +86,7 @@ def make_file_block(path: Path) -> str:
 async def test_no_reintercept_after_deanon_new_task():
     """Регрессия багрепорта: новая задача после де-анонимизации идёт в облако.
 
-    Команда «анонимизируй» остаётся в истории диалога, а у файла результата
+    Команда «скрой все данные» остаётся в истории диалога, а у файла результата
     (<name>.result.<ext>) никогда не было маркера done. Прежний поиск интента
     по ВСЕЙ истории ложно перехватывал запрос «Сравни два файла…» и повторно
     анонимизировал файлы вместо отправки в облако.
@@ -105,12 +105,12 @@ async def test_no_reintercept_after_deanon_new_task():
     try:
         handler = make_handler(cloud_response=cloud_response)
 
-        # Шаг 1: «Анонимизируй файл» → перехват, копия создана
+        # Шаг 1: «Скрой все данные» → перехват, копия создана
         req1 = ChatCompletionRequest(
             model="m", anonymize=True, stream=False,
             messages=[ChatMessage(
                 role="user",
-                content=f"Анонимизируй приложенный файл\n\n{make_file_block(orig)}",
+                content=f"Скрой все данные\n\n{make_file_block(orig)}",
             )],
         )
         resp1, _ = await handler.handle_chat_completion(req1)
@@ -127,7 +127,7 @@ async def test_no_reintercept_after_deanon_new_task():
         # Шаг 2: де-анонимизация упомянутых файлов → перехват де-анонимизации
         history2 = list(req1.messages) + [
             ChatMessage(role="assistant", content=answer1),
-            ChatMessage(role="user", content="деанонимизируй упомянутые файлы"),
+            ChatMessage(role="user", content="раскрой все данные"),
         ]
         req2 = ChatCompletionRequest(model="m", anonymize=True, stream=False,
                                      messages=history2)
@@ -153,7 +153,7 @@ async def test_no_reintercept_after_deanon_new_task():
         resp3, _ = await handler.handle_chat_completion(req3)
         assert handler.openrouter.captured, "новая задача не отправлена в облако"
         meta = resp3.anonymization_metadata
-        assert meta["mode"] == "passthrough_deanonymized", meta
+        assert meta["mode"] == "manual_deanonymized", meta
         # Файлы НЕ переанонимизированы: анонимизированная копия ровно одна
         # (от шага 1), копии у файла результата не появилось
         anon_copies = list(orig.parent.glob(f"{orig.stem}*.anonymized*"))
@@ -183,7 +183,7 @@ async def test_done_marker_matches_other_path_spellings():
                 messages=[
                     ChatMessage(role="assistant", content=markers_text),
                     ChatMessage(role="user", content=(
-                        f"Анонимизируй этот файл ещё раз\n\n{make_file_block(path)}"
+                        f"Скрой все данные этот файл ещё раз\n\n{make_file_block(path)}"
                     )),
                 ],
             )
@@ -220,7 +220,7 @@ async def test_intercept_anonymizes_file_no_cloud():
     try:
         handler = make_handler()
         resp, sid = await handler.handle_chat_completion(
-            make_request(path, "Анонимизируй приложенный файл и составь его резюме")
+            make_request(path, "Скрой все данные и составь его резюме")
         )
 
         # Облако НЕ вызывалось
@@ -250,7 +250,7 @@ async def test_intercept_anonymizes_file_no_cloud():
 
 
 async def test_no_intent_goes_to_cloud():
-    """Без команды анонимизации запрос с файлом идёт в облако (passthrough)"""
+    """Без команды анонимизации запрос с файлом идёт в облако (manual)"""
     path = make_txt_file()
     try:
         handler = make_handler(cloud_response={
@@ -266,9 +266,9 @@ async def test_no_intent_goes_to_cloud():
             make_request(path, "Составь резюме приложенного файла")
         )
         assert handler.openrouter.captured, "облако не вызвано"
-        assert resp.anonymization_metadata["mode"] == "passthrough"
+        assert resp.anonymization_metadata["mode"] == "manual"
         assert not path.with_name(f"{path.stem}.anonymized{path.suffix}").exists()
-        print("TEST 2 OK: без интента — обычный passthrough в облако")
+        print("TEST 2 OK: без интента — обычный manual в облако")
     finally:
         path.unlink(missing_ok=True)
 
@@ -288,12 +288,12 @@ async def test_intent_without_file_goes_to_cloud():
         model="m",
         anonymize=True,
         stream=False,
-        messages=[ChatMessage(role="user", content="Анонимизируй этот текст")],
+        messages=[ChatMessage(role="user", content="Скрой все данные этот текст")],
     )
     resp, _ = await handler.handle_chat_completion(request)
     assert handler.openrouter.captured, "облако не вызвано"
-    assert resp.anonymization_metadata["mode"] == "passthrough"
-    print("TEST 3 OK: интент без файла — passthrough в облако")
+    assert resp.anonymization_metadata["mode"] == "manual"
+    print("TEST 3 OK: интент без файла — manual в облако")
 
 
 async def test_done_marker_prevents_reinterception():
@@ -309,7 +309,7 @@ async def test_done_marker_prevents_reinterception():
             }],
             "usage": {},
         })
-        first = make_request(path, "Анонимизируй приложенный файл")
+        first = make_request(path, "Скрой все данные")
         resp1, _ = await handler.handle_chat_completion(first)
         assert not handler.openrouter.captured, "первый запрос ушёл в облако"
 
@@ -326,7 +326,7 @@ async def test_done_marker_prevents_reinterception():
         assert handler.openrouter.captured, "второй запрос не ушёл в облако"
         # Повторного перехвата нет (облако вызвано), но текст ответа теперь
         # де-анонимизируется выборочно по сессии из истории диалога
-        assert resp2.anonymization_metadata["mode"] == "passthrough_deanonymized"
+        assert resp2.anonymization_metadata["mode"] == "manual_deanonymized"
         print("TEST 4 OK: маркер done — повторного перехвата нет (облако вызвано)")
     finally:
         path.unlink(missing_ok=True)
@@ -339,7 +339,7 @@ async def test_stream_variant():
     anon_path = None
     try:
         handler = make_handler()
-        request = make_request(path, "Анонимизируй приложенный файл")
+        request = make_request(path, "Скрой все данные")
         request.stream = True
 
         file_paths = handler.detect_attached_files_anonymization(request)
@@ -389,10 +389,10 @@ async def test_anonymize_false_disables_intercept():
             "usage": {},
         })
         resp, _ = await handler.handle_chat_completion(
-            make_request(path, "Анонимизируй приложенный файл", anonymize=False)
+            make_request(path, "Скрой все данные", anonymize=False)
         )
         assert handler.openrouter.captured, "облако не вызвано"
-        assert resp.anonymization_metadata["mode"] == "passthrough"
+        assert resp.anonymization_metadata["mode"] == "manual"
         assert not path.with_name(f"{path.stem}.anonymized{path.suffix}").exists()
         print("TEST 6 OK: anonymize=false — перехват отключён, облако вызвано")
     finally:
@@ -414,7 +414,7 @@ async def test_hermes_file_ref_intercepted():
     path = make_txt_file()
     try:
         handler = make_handler()
-        request = make_hermes_request(path, "анонимизируй приложенный файл")
+        request = make_hermes_request(path, "скрой все данные")
         file_paths = handler.detect_attached_files_anonymization(request)
         assert file_paths == [str(path)], file_paths
 
@@ -445,7 +445,7 @@ async def test_hermes_relative_path_resolved_from_home():
             return
         rel = path.relative_to(home)
         handler = make_handler()
-        request = make_hermes_request(rel, "анонимизируй приложенный файл")
+        request = make_hermes_request(rel, "скрой все данные")
         file_paths = handler.detect_attached_files_anonymization(request)
         assert file_paths == [str(path.resolve())], file_paths
         print("TEST 10 OK: относительный @file-путь резолвится от домашней папки")
@@ -454,7 +454,7 @@ async def test_hermes_relative_path_resolved_from_home():
 
 
 async def test_plain_path_mention_intercepted():
-    """Файл, указанный простым путём в тексте («анонимизируй файл <путь>»),
+    """Файл, указанный простым путём в тексте («скрой все данные <путь>»),
     перехватывается так же, как @file: и <file_content>"""
     path = make_txt_file()
     try:
@@ -463,7 +463,7 @@ async def test_plain_path_mention_intercepted():
             model="m", anonymize=True, stream=False,
             messages=[ChatMessage(
                 role="user",
-                content=f"анонимизируй файл {path}, он мне нужен",
+                content=f"скрой все данные {path}, он мне нужен",
             )],
         )
         file_paths = handler.detect_attached_files_anonymization(request)
@@ -490,7 +490,7 @@ async def test_path_mention_with_punctuation():
             model="m", anonymize=True, stream=False,
             messages=[ChatMessage(
                 role="user",
-                content=f'анонимизируй файл "{path}".',
+                content=f'скрой все данные "{path}".',
             )],
         )
         file_paths = handler.detect_attached_files_anonymization(request)
@@ -502,7 +502,7 @@ async def test_path_mention_with_punctuation():
 
 async def test_nonexistent_path_not_intercepted():
     """Упоминание несуществующего файла не перехватывает запрос — он идёт
-    в облако как обычный passthrough"""
+    в облако как обычный manual"""
     handler = make_handler(cloud_response={
         "id": "c-1", "created": 1, "model": "m",
         "choices": [{
@@ -516,14 +516,14 @@ async def test_nonexistent_path_not_intercepted():
         model="m", anonymize=True, stream=False,
         messages=[ChatMessage(
             role="user",
-            content=r"анонимизируй файл C:\нет\такого\файла.docx",
+            content=r"скрой все данные C:\нет\такого\файла.docx",
         )],
     )
     assert handler.detect_attached_files_anonymization(request) == []
     resp, _ = await handler.handle_chat_completion(request)
     assert handler.openrouter.captured, "облако не вызвано"
-    assert resp.anonymization_metadata["mode"] == "passthrough"
-    print("TEST 13 OK: несуществующий путь — passthrough в облако")
+    assert resp.anonymization_metadata["mode"] == "manual"
+    print("TEST 13 OK: несуществующий путь — manual в облако")
 
 
 async def test_hermes_backticked_attachments_system_prompt_excluded():
@@ -569,7 +569,7 @@ async def test_hermes_backticked_attachments_system_prompt_excluded():
             f"📎 @file:`{r.as_posix()}` — binary file. It is available on "
             f"disk at `{p}`."
             for r, p in zip(rels, attachments))
-        user_text = (f"{refs}\n\nанонимизируй приложенные файлы\n\n"
+        user_text = (f"{refs}\n\nскрой все данные приложенные файлы\n\n"
                      f"--- Attached Context ---\n\n{context}")
         system_prompt = (
             "## AGENTS.md\nправила из AGENTS.md (C:\\Test\\anonymizer_proxy)\n"
@@ -626,7 +626,7 @@ async def test_office_lock_file_skipped():
         request = ChatCompletionRequest(
             model="m", anonymize=True, stream=False,
             messages=[ChatMessage(role="user", content=(
-                f"анонимизируй файл\n\n"
+                f"скрой все данные\n\n"
                 f"It is available on disk at `{lock}`"
             ))],
         )
@@ -654,7 +654,7 @@ async def test_bad_zip_file_reported_not_fatal():
             ChatCompletionRequest(
                 model="m", anonymize=True, stream=False,
                 messages=[ChatMessage(role="user",
-                                      content="анонимизируй файл")],
+                                      content="скрой все данные")],
             ),
             [str(bad), str(good)],
         )
@@ -686,7 +686,7 @@ async def test_duplicate_requests_coalesce():
     несколько одинаковых сообщений «файл анонимизирован», а прокси молотил
     впустую десятки секунд.
     """
-    from anonymizer_proxy.tests.test_tools_passthrough import (
+    from anonymizer_proxy.tests.test_tools_manual import (
         FakeOpenRouter, FakeStore,
     )
 
@@ -709,7 +709,7 @@ async def test_duplicate_requests_coalesce():
     try:
         req = ChatCompletionRequest(
             model="m", anonymize=True, stream=False,
-            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+            messages=[ChatMessage(role="user", content="скрой все данные")],
         )
         # Основной запрос + «вспомогательный» с другой сессией — одновременно
         r_main, r_title = await asyncio.gather(
@@ -745,7 +745,7 @@ async def test_rerun_reuses_unchanged_original():
         handler = make_handler()
         req = ChatCompletionRequest(
             model="m", anonymize=True, stream=False,
-            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+            messages=[ChatMessage(role="user", content="скрой все данные")],
         )
         first = await handler.prepare_files_anonymization(
             req, [str(path)], session_id="s1")
@@ -787,7 +787,7 @@ async def test_modified_original_reanonymized():
         handler = make_handler()
         req = ChatCompletionRequest(
             model="m", anonymize=True, stream=False,
-            messages=[ChatMessage(role="user", content="анонимизируй файл")],
+            messages=[ChatMessage(role="user", content="скрой все данные")],
         )
         first = await handler.prepare_files_anonymization(
             req, [str(path)], session_id="s1")

@@ -11,7 +11,7 @@
 4. Стриминг: аргументы tool_calls де-анонимизируются с буферизацией
    разорванных плейсхолдеров.
 
-Запуск: python anonymizer_proxy\\tests\\test_tools_passthrough.py (из корня проекта)
+Запуск: python anonymizer_proxy\\tests\\test_tools_manual.py (из корня проекта)
 """
 import asyncio
 import json

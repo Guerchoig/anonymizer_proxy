@@ -1,6 +1,6 @@
 """
 Функциональные тесты извлечения содержимого анонимизированных копий
-в passthrough-режиме.
+в manual-режиме.
 
 Проверяют, что когда клиент (Cline) не смог прочитать бинарный файл и
 прислал заглушку «Error fetching content» в <file_content path="...">:
@@ -8,9 +8,9 @@
    локальный файл и подставляет извлечённый текст — облако получает
    анонимизированное содержимое.
 2. Обычный (не анонимизированный) файл НЕ трогается — заглушка уходит в
-   облако как есть (контракт passthrough).
+   облако как есть (контракт manual).
 
-Запуск: python anonymizer_proxy\\tests\\test_passthrough_anonymized_extract.py
+Запуск: python anonymizer_proxy\\tests\\test_manual_anonymized_extract.py
 """
 import asyncio
 import sys
@@ -22,9 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore, FakeOpenRouter
+from anonymizer_proxy.tests.test_tools_manual import FakeNER, FakeStore, FakeOpenRouter
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 CLOUD_RESPONSE = {
     "id": "c-1", "created": 1, "model": "m",
@@ -78,7 +78,7 @@ async def test_extracts_anonymized_copy():
 
 
 async def test_does_not_extract_plain_file():
-    """Обычный файл: заглушка остаётся как есть (passthrough-контракт)"""
+    """Обычный файл: заглушка остаётся как есть (manual-контракт)"""
     tmp = tempfile.NamedTemporaryFile(
         suffix=".txt", delete=False, mode="w", encoding="utf-8"
     )
@@ -121,7 +121,7 @@ async def test_stream_extracts_anonymized_copy():
         request = make_request(path)
         request.stream = True
         out = []
-        async for chunk in handler.stream_passthrough(request):
+        async for chunk in handler.stream_manual(request):
             out.append(chunk)
         sent = handler.openrouter.captured["messages"][0]["content"]
         assert "Договор с [PERSON_1]" in sent, sent

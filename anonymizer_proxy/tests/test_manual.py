@@ -1,13 +1,13 @@
 """
-Функциональные тесты passthrough-режима (anonymize=False).
+Функциональные тесты manual-режима (anonymize=False).
 
 Проверяют, что при anonymize=False:
 1. NER/анонимизация не вызываются.
 2. В облако уходят ОРИГИНАЛЬНЫЕ сообщения (без плейсхолдеров).
 3. Ответ возвращается как есть (без де-анонимизации).
-4. Метаданные указывают mode="passthrough".
+4. Метаданные указывают mode="manual".
 
-Запуск: python anonymizer_proxy\\tests\\test_passthrough.py (из корня проекта)
+Запуск: python anonymizer_proxy\\tests\\test_manual.py (из корня проекта)
 """
 import asyncio
 import sys
@@ -17,11 +17,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import FakeStore, FakeOpenRouter
+from anonymizer_proxy.tests.test_tools_manual import FakeStore, FakeOpenRouter
 
 
 class CountingNER:
-    """NER, который только считает вызовы (passthrough не должен его звать)"""
+    """NER, который только считает вызовы (manual не должен его звать)"""
 
     def __init__(self):
         self.calls = 0
@@ -39,7 +39,7 @@ def make_handler(ner, response=None, stream_chunks=None):
     )
 
 
-async def test_passthrough_no_stream():
+async def test_manual_no_stream():
     ner = CountingNER()
     handler = make_handler(
         ner,
@@ -68,11 +68,11 @@ async def test_passthrough_no_stream():
     assert sent[0]["content"] == "Проверь документ от Ивана Петрова", sent
     # Ответ НЕ де-анонимизирован
     assert resp.choices[0].message.content == "Ответ про [PERSON_1]"
-    assert resp.anonymization_metadata["mode"] == "passthrough"
-    print("TEST 1 OK: passthrough non-stream — без NER/анонимизации/де-анонимизации")
+    assert resp.anonymization_metadata["mode"] == "manual"
+    print("TEST 1 OK: manual non-stream — без NER/анонимизации/де-анонимизации")
 
 
-async def test_passthrough_stream():
+async def test_manual_stream():
     ner = CountingNER()
     stream_chunks = [
         {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
@@ -91,20 +91,20 @@ async def test_passthrough_stream():
     )
 
     out = []
-    async for chunk in handler.stream_passthrough(request):
+    async for chunk in handler.stream_manual(request):
         out.append(chunk)
 
     assert ner.calls == 0, f"NER вызван {ner.calls} раз"
     sent = handler.openrouter.captured["messages"]
     assert sent[0]["content"] == "Ивана Петрова", sent
     assert any("[DONE]" in c for c in out), out
-    print("TEST 2 OK: passthrough stream — без NER/анонимизации")
+    print("TEST 2 OK: manual stream — без NER/анонимизации")
 
 
 async def main():
-    await test_passthrough_no_stream()
-    await test_passthrough_stream()
-    print("\nALL PASSTHROUGH TESTS PASSED")
+    await test_manual_no_stream()
+    await test_manual_stream()
+    print("\nALL MANUAL TESTS PASSED")
 
 
 if __name__ == "__main__":

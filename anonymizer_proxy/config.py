@@ -207,19 +207,26 @@ STORAGE = {
 # Режимы работы
 class Mode:
     FULL = "full"                      # Полная обработка: анонимизация → облако → де-анонимизация
-    PASSTHROUGH = "passthrough"        # Passthrough (без анонимизации): явная схема управления
-    
-# Значение ANONYMIZER_MODE нормализуется: допустимы full и passthrough.
-# Устаревший режим anonymize_only удалён (v1.10.0): если он остался в чьём-то
-# .env, используется passthrough с предупреждением в логе (прокси не падает).
-_CURRENT_MODE_ENV = os.getenv("ANONYMIZER_MODE", Mode.PASSTHROUGH)
-if _CURRENT_MODE_ENV in (Mode.FULL, Mode.PASSTHROUGH):
+    MANUAL = "manual"                  # Manual (ручное управление): анонимизация только по командам в чате
+
+# Значение ANONYMIZER_MODE нормализуется: допустимы full и manual.
+# Устаревшие значения не падают (прокси не падает на чужих .env):
+# - anonymize_only удалён (v1.10.0);
+# - passthrough переименован в manual (v1.12.0) — берётся manual с
+#   предупреждением в логе.
+_CURRENT_MODE_ENV = os.getenv("ANONYMIZER_MODE", Mode.MANUAL)
+if _CURRENT_MODE_ENV == "passthrough":
+    logger.warning(
+        "ANONYMIZER_MODE=passthrough устарело (режим переименован в manual) — "
+        "обновите .env; используется manual")
+    _CURRENT_MODE_ENV = Mode.MANUAL
+if _CURRENT_MODE_ENV in (Mode.FULL, Mode.MANUAL):
     CURRENT_MODE = _CURRENT_MODE_ENV
 else:
     logger.warning(
-        "ANONYMIZER_MODE=%s не поддерживается (режим anonymize_only удалён) — "
-        "используется passthrough", _CURRENT_MODE_ENV)
-    CURRENT_MODE = Mode.PASSTHROUGH
+        "ANONYMIZER_MODE=%s не поддерживается — "
+        "используется manual", _CURRENT_MODE_ENV)
+    CURRENT_MODE = Mode.MANUAL
 
 # ==================== Локальная LLM (LM Studio) ====================
 # LM Studio поднимает OpenAI-совместимый сервер (по умолчанию
@@ -330,7 +337,7 @@ def save_runtime_state() -> None:
 # FastAPI-приложении и баннере при старте). Увеличивайте при изменениях
 # кода: Python не перезагружает код в работающем сервере, и по /health
 # можно понять, выполняет ли процесс актуальную версию.
-PROXY_VERSION = "1.13.0"
+PROXY_VERSION = "1.14.0"
 
 # Категории PII для детекции
 PII_CATEGORIES = {
@@ -349,10 +356,10 @@ PII_CATEGORIES = {
     "MONEY": "Суммы денег",
 }
 
-# Типы плейсхолдеров, допустимые в командах («деанонимизируй плейсхолдеры…»,
-# замены при «дополнительно анонимизируй…»): PII_CATEGORIES + MISC —
+# Типы плейсхолдеров, допустимые в командах («Раскрой эти данные…»,
+# замены при «Скрой эти данные…»): PII_CATEGORIES + MISC —
 # произвольные строки (номера, даты и т.п.), заменяемые вручную командой
-# дополнительной анонимизации. MISC сознательно НЕ добавлен в метки NER
+# точечной анонимизации. MISC сознательно НЕ добавлен в метки NER
 # (PII_CATEGORIES), чтобы не менять поведение GLiNER.
 PLACEHOLDER_TYPES = {
     **PII_CATEGORIES,

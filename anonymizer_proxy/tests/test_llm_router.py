@@ -28,11 +28,11 @@ from anonymizer_proxy.proxy.llm_router import (
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import (
+from anonymizer_proxy.tests.test_tools_manual import (
     FakeNER, FakeStore, FakeOpenRouter,
 )
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 CLOUD_RESPONSE = {
     "id": "c-1", "created": 1, "model": "m",
@@ -196,7 +196,7 @@ def test_command_detection():
 
 def test_local_backend_skips_file_anon():
     """На локальном бэкенде авто-анонимизация файлов отключена:
-    запрос с файлом и командой «анонимизируй» уходит в локальную модель"""
+    запрос с файлом и командой «скрой все данные» уходит в локальную модель"""
     import tempfile
 
     def make_txt_file() -> Path:
@@ -208,7 +208,7 @@ def test_local_backend_skips_file_anon():
 
     def make_request(path: Path) -> ChatCompletionRequest:
         content = (
-            "Анонимизируй приложенный файл\n\n"
+            "Скрой все данные\n\n"
             f'<file_content path="{path}">\n'
             "Error fetching content: binary file\n"
             "</file_content>"

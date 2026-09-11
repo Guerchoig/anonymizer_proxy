@@ -3,8 +3,8 @@
 без моделей и сети.
 
 Команды используют канонические формулировки с перечислениями:
-- «дополнительно анонимизируй: Иванов, Петрова» — parse_name_list;
-- «деанонимизируй плейсхолдеры PERSON_1, PERSON_3–PERSON_5» —
+- «Скрой эти данные: Иванов, Петрова» — parse_name_list;
+- «Раскрой эти данные PERSON_1, PERSON_3–PERSON_5» —
   parse_placeholder_spec (списки и диапазоны, в т.ч. «PERSON_3–5» и
   «с PERSON_3 по PERSON_5»).
 
@@ -116,6 +116,12 @@ def is_name_like(item: str) -> bool:
     return bool(_NAME_ITEM_RE.match(item))
 
 
+# Число-подобный элемент списка: целая часть с разрядными пробелами или
+# без, десятичная часть отделена запятой (для склейки «386887»+«42»)
+_INT_LIKE_RE = re.compile(r"\d{1,3}(?:[ \u00A0]\d{3})*|\d+")
+_SHORT_NUM_RE = re.compile(r"\d{1,3}")
+
+
 def parse_name_list(segment: str) -> Tuple[List[str], List[str]]:
     """Разобрать перечень значений из текста ПОСЛЕ команды.
 
@@ -128,6 +134,12 @@ def parse_name_list(segment: str) -> Tuple[List[str], List[str]]:
     имя человека, номер договора «0095/23/2.1/00075271/013/2023», дату
     «27.12.2023» и т.п. — пользователь сам решает, что анонимизировать
     (багрепорт 2026-09-09: номера/даты ошибочно отвергались как «не имена»).
+
+    Десятичные числа, разорванные разделителем списка, склеиваются:
+    «386887,42, 51903,14» → [«386887,42», «51903,14»], а не четыре
+    значения (багрепорт 2026-09-10: суммы колонки XLSX анонимизировались
+    частично — «386887.[MISC_5]»). Для неоднозначных списков
+    («386887, 42» — два отдельных значения) используйте «;».
 
     Returns:
         (names, errors): names — значения без дубликатов (регистронезависимо);
@@ -142,15 +154,36 @@ def parse_name_list(segment: str) -> Tuple[List[str], List[str]]:
         else:
             break
     cleaned = cleaned.lstrip(" \t:;—–-")
+
+    def _strip_item(raw_item: str) -> str:
+        item = raw_item.strip(" \t\r\n«»\"'`")
+        # Ведущая пунктуация после слова команды («скрой эти данные: Иванов»)
+        return item.lstrip(":;—–-").strip(" \t")
+
+    # Склейка разорванных десятичных чисел: «386887» + «42» → «386887,42».
+    # Только внутри группы, разделённой запятыми/«и»: «;» и перенос строки —
+    # явные границы, ими пользователь задаёт неоднозначные списки
+    # («386887; 42» — два отдельных значения)
+    merged: List[str] = []
+    for group in re.split(r";|\n", cleaned):
+        group_items: List[str] = []
+        for raw_item in re.split(r",|\s+и\s+", group):
+            item = _strip_item(raw_item)
+            if item:
+                group_items.append(item)
+        group_merged: List[str] = []
+        for item in group_items:
+            if (group_merged and _SHORT_NUM_RE.fullmatch(item)
+                    and _INT_LIKE_RE.fullmatch(group_merged[-1])):
+                group_merged[-1] = group_merged[-1] + "," + item
+                continue
+            group_merged.append(item)
+        merged.extend(group_merged)
+
     names: List[str] = []
     errors: List[str] = []
     seen: set = set()
-    for raw_item in _ITEM_SPLIT_RE.split(cleaned):
-        item = raw_item.strip(" \t\r\n«»\"'`")
-        # Ведущая пунктуация после слова команды («анонимизируй: Иванов»)
-        item = item.lstrip(":;—–-").strip(" \t")
-        if not item:
-            continue
+    for item in merged:
         if (len(item) < 2 or len(item) > 100
                 or len(item.split()) > 8
                 or not _HAS_ALNUM_RE.search(item)):

@@ -1,12 +1,12 @@
 """
-Функциональные тесты выборочной де-анонимизации в passthrough-режиме.
+Функциональные тесты выборочной де-анонимизации в manual-режиме.
 
 Проверяют, что когда в истории диалога есть маркер анонимизации
 ([ANONYMIZER] + session_id: ...), прокси де-анонимизирует ТОЛЬКО текстовое
 содержимое ответа (message.content / delta.content), а аргументы tool_calls
 остаются с плейсхолдерами (модель правит анонимизированную копию).
 
-Запуск: python anonymizer_proxy\\tests\\test_passthrough_selective_deanon.py
+Запуск: python anonymizer_proxy\\tests\\test_manual_selective_deanon.py
 """
 import asyncio
 import json
@@ -18,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
-from anonymizer_proxy.tests.test_tools_passthrough import FakeNER, FakeStore, FakeOpenRouter
+from anonymizer_proxy.tests.test_tools_manual import FakeNER, FakeStore, FakeOpenRouter
 
-handlers_module.CURRENT_MODE = "passthrough"
+handlers_module.CURRENT_MODE = "manual"
 
 
 def make_handler(store, response=None, stream_chunks=None):
@@ -40,7 +40,7 @@ def make_store(mappings=None):
 def history_with_anonymizer() -> list[ChatMessage]:
     """Диалог, в котором файл уже был анонимизирован (ответ перехвата)."""
     return [
-        ChatMessage(role="user", content="Анонимизируй приложенный файл"),
+        ChatMessage(role="user", content="Скрой все данные"),
         ChatMessage(
             role="assistant",
             content=(
@@ -93,7 +93,7 @@ async def test_content_deanonymized_tool_calls_not():
     # tool_calls НЕ тронуты — плейсхолдеры остались
     args = json.loads(msg.tool_calls[0]["function"]["arguments"])
     assert args["content"] == "Подписант [PERSON_1]", args["content"]
-    assert resp.anonymization_metadata["mode"] == "passthrough_deanonymized"
+    assert resp.anonymization_metadata["mode"] == "manual_deanonymized"
     assert resp.anonymization_metadata["sessions"] == ["sess-test"]
     print("TEST 1 OK: content де-анонимизирован, tool_calls с плейсхолдерами")
 
@@ -120,7 +120,7 @@ async def test_stream_content_deanonymized_tool_calls_not():
     )
 
     out = []
-    async for chunk in handler.stream_passthrough(request):
+    async for chunk in handler.stream_manual(request):
         out.append(chunk)
 
     assert any("[DONE]" in c for c in out), out
@@ -144,8 +144,8 @@ async def test_stream_content_deanonymized_tool_calls_not():
     print("TEST 2 OK: стрим — content де-анонимизирован, tool_calls с плейсхолдерами")
 
 
-async def test_no_marker_passthrough_unchanged():
-    """Без маркера анонимизации — обычный passthrough (без де-анонимизации)"""
+async def test_no_marker_manual_unchanged():
+    """Без маркера анонимизации — обычный manual (без де-анонимизации)"""
     store = make_store({"[PERSON_1]": "Иван Петров"})
     handler = make_handler(store, response={
         "id": "c-1", "created": 1, "model": "m",
@@ -162,14 +162,14 @@ async def test_no_marker_passthrough_unchanged():
     )
     resp, _ = await handler.handle_chat_completion(request)
     assert resp.choices[0].message.content == "Ответ про [PERSON_1]"
-    assert resp.anonymization_metadata["mode"] == "passthrough"
-    print("TEST 3 OK: без маркера — обычный passthrough, без де-анонимизации")
+    assert resp.anonymization_metadata["mode"] == "manual"
+    print("TEST 3 OK: без маркера — обычный manual, без де-анонимизации")
 
 
 async def main():
     await test_content_deanonymized_tool_calls_not()
     await test_stream_content_deanonymized_tool_calls_not()
-    await test_no_marker_passthrough_unchanged()
+    await test_no_marker_manual_unchanged()
     print("\nALL SELECTIVE DEANON TESTS PASSED")
 
 
