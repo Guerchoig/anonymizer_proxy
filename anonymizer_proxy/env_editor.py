@@ -41,7 +41,6 @@ class EnvEditorError(ValueError):
 INT_KEYS: dict[str, tuple[int, int]] = {
     "PROXY_PORT": (1, 65535),
     "LOCAL_LLM_TIMEOUT": (1, 3600),
-    "LOCAL_LLM_MIN_MAX_TOKENS": (256, 1_000_000),
 }
 CHOICE_KEYS: dict[str, list[str]] = {}
 
@@ -110,8 +109,6 @@ def schema() -> list[dict]:
          "is_secret": True},
         {"key": "LOCAL_LLM_TIMEOUT", "group": "Локальная модель (LM Studio)",
          "description": "Таймаут запроса, сек", "is_secret": False},
-        {"key": "LOCAL_LLM_MIN_MAX_TOKENS", "group": "Локальная модель (LM Studio)",
-         "description": "Минимальный бюджет выходных токенов", "is_secret": False},
 
         {"key": "PROXY_HOST", "group": "Прокси-сервер",
          "description": "Адрес привязки (127.0.0.1 — только эта машина)",

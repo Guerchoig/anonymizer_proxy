@@ -22,11 +22,12 @@ main.py работают с роутером без изменений.
    или POST /api/backend БЕЗ перезапуска сервера; выбор сохраняется
    в data/runtime_state.json.
 
-Для локального бэкенда из ответа вырезается thinking-вывод модели
-(<think>…</think> и reasoning_content) — Cline получает чистый текст.
+Thinking-вывод локальной модели (<think>…</think> и reasoning_content)
+НЕ вырезается — передаётся в чат так же, как у облачных бэкендов.
+max_tokens в запрос не пересылается: у локальной модели нет бюджета
+выходных токенов.
 """
 import json
-import re
 from typing import AsyncIterator, Optional
 
 import httpx
@@ -39,90 +40,21 @@ from .openrouter_client import (
     OpenAICompatClient, OpenRouterClient, OpenRouterError,
 )
 
-_THINK_CLOSED_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
-_THINK_OPEN_RE = re.compile(r"<think>.*\Z", re.DOTALL)  # незакрытый блок
-
-_LEN_THINK_OPEN = len("<think>")
-_LEN_THINK_CLOSE = len("</think>")
-
-
-def strip_thinking(text: str) -> str:
-    """Вырезать <think>…</think> (в т.ч. незакрытый) из текста ответа."""
-    if not text:
-        return text
-    text = _THINK_CLOSED_RE.sub("", text)
-    return _THINK_OPEN_RE.sub("", text)
-
-
-class _ThinkFilter:
-    """Потоковый фильтр thinking-вывода.
-
-    Вырезает <think>…</think> из SSE-потока, корректно обрабатывая теги,
-    разорванные между чанками (буферизует возможное начало/хвост тега).
-    """
-
-    def __init__(self) -> None:
-        self._inside = False
-        self._buf = ""
-
-    def feed(self, chunk: str) -> str:
-        self._buf += chunk
-        out: list[str] = []
-        while True:
-            if self._inside:
-                j = self._buf.find("</think>")
-                if j == -1:
-                    # отдаём всё, кроме возможного хвоста "</thi..."
-                    safe = max(0, len(self._buf) - _LEN_THINK_CLOSE + 1)
-                    if safe:
-                        out.append(self._buf[:safe])
-                        self._buf = self._buf[safe:]
-                    return "".join(out)
-                self._buf = self._buf[j + _LEN_THINK_CLOSE:]
-                self._inside = False
-                continue
-            i = self._buf.find("<think>")
-            if i == -1:
-                safe = max(0, len(self._buf) - _LEN_THINK_OPEN + 1)
-                if safe:
-                    out.append(self._buf[:safe])
-                    self._buf = self._buf[safe:]
-                return "".join(out)
-            out.append(self._buf[:i])
-            self._buf = self._buf[i + _LEN_THINK_OPEN:]
-            self._inside = True
-
-    def flush(self) -> str:
-        """Хвост потока: незакрытый <think> до конца — вывод отбрасывается."""
-        tail = "" if self._inside else self._buf
-        self._buf = ""
-        return tail
-
 
 class LocalLMClient:
-    """Клиент локальной модели (LM Studio, OpenAI-совместимый API)."""
+    """Клиент локальной модели (LM Studio, OpenAI-совместимый API).
+
+    Thinking-вывод (reasoning_content, <think>…) передаётся клиенту без
+    изменений; max_tokens не пересылается — у локальной модели нет бюджета.
+    """
 
     def __init__(self, config: dict):
         self.base_url = config["base_url"].rstrip("/")
         self.api_key = config.get("api_key") or "lm-studio"
         self.model = config.get("model") or ""
         self.timeout = config.get("timeout", 600.0)
-        # Минимальный бюджет выходных токенов для локальной модели.
-        # Клиент (Cline) может прислать маленький max_tokens — на thinking-
-        # модели лимит съедается размышлениями, и текст обрывается на
-        # полуслове. Локальная генерация бесплатна, контекст большой —
-        # поэтому поднимаем бюджет до этого минимума.
-        self.min_max_tokens = int(config.get("min_max_tokens", 16384))
         self._client: Optional[httpx.AsyncClient] = None
-        self._think = _ThinkFilter()
         self._resolved_model: Optional[str] = None
-
-    @staticmethod
-    def _effective_max_tokens(max_tokens: Optional[int], floor: int) -> Optional[int]:
-        """Поднять max_tokens клиента до минимума (None — не трогаем)."""
-        if max_tokens is None:
-            return None
-        return max(max_tokens, floor)
 
     async def _resolve_model(self, requested: Optional[str]) -> str:
         """Имя модели для запроса: явное > из .env > первая из LM Studio.
@@ -166,17 +98,6 @@ class LocalLMClient:
             "«работай через облако»."
         )
 
-    def _strip_choice(self, choice: dict) -> None:
-        message = choice.get("message") or {}
-        message.pop("reasoning_content", None)
-        if isinstance(message.get("content"), str):
-            message["content"] = strip_thinking(message["content"])
-
-    def _strip_delta(self, delta: dict) -> None:
-        delta.pop("reasoning_content", None)
-        if isinstance(delta.get("content"), str) and delta["content"]:
-            delta["content"] = self._think.feed(delta["content"])
-
     @staticmethod
     def _extract_error(error_text: str) -> str:
         try:
@@ -194,10 +115,9 @@ class LocalLMClient:
         payload: dict = {"model": await self._resolve_model(model), "messages": messages}
         if temperature is not None:
             payload["temperature"] = temperature
-        if max_tokens is not None:
-            # локальная генерация бесплатна: поднимаем лимит клиента до минимума
-            payload["max_tokens"] = self._effective_max_tokens(
-                max_tokens, self.min_max_tokens)
+        # max_tokens не пересылается: у локальной модели нет бюджета выходных
+        # токенов, генерация бесплатна — модель заканчивает ответ сама.
+        # Параметр оставлен в сигнатуре для совместимости интерфейса.
         for key, value in kwargs.items():
             if value is not None:
                 payload[key] = value
@@ -214,14 +134,15 @@ class LocalLMClient:
                          response.status_code, error_text[:500])
             raise OpenRouterError(response.status_code, error_text)
 
+        # thinking (reasoning_content, <think>…) не вырезается — уходит
+        # клиенту как есть, как у облачных бэкендов
         data = response.json()
         for choice in data.get("choices", []):
-            self._strip_choice(choice)
             if choice.get("finish_reason") == "length":
                 logger.warning(
                     "Локальная модель остановлена по лимиту выходных "
                     "токенов (finish_reason=length) — ответ может быть "
-                    "обрезан. Лимит запроса: %s", payload.get("max_tokens"))
+                    "обрезан (настройки генерации/контекст LM Studio)")
         return data
 
     async def chat_completion_stream(
@@ -234,15 +155,11 @@ class LocalLMClient:
             "model": await self._resolve_model(model), "messages": messages, "stream": True}
         if temperature is not None:
             payload["temperature"] = temperature
-        if max_tokens is not None:
-            # локальная генерация бесплатна: поднимаем лимит клиента до минимума
-            payload["max_tokens"] = self._effective_max_tokens(
-                max_tokens, self.min_max_tokens)
+        # max_tokens не пересылается (см. chat_completion) — бюджета нет
         for key, value in kwargs.items():
             if value is not None:
                 payload[key] = value
 
-        self._think = _ThinkFilter()
         try:
             async with client.stream(
                 "POST", f"{self.base_url}/chat/completions", json=payload
@@ -263,8 +180,8 @@ class LocalLMClient:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    for choice in chunk.get("choices", []):
-                        self._strip_delta(choice.get("delta") or {})
+                    # thinking-дельты (reasoning_content, <think>…) идут
+                    # клиенту без изменений
                     yield chunk
         except httpx.ConnectError as exc:
             raise OpenRouterError(502, self._unavailable_hint()) from exc

@@ -5,11 +5,13 @@
 1. Выбор бэкенда: префиксы local//cloud/, точное имя локальной модели,
    рантайм-дефолт, явный backend-аргумент.
 2. set_backend: переключение без перезапуска + персист в runtime_state.json.
-3. ThinkFilter / strip_thinking: <think>…</think> вырезается, в т.ч.
-   при разрыве тега между чанками и в незакрытом блоке.
-4. Чат-команды «перезапусти прокси» / «работай через локальную модель» /
+3. Thinking локальной модели НЕ вырезается: reasoning_content и
+   <think>…</think> доходят до клиента как есть (non-stream и stream).
+4. max_tokens клиента не пересылается в LM Studio — у локальной модели
+   нет бюджета выходных токенов.
+5. Чат-команды «перезапусти прокси» / «работай через локальную модель» /
    «работай через облако» распознаются только в текущем сообщении.
-5. На локальном бэкенде авто-анонимизация приложенных файлов отключена —
+6. На локальном бэкенде авто-анонимизация приложенных файлов отключена —
    запрос уходит в локальную модель (заглушку) без перехвата.
 
 Запуск: python anonymizer_proxy\\tests\\test_llm_router.py (из корня проекта)
@@ -22,9 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy.config import LOCAL_LLM, RUNTIME, RUNTIME_STATE_PATH
-from anonymizer_proxy.proxy.llm_router import (
-    LLMRouter, LocalLMClient, _ThinkFilter, strip_thinking,
-)
+from anonymizer_proxy.proxy.llm_router import LLMRouter, LocalLMClient
 from anonymizer_proxy.models.schemas import ChatCompletionRequest, ChatMessage
 from anonymizer_proxy.proxy import handlers as handlers_module
 from anonymizer_proxy.proxy.handlers import RequestHandler
@@ -96,30 +96,75 @@ def test_set_backend_persists():
         RUNTIME["backend"] = old
 
 
-def test_think_filter():
-    """<think>-блоки вырезаются, включая разрыв тега между чанками"""
-    f = _ThinkFilter()
-    out = f.feed("<think>размыш")
-    out += f.feed("ления</think>От")
-    out += f.feed("вет")
-    out += f.flush()
-    assert out == "Ответ", out
+def test_local_thinking_passthrough():
+    """Thinking не вырезается: reasoning_content и <think> доходят до клиента"""
+    import httpx
 
-    f2 = _ThinkFilter()
-    out2 = f2.feed("до <th")
-    out2 += f2.feed("ink>x</th")
-    out2 += f2.feed("ink>после")
-    out2 += f2.flush()
-    assert out2 == "до после", out2
+    resp = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "<think>думаю</think>Ответ",
+                "reasoning_content": "шаги размышления",
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {},
+    }
 
-    assert strip_thinking("<think>a\nb</think>Готово") == "Готово"
-    assert strip_thinking("Начало <think>незакрытый блок") == "Начало "
-    assert strip_thinking("без мышления") == "без мышления"
-    print("TEST 3 OK: ThinkFilter / strip_thinking")
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=resp)
+
+    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
+    local._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    data = asyncio.run(local.chat_completion(
+        messages=[{"role": "user", "content": "тест"}]))
+    msg = data["choices"][0]["message"]
+    assert msg["content"] == "<think>думаю</think>Ответ", msg
+    assert msg["reasoning_content"] == "шаги размышления", msg
+    print("TEST 3 OK: thinking локальной модели проходит без вырезания")
 
 
-def test_local_max_tokens_floor():
-    """max_tokens клиента поднимается до минимума (thinking съедает бюджет)"""
+def test_local_stream_thinking_passthrough():
+    """В стриме reasoning_content и <think> не фильтруются"""
+    import httpx
+
+    lines = [
+        'data: {"choices":[{"delta":{"reasoning_content":"думаю"}}]}',
+        'data: {"choices":[{"delta":{"content":"<think>x</think>От"}}]}',
+        'data: {"choices":[{"delta":{"content":"вет"},'
+        '"finish_reason":"stop"}]}',
+        "data: [DONE]",
+    ]
+    body = "\n\n".join(lines) + "\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body.encode("utf-8"),
+            headers={"Content-Type": "text/event-stream"})
+
+    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
+    local._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        out = []
+        async for chunk in local.chat_completion_stream(
+                messages=[{"role": "user", "content": "тест"}]):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio.run(run())
+    deltas = [c["choices"][0].get("delta", {})
+              for c in chunks if c.get("choices")]
+    assert any("reasoning_content" in d for d in deltas), deltas
+    content = "".join(d.get("content", "") for d in deltas)
+    assert content == "<think>x</think>Ответ", content
+    print("TEST 3b OK: стрим — thinking проходит без фильтра")
+
+
+def test_local_no_max_tokens():
+    """max_tokens клиента не пересылается: у локальной модели нет бюджета"""
     import httpx
 
     captured: dict = {}
@@ -132,22 +177,13 @@ def test_local_max_tokens_floor():
             "usage": {},
         })
 
-    local = LocalLMClient({
-        "base_url": "http://x/v1", "model": "test-model",
-        "min_max_tokens": 16384,
-    })
+    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
     local._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-    async def run(max_tokens):
-        await local.chat_completion(
-            messages=[{"role": "user", "content": "тест"}],
-            max_tokens=max_tokens)
-
-    asyncio.run(run(512))
-    assert captured["json"]["max_tokens"] == 16384, captured["json"]
-    asyncio.run(run(32000))
-    assert captured["json"]["max_tokens"] == 32000, "большой лимит клиента не урезается"
-    print("TEST 6 OK: локальная модель — floor max_tokens (16384)")
+    asyncio.run(local.chat_completion(
+        messages=[{"role": "user", "content": "тест"}], max_tokens=512))
+    assert "max_tokens" not in captured["json"], captured["json"]
+    print("TEST 6 OK: max_tokens не пересылается в LM Studio")
 
 
 def make_request(text: str) -> ChatCompletionRequest:
@@ -259,8 +295,9 @@ def test_local_backend_skips_file_anon():
 def main():
     test_backend_resolution()
     test_set_backend_persists()
-    test_think_filter()
-    test_local_max_tokens_floor()
+    test_local_thinking_passthrough()
+    test_local_stream_thinking_passthrough()
+    test_local_no_max_tokens()
     test_command_detection()
     test_local_backend_skips_file_anon()
     print("\nALL LLM ROUTER TESTS PASSED")
