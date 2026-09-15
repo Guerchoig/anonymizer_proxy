@@ -44,7 +44,7 @@ else
     echo "Создан .env, сгенерирован PROXY_API_TOKEN, NER_DEVICE=mps."
     while true; do
         printf 'Введите OPENROUTER_API_KEY (sk-or-v1-…), Enter — пропустить: '
-        read -r KEY
+        read -r KEY || KEY=""
         if [ -z "$KEY" ]; then
             echo "[ВНИМАНИЕ] Ключ не задан: анонимизация работать будет, а вот запросы"
             echo "к облаку упадут с 401. Впишите ключ с https://openrouter.ai/keys в .env."
@@ -86,7 +86,7 @@ else
     echo "[ПРЕДУПРЕЖДЕНИЕ] Не удалось создать .app — запускайте через start_proxy.command."
 fi
 printf 'Включить автозапуск прокси при логине (LaunchAgent)? [y/N]: '
-read -r AUTO_START
+read -r AUTO_START || AUTO_START=""
 case "$AUTO_START" in
     y|Y) bash install_launchagent.sh || echo "[ПРЕДУПРЕЖДЕНИЕ] LaunchAgent не установлен." ;;
     *)   echo "Автозапуск не включён. Включить позже: bash install_launchagent.sh" ;;
