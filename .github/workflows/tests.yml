@@ -1,0 +1,153 @@
+# CI-тесты Anonymizer Proxy (ubuntu + macOS).
+#
+# Срабатывает на пуш в master, на PR и вручную (workflow_dispatch).
+# Отличать от workflow «Release» (release.yml): тот запускается по тегу v*
+# и только собирает архивы. Этот workflow — тесты, включая полный прогон
+# macOS-инсталлятора на настоящем macOS-раннере.
+#
+# Что проверяется:
+#   job unit-tests (matrix: ubuntu-latest, macos-latest):
+#     - scripts/check_crossplatform.py — статический аудит Windows-only
+#       конструкций (subprocess.CREATE_*, winreg, пути .venv\Scripts и т.п.);
+#     - все тест-скрипты anonymizer_proxy/tests/test_*.py (код возврата).
+#   job macos-installer (macos-latest) — E2E-тест macOS-инсталлятора:
+#     - синтаксис всех *.sh / *.command (bash -n; zsh -n для zsh-скриптов);
+#     - bash install.sh неинтерактивно (stdin=/dev/null): uv sync
+#       --locked --extra cpu, генерация .env, скачивание NER-моделей;
+#     - scripts/install_selftest.py — код возврата обязан быть 0
+#       (install.sh сам прогоняет selftest, но НЕ фейлит установку);
+#     - make_mac_app.sh: каркас Anonymizer Proxy.app, plutil -lint;
+#     - start_proxy.sh: сервер реально стартует, /health отвечает;
+#     - install_launchagent.sh: регистрация LaunchAgent (не блокирующе).
+#
+# Windows не входит в matrix: тесты прогоняются локально на машине
+# разработки перед релизом (см. RELEASING.md, «Шаг 1»).
+
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Тесты пакета (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Установить uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Зависимости (uv sync --locked --extra cpu — как в install.sh)
+        run: uv sync --locked --extra cpu
+
+      - name: Статический аудит кроссплатформенности
+        run: uv run --no-sync python scripts/check_crossplatform.py
+
+      - name: Тесты пакета (anonymizer_proxy/tests/*.py)
+        run: |
+          set -euo pipefail
+          status=0
+          for t in anonymizer_proxy/tests/test_*.py; do
+            echo "==> $t"
+            if ! uv run --no-sync python "$t"; then
+              echo "ПРОВАЛ: $t"
+              status=1
+            fi
+          done
+          exit $status
+
+  macos-installer:
+    name: E2E macOS-инсталлятор (install.sh / .app / LaunchAgent)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Синтаксис shell-скриптов
+        run: |
+          set -euo pipefail
+          for f in *.sh *.command; do
+            bash -n "$f" && echo "bash -n OK: $f"
+          done
+          # У этих трёх shebang zsh — дополнительно парсим zsh
+          for f in make_mac_app.sh install_launchagent.sh start_proxy.command; do
+            zsh -n "$f" && echo "zsh -n OK: $f"
+          done
+
+      - name: Установить uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: bash install.sh (неинтерактивно, как у пользователя)
+        # stdin </dev/null: read возвращает пустую строку, интерактивные шаги
+        # (ввод OPENROUTER_API_KEY, автозапуск LaunchAgent) пропускаются.
+        run: bash install.sh < /dev/null
+
+      - name: install_selftest.py — код возврата обязан быть 0
+        run: .venv/bin/python scripts/install_selftest.py
+
+      - name: Проверки .env (токен сгенерирован, NER_DEVICE=mps)
+        run: |
+          set -euo pipefail
+          grep -q '^NER_DEVICE=mps' .env
+          grep -qE '^PROXY_API_TOKEN=.+' .env
+          ! grep -q 'REPLACE_WITH_RANDOM_TOKEN' .env
+          echo ".env сконфигурирован: PROXY_API_TOKEN сгенерирован, NER_DEVICE=mps"
+
+      - name: make_mac_app.sh — каркас Anonymizer Proxy.app
+        run: |
+          set -euo pipefail
+          bash make_mac_app.sh remove
+          bash make_mac_app.sh
+          test -x "Anonymizer Proxy.app/Contents/MacOS/AnonymizerProxy"
+          plutil -lint "Anonymizer Proxy.app/Contents/Info.plist"
+          echo "Anonymizer Proxy.app собран и валиден"
+
+      - name: start_proxy.sh — сервер стартует, /health отвечает
+        run: |
+          set -euo pipefail
+          mkdir -p data/logs
+          ./start_proxy.sh > data/logs/ci_proxy.log 2>&1 &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8081/health > /dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then
+            echo "Логи сервера:" || true
+            cat data/logs/ci_proxy.log || true
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          echo "/health отвечает — сервер работает на macOS"
+          kill "$pid" 2>/dev/null || true
+          pkill -f "anonymizer_proxy.main" 2>/dev/null || true
+
+      - name: install_launchagent.sh — регистрация и удаление LaunchAgent
+        # Не блокирующая проверка: на CI-раннере bootstrap в gui-сессии
+        # может быть ограничен песочницей; падение шага не валит job.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bash install_launchagent.sh
+          launchctl print "gui/$(id -u)/ru.anonymizer.proxy" > /dev/null
+          echo "LaunchAgent зарегистрирован"
+          bash install_launchagent.sh remove
