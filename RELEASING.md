@@ -1,15 +1,19 @@
 # Публикация изменений и выпуск релизов
 
 > Этот документ описывает полный цикл: от коммита до опубликованного релиза
-> на GitHub. Все команды проверены на практике; автоматизация —
-> `.github/workflows/release.yml`.
+> на GitHub. Все команды проверены на практике; автоматизация — два workflow:
+> `tests.yml` (тесты, включая macOS) и `release.yml` (сборка релиза).
 
 ## Общая схема
 
 ```
 изменения → git add/commit → git push master
                                   ↓
-                     git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
+        GitHub Actions «Tests» (tests.yml: ubuntu + macos)
+        - тесты пакета (ubuntu + macos) + кроссплатформенный аудит;
+        - E2E macOS-инсталлятора: install.sh → selftest → .app → /health
+                                  ↓ (Tests зелёный)
+        git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
                                   ↓
               GitHub Actions (workflow "Release", ubuntu-latest)
                                   ↓
@@ -18,6 +22,9 @@
               GitHub Release + ассеты + авто-changelog
 ```
 
+- **Тесты до релиза**: workflow «Tests» запускается на каждый пуш в master
+  и на PR. Тег ставится ТОЛЬКО если последний запуск Tests на master зелёный:
+  `gh run list --workflow=tests.yml --repo Guerchoig/anonymizer_proxy --limit 1`.
 - **Что собирается**: `git archive` берёт ТОЛЬКО отслеживаемые файлы —
   `.env`, `data/`, `.venv`, `*.docx` и прочее из `.gitignore` в архив
   не попадут; `.gitattributes` (`export-ignore`) дополнительно вырезает
@@ -63,6 +70,23 @@ git push origin master
   `chore:` — по одному логическому изменению на коммит.
 - Перед релизом функциональных изменений прогнать целевые тесты
   (`anonymizer_proxy/tests/*.py` — скрипты с кодом возврата).
+  На Windows — локально (`.venv\Scripts\python.exe <тест>`); ubuntu и macOS
+  проверяет CI: `gh run list --workflow=tests.yml --repo Guerchoig/anonymizer_proxy --limit 1`.
+
+### Тесты macOS в CI (workflow «Tests», `tests.yml`)
+
+Триггеры: пуш в master, PR, ручной запуск (workflow_dispatch). Два job'а:
+
+| Job | Раннер | Что делает |
+|---|---|---|
+| `unit-tests` | ubuntu-latest + macos-latest | `uv sync --locked --extra cpu` (как в install.sh), `scripts/check_crossplatform.py`, все `anonymizer_proxy/tests/test_*.py` (код возврата) |
+| `macos-installer` | macos-latest | E2E-тест macOS-инсталлятора: `bash -n`/`zsh -n` всех скриптов → `bash install.sh < /dev/null` (реальная установка: uv, .env, скачивание моделей) → `install_selftest.py` с обязательным кодом 0 → проверка `.env` (`NER_DEVICE=mps`, токен) → `make_mac_app.sh` + `plutil -lint` → `start_proxy.sh` и опрос `/health` → `install_launchagent.sh` (не блокирующе) |
+
+Windows в CI не гоняется: это машина разработки, тесты прогоняются локально
+перед тегом. macOS в CI — главный барьер против регрессий вида
+`subprocess.CREATE_*`, `.venv\Scripts` и прочих Windows-only конструкций
+(статический аудит — `scripts/check_crossplatform.py`, динамический —
+реальный запуск инсталлятора и сервера на macos-latest).
 
 ## Шаг 2. Выпуск релиза
 
@@ -81,6 +105,7 @@ gh release create v1.4.1 --repo Guerchoig/anonymizer_proxy --title "v1.4.1" --no
 
 ```powershell
 gh run list --repo Guerchoig/anonymizer_proxy --limit 3     # статус сборки
+gh run list --workflow=tests.yml --repo Guerchoig/anonymizer_proxy --limit 1  # тесты (macOS в т.ч.)
 gh release view v1.4.1 --repo Guerchoig/anonymizer_proxy    # релиз и ассеты
 ```
 
@@ -124,6 +149,7 @@ git push origin :refs/tags/vX.Y.Z      # если тег успел уйти о�
 | `gh` отвечает 404 на приватном репо | Аутентификация: `gh auth status`; повторный `gh auth login` |
 | README в архиве устарел | Документационные коммиты попали после тега — перевыпустить: удалить тег/релиз, создать заново на актуальном коммите |
 | Workflow не запустился | Проверить, что пуш именно тега `v*` (пуш коммитов тег не триггерит); Actions включён в Settings |
+| Упал job `macos-installer` в workflow «Tests» | Инсталлятор сломан на macOS — релиз ставить нельзя. Смотреть лог: `gh run view <id> --repo Guerchoig/anonymizer_proxy --log-failed`; частая причина — Windows-only код, который не поймал статический аудит |
 | Предупреждение «Node.js 20 is deprecated» | Устарело: actions обновлены до Node 24 (`checkout@v5`, `gh-release@v3`); не пиновать старые версии |
 
 ## Диагностика сбоев коммита
@@ -141,4 +167,7 @@ git push origin :refs/tags/vX.Y.Z      # если тег успел уйти о�
   windows-раннера); из урока: сборка перенесена на ubuntu-latest.
 - v1.0.5+: два архива из одной задачи на Ubuntu; `actions/checkout@v5`,
   `gh-release@v3` (Node 24, предупреждения ушли).
+- CI-тесты: добавлен workflow `tests.yml` (ubuntu + macos) — unit-тесты
+  пакета и E2E-тест macOS-инсталлятора (install.sh → selftest → .app →
+  /health); правило «тег только при зелёном Tests на master».
 - Приватность: репозиторий приватный; все проверки — через `gh api`.
