@@ -28,6 +28,7 @@ max_tokens в запрос не пересылается: у локальной 
 выходных токенов.
 """
 import json
+import re
 from typing import AsyncIterator, Optional
 
 import httpx
@@ -39,6 +40,83 @@ from ..config import (
 from .openrouter_client import (
     OpenAICompatClient, OpenRouterClient, OpenRouterError,
 )
+
+
+# ==================== «Пустой» ответ thinking-модели ====================
+# Локальные thinking-модели (qwen3 и подобные) иногда завершают генерацию
+# ВНУТРИ блока размышлений: весь ответ (включая задуманный вызов
+# инструмента или готовый черновик финального текста) остаётся в
+# reasoning_content/<think>…, а content пуст и tool_calls нет. Клиент-агент
+# (Cline/Hermes) получает ход без текста и без tool-call — показать нечего,
+# ход завершается молча: интерфейс «зависает», GPU простаивает, результат
+# появляется только после нового сообщения пользователя.
+#
+# Единственное звено, которое видит полный ответ модели до клиента, — прокси.
+# Здесь мы обнаруживаем «пустой» ответ и ОДИН раз прозрачно дозапрашиваем
+# модель с подсказкой «продолжи, дай финальный ответ или вызов инструмента»
+# (nudge не содержит PII — добавляется в уже анонимизированные сообщения).
+# Работает на любой ОС и для любой thinking-модели за прокси.
+
+_CONTINUE_NUDGE = (
+    "Твой предыдущий ответ оборвался внутри блока размышлений: ты не дал "
+    "ни финального текста, ни вызова инструмента. Продолжи сейчас и ответь "
+    "сразу: либо финальный текст для пользователя, либо вызов инструмента. "
+    "Новые размышления не добавляй."
+)
+
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    """Убрать <think>…</think>-блоки: они не видны пользователю как контент."""
+    if not text:
+        return ""
+    return _THINK_RE.sub("", text).strip()
+
+
+def _empty_local_response(data: dict) -> bool:
+    """True, если во ВСЕХ choices нет tool_calls и нет видимого контента
+    (только размышления: reasoning_content и/или <think>…)."""
+    choices = data.get("choices") or []
+    if not choices:
+        return True
+    for choice in choices:
+        msg = choice.get("message") or {}
+        if msg.get("tool_calls"):
+            return False
+        if _strip_think(msg.get("content") or ""):
+            return False
+    return True
+
+
+class _StreamScan:
+    """Сканирует SSE-чанки стрима на предмет «пустого» ответа (см. выше).
+
+    Чанки при этом пересылаются клиенту как есть — детекция только
+    накапливает признаки, чтобы ПОСЛЕ конца стрима решить, нужен ли
+    дозапрос-продолжение.
+    """
+
+    def __init__(self):
+        self.content = ""
+        self.tool_calls = False
+
+    def feed(self, chunk: dict) -> None:
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("tool_calls"):
+                self.tool_calls = True
+            self.content += delta.get("content") or ""
+
+    @property
+    def empty(self) -> bool:
+        return not self.tool_calls and not _strip_think(self.content)
+
+
+def _continue_messages(messages: list[dict]) -> list[dict]:
+    """Сообщения для дозапроса: исходные + подсказка-продолжение
+    (текст фиксированный, без PII — сообщения уже анонимизированы)."""
+    return list(messages) + [{"role": "user", "content": _CONTINUE_NUDGE}]
 
 
 class LocalLMClient:
@@ -326,9 +404,17 @@ class LLMRouter:
         target = self._resolve(model, backend)
         logger.info("LLM-бэкенд: %s (model=%s)", target, model)
         if target == "local":
-            return await self._local.chat_completion(
+            data = await self._local.chat_completion(
                 messages=messages, model=None, temperature=temperature,
                 max_tokens=max_tokens, **kwargs)
+            if _empty_local_response(data):
+                logger.warning(
+                    "Локальная модель вернула только размышления (нет "
+                    "контента и tool_calls) — запрашиваю продолжение")
+                data = await self._local.chat_completion(
+                    messages=_continue_messages(messages), model=None,
+                    temperature=temperature, max_tokens=max_tokens, **kwargs)
+            return data
         # Облачный провайдер: модель из .env, как и раньше. Для НЕ-дефолтного
         # провайдера модель можно передать префиксом "<провайдер>/<модель>"
         # («aitunnel/deepseek-v4-pro»); дефолтному модель из запроса не
@@ -348,10 +434,22 @@ class LLMRouter:
         target = self._resolve(model, backend)
         logger.info("LLM-бэкенд (стрим): %s (model=%s)", target, model)
         if target == "local":
+            scan = _StreamScan()
             async for chunk in self._local.chat_completion_stream(
                     messages=messages, model=None, temperature=temperature,
                     max_tokens=max_tokens, **kwargs):
+                scan.feed(chunk)
                 yield chunk
+            if scan.empty:
+                # «Пустой» ответ thinking-модели: без дозапроса клиент-агент
+                # получил бы ход без текста и tool-call и молча ждал бы ввода.
+                logger.warning(
+                    "Локальная модель вернула только размышления (стрим без "
+                    "контента и tool_calls) — запрашиваю продолжение")
+                async for chunk in self._local.chat_completion_stream(
+                        messages=_continue_messages(messages), model=None,
+                        temperature=temperature, max_tokens=max_tokens, **kwargs):
+                    yield chunk
             return
         override = (self._extract_prefixed_model(model, target)
                     if target != "openrouter" else None)
