@@ -1,4 +1,4 @@
-"""Самопроверка установки Anonymizer Proxy.
+﻿"""Самопроверка установки Anonymizer Proxy.
 
 Проверяет три уровня:
 1. Импорты ключевых пакетов (fastapi, uvicorn, httpx, gliner, natasha,
@@ -39,7 +39,7 @@ CHECK_IMPORTS = [
 
 
 def check_imports() -> bool:
-    print("==> Шаг 1/3: импорты ключевых пакетов")
+    print("==> Шаг 1/5: импорты ключевых пакетов")
     ok = True
     for name in CHECK_IMPORTS:
         try:
@@ -52,7 +52,7 @@ def check_imports() -> bool:
 
 
 def check_onnxruntime() -> bool:
-    print("==> Шаг 2/4: onnxruntime")
+    print("==> Шаг 2/5: onnxruntime")
     try:
         import onnxruntime as ort
     except ImportError as exc:
@@ -69,14 +69,14 @@ WARNINGS: list[str] = []
 
 
 def check_provider_key() -> bool:
-    """Шаг 4/4: конфигурация ДЕЙСТВУЮЩЕГО облачного провайдера.
+    """Шаг 4/5: конфигурация ДЕЙСТВУЮЩЕГО облачного провайдера.
 
     Отсутствие/невалидность ключа НЕ фейлит установку (локальная анонимизация
     самодостаточна), но печатается заметное предупреждение с инструкцией.
     Сразу после установки действующий провайдер — стартовый CLOUD_PROVIDER
     (openrouter); после явного переключения в runtime_state.json.
     """
-    print("==> Шаг 4/4: облачный провайдер")
+    print("==> Шаг 4/5: облачный провайдер")
     import os
 
     import httpx
@@ -159,7 +159,7 @@ def check_provider_key() -> bool:
 
 
 def check_ner_engines() -> bool:
-    print("==> Шаг 3/4: загрузка NER-движков и пробный прогон")
+    print("==> Шаг 3/5: загрузка NER-движков и пробный прогон")
     from anonymizer_proxy.anonymizer.gliner_engine import GlinerEngine
     from anonymizer_proxy.anonymizer.natasha_engine import NatashaEngine
     from anonymizer_proxy.config import ensure_directories
@@ -198,6 +198,63 @@ def check_ner_engines() -> bool:
     return ok
 
 
+def check_llm_server() -> bool:
+    """Шаг 5/5: llama-server (локальная LLM).
+
+    НЕ фейлит установку: облачные бэкенды работают без llama-server.
+    Проверяется: бинарь найден (LLM_SERVER_BIN / PATH / tools/llama.cpp /
+    Homebrew), GGUF-модель существует, порт свободен или занят живым
+    llama-инстансом.
+    """
+    print("==> Шаг 5/5: llama-server (локальная LLM)")
+    from anonymizer_proxy import llm_server, llama_runtime
+    from anonymizer_proxy.config import LLM_SERVER
+
+    bin_path = llm_server.find_binary()
+    if not bin_path:
+        WARNINGS.append("llama-server не найден (LLM_SERVER_BIN пуст)")
+        print("    [ВНИМАНИЕ] llama-server не найден (общий llama-рантайм / "
+              "PATH / tools/llama.cpp / Homebrew).")
+        print("    Локальный LLM-бэкенд не поднимется; установите общий "
+              f"рантайм: {llama_runtime.install_hint()}")
+        print("    (или укажите LLM_SERVER_BIN в .env). Облачные бэкенды "
+              "работают как обычно.")
+        return True
+    print(f"    OK: llama-server найден: {bin_path}")
+
+    # Модель: shared:chat — файл из манифеста общего llama-рантайма
+    spec = LLM_SERVER["model"] or "shared:chat"
+    try:
+        model = llama_runtime.resolve_model(spec, role="chat")
+    except FileNotFoundError as exc:
+        model = None
+        print(f"    [ВНИМАНИЕ] {exc}")
+    if model is None or not model.is_file():
+        WARNINGS.append("GGUF-модель не найдена")
+        py = (r".venv\Scripts\python.exe" if sys.platform == "win32"
+              else ".venv/bin/python")
+        print(f"    [ВНИМАНИЕ] GGUF-модель не найдена: {spec}")
+        print("    Скачайте общую чат-модель: кнопка «Применить» на странице "
+              "/env-editor либо")
+        print(f"    {py} -m anonymizer_proxy.llama_runtime "
+              "switch Qwen3.5-9B-Q6_K.gguf")
+        return True
+    print(f"    OK: GGUF-модель: {model}")
+
+    det = llm_server.probe()
+    if det["state"] == llm_server.STATE_LLAMA:
+        print(f"    OK: llama-server уже запущен "
+              f"({det['total_slots']} слот(ов))")
+    elif det["state"] == llm_server.STATE_FOREIGN:
+        WARNINGS.append(f"порт {LLM_SERVER['port']} занят посторонним сервисом")
+        print(f"    [ВНИМАНИЕ] Порт {LLM_SERVER['port']} занят посторонним "
+              "сервисом — смените LLM_SERVER_PORT в .env.")
+    else:
+        print(f"    OK: порт {LLM_SERVER['port']} свободен — прокси запустит "
+              "llama-server при старте (LLM_SERVER_AUTOSTART=1)")
+    return True
+
+
 def main() -> int:
     print("=== Самопроверка установки Anonymizer Proxy ===")
     results = [
@@ -205,6 +262,7 @@ def main() -> int:
         check_onnxruntime(),
         check_ner_engines(),
         check_provider_key(),
+        check_llm_server(),
     ]
     print()
     if not all(results):

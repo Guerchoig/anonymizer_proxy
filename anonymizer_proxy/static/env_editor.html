@@ -77,6 +77,16 @@
     </div>
     <div id="cloudBody">…войдите, чтобы загрузить настройки…</div>
   </div>
+  <div class="card" id="chatModelCard">
+    <h2>Общая чат-модель (llama.cpp)</h2>
+    <div class="sub">
+      Модель одна на все проекты машины (общий llama-рантайм): файлы лежат в
+      одном каталоге, активная записана в манифесте. Смена модели перезапускает
+      llama-серверы всех зарегистрированных проектов (в т.ч. hermes-disk-search)
+      и видна им сразу. Путь к бинарю/модели — в группе «Локальная модель».
+    </div>
+    <div id="chatModelBody">…загрузка…</div>
+  </div>
   <div id="groups"></div>
   <div class="actions">
     <button id="btnSave">Сохранить</button>
@@ -141,6 +151,7 @@ async function loadAll() {
                               !i.group.startsWith("Провайдер:") &&
                               !i.is_secret));
   renderSecrets(items.filter(i => i.is_secret && !provKeys.includes(i.key)));
+  loadChatModel();
 }
 
 function providerKeyEnvs(backends) {
@@ -212,6 +223,86 @@ async function loadModels(provider) {
     showMsg("Список моделей " + provider + " недоступен — модель можно ввести вручную", true);
   }
 }
+/* ---------- Общая чат-модель (llama-рантайм машины) ---------- */
+
+let CHAT_MODEL_TIMER = null;
+
+function restartReport(result) {
+  const a = (result && result.applied) || [];
+  if (!a.length) return "";
+  return " · " + a.map(x => x.name + (x.ok ? ": ok" : ": " + x.msg)).join("; ");
+}
+
+function scheduleChatModelPoll(job) {
+  clearTimeout(CHAT_MODEL_TIMER);
+  if (!job || !job.running) return;
+  CHAT_MODEL_TIMER = setTimeout(loadChatModel, 2000);
+}
+
+async function loadChatModel() {
+  let info;
+  try { info = await api("/api/chat-model"); } catch (e) { return; }
+  renderChatModel(info);
+  scheduleChatModelPoll(info.job);
+}
+
+function renderChatModel(info) {
+  const cur = info.current || "";
+  const rows = (info.available || []).map(m => Object.assign({downloaded: true}, m));
+  (info.presets || []).forEach(p => {
+    if (!rows.some(r => r.file === p.file)) rows.push(p);
+  });
+  const body = $("#chatModelBody");
+  if (!rows.length) {
+    body.innerHTML = '<div class="note">В каталоге пока нет GGUF-моделей: ' +
+      esc(info.models_dir || "(каталог не создан)") + '</div>';
+    return;
+  }
+  const opts = rows.map(r =>
+    '<option value="' + esc(r.file) + '"' + (r.file === cur ? " selected" : "") + '>' +
+    esc(r.file) + (r.downloaded
+      ? " — на диске" + (r.size_human ? " (" + esc(r.size_human) + ")" : "")
+      : " — скачать" + (r.size_hint ? " " + esc(r.size_hint) : "")) +
+    '</option>').join("");
+  const job = info.job || {};
+  let status;
+  if (job.running) {
+    status = '<span class="note">идёт: ' + esc(job.msg || "") + '</span>';
+  } else if (job.result) {
+    status = '<span class="note">' + (job.result.ok ? "✔ " : "✖ ") +
+      esc(job.msg || "") + esc(restartReport(job.result)) + '</span>';
+  } else {
+    status = '<span class="note">текущая: ' + esc(cur || "не задана") + '</span>';
+  }
+  body.innerHTML =
+    '<div class="row"><label>Модель<span class="desc">' +
+      esc(info.models_dir || "") +
+      (info.binary_ok ? "" : " · бинарь llama-server не найден") +
+    '</span></label><select id="chatModelSel">' + opts + '</select>' +
+    '<button id="btnChatModelApply">Применить везде</button></div>' +
+    '<div class="row"><label>Проекты<span class="desc">их llama-серверы ' +
+      'перезапускаются при смене модели</span></label><div class="note">' +
+      esc((info.projects || []).map(p => p.name).join(", ") ||
+          "нет зарегистрированных проектов") +
+    '</div><span></span></div>' + status;
+  $("#btnChatModelApply").addEventListener("click", applyChatModel);
+}
+
+async function applyChatModel() {
+  const file = $("#chatModelSel").value;
+  if (!file) return;
+  if (!confirm("Применить модель " + file + "?\n\nllama-серверы всех " +
+      "проектов (включая hermes-disk-search) будут перезапущены: текущие " +
+      "локальные запросы прервутся. Отсутствующий пресет будет скачан.")) return;
+  try {
+    const r = await api("/api/chat-model", { method: "POST",
+      body: JSON.stringify({ file: file, restart: true }) });
+    showMsg(r.msg || "запущено");
+  } catch (e) { return; }
+  scheduleChatModelPoll({running: true});
+  setTimeout(loadChatModel, 1500);
+}
+
 /* ---------- Обычные (не секретные) поля по группам ---------- */
 
 function fieldRow(item) {

@@ -94,7 +94,27 @@ switch ($flavor) {
     default    { Write-Host "GPU не обнаружен → extra 'cpu'" }
 }
 
-# ---------- 3. Зависимости ----------
+# ---------- 3. Общий llama-рантайм (llama.cpp + GGUF-модели) ----------
+# Бинарь llama-server и модели — в ЕДИНОМ каталоге машины
+# (%LLAMA_RUNTIME_DIR% / %LOCALAPPDATA%\llama-runtime), общем с другими
+# проектами (hermes-disk-search и т.п.): один вариант сборки (cuda|vulkan),
+# один набор моделей, синхронная смена чат-модели во всех проектах.
+Write-Step "Общий llama-рантайм машины (llama-server + GGUF-модели)"
+try {
+    & powershell -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $PSScriptRoot "scripts\ensure_llama_runtime.ps1") `
+        -Models chat `
+        -ProjectName "anonymizer_proxy" `
+        -ProjectRoot $PSScriptRoot `
+        -RestartArgs "-m anonymizer_proxy.llm_server restart"
+    if ($LASTEXITCODE -ne 0) { throw "ensure_llama_runtime.ps1 завершился с кодом $LASTEXITCODE" }
+} catch {
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Общий llama-рантайм не готов: $_" -ForegroundColor Yellow
+    Write-Host "Локальная модель не поднимется (облачные бэкенды работают как обычно)." -ForegroundColor Yellow
+    Write-Host "Повторите позже: powershell -File scripts\ensure_llama_runtime.ps1 -Models chat" -ForegroundColor Yellow
+}
+
+# ---------- 4. Зависимости ----------
 Write-Step "Установка зависимостей (uv sync --locked --extra $flavor)"
 & uv sync --locked --extra $flavor
 if ($LASTEXITCODE -ne 0) {
@@ -150,13 +170,16 @@ if (Test-Path ".env") {
     Write-Host "POST /api/backend или переменная CLOUD_PROVIDER в .env."
 }
 
-# ---------- 5. Прогрев моделей ----------
+# ---------- 6. Прогрев моделей ----------
 if (-not $SkipModels) {
     Write-Step "Прогрев NER-моделей (GLiNER + Natasha, первый раз — скачивание)"
     & $py scripts\download_models.py
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Прогрев моделей завершился с ошибками — см. выше." -ForegroundColor Yellow
     }
+    # GGUF-модель локальной LLM уже обеспечена на шаге 3 (общий
+    # llama-рантайм, models\chat общего каталога) — защита от повторной
+    # загрузки при повторном запуске установщика.
 }
 
 # ---------- 6. Самопроверка ----------

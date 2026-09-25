@@ -228,31 +228,91 @@ else:
         "используется manual", _CURRENT_MODE_ENV)
     CURRENT_MODE = Mode.MANUAL
 
-# ==================== Локальная LLM (LM Studio) ====================
-# LM Studio поднимает OpenAI-совместимый сервер (по умолчанию
-# http://127.0.0.1:1234/v1). Локальный бэкенд используется для сценариев,
+# ==================== Локальная LLM (llama.cpp / llama-server) ====================
+# llama-server поднимает OpenAI-совместимый HTTP-сервер (родной дефолт
+# llama.cpp — порт 8080). Локальный бэкенд используется для сценариев,
 # где анонимизация мешает работе (например, модель должна считать
 # конфиденциальные суммы в ячейках): данные не покидают машину.
+# Управление самим сервером (запуск/остановка/проверка) — модуль
+# anonymizer_proxy.llm_server, конфигурация — секция LLM_SERVER ниже.
+
+def _llm_server_base_url() -> str:
+    """Base URL локального бэкенда: из LOCAL_LLM_BASE_URL, если задан явно,
+    иначе конструируется из LLM_SERVER_HOST/PORT (единая точка правды для
+    хоста и порта llama-server)."""
+    explicit = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
+    if explicit:
+        return explicit
+    host = os.getenv("LLM_SERVER_HOST", "127.0.0.1")
+    port = os.getenv("LLM_SERVER_PORT", "8080")
+    return f"http://{host}:{port}/v1"
+
+
+def _llm_server_api_key() -> str:
+    """Ключ авторизации на llama-server: LOCAL_LLM_API_KEY имеет приоритет,
+    иначе общий ключ сервера LLM_SERVER_API_KEY, иначе нейтральное значение
+    (llama-server без --api-key заголовок Authorization игнорирует)."""
+    return (os.getenv("LOCAL_LLM_API_KEY", "").strip()
+            or os.getenv("LLM_SERVER_API_KEY", "").strip()
+            or "llama-server")
+
+
 LOCAL_LLM = {
-    "base_url": os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1"),
-    "api_key": os.getenv("LOCAL_LLM_API_KEY", "lm-studio"),
-    # Имя модели, загруженной в LM Studio (например, qwen3.5-9b-instruct).
+    "base_url": _llm_server_base_url(),
+    "api_key": _llm_server_api_key(),
+    # Имя модели (алиас llama-server, например qwen3.5-9b-instruct).
     # Запросы с этим именем модели (или с префиксом "local/") роутер
     # направляет локально независимо от выбранного бэкенда. Если пусто —
-    # берётся первая загруженная в LM Studio не-embedding модель.
+    # берётся первая (единственная) модель llama-server через /v1/models.
     "model": os.getenv("LOCAL_LLM_MODEL", ""),
-    # Локальная thinking-модель отвечает медленнее — таймаут больше
+    # Локальная thinking-модель отвечает медленнее — таймаут больше.
+    # При LLM_SERVER_PARALLEL=1 запрос может ждать в очереди за длинным
+    # файловым прогоном другого приложения — таймаут должен покрывать и это.
     "timeout": float(os.getenv("LOCAL_LLM_TIMEOUT", "600")),
-    # max_tokens клиента НЕ пересылается в LM Studio: у локальной модели нет
-    # бюджета выходных токенов (генерация бесплатна). Thinking-вывод модели
-    # (reasoning_content, <think>…) передаётся в чат без вырезания.
+    # max_tokens клиента НЕ пересылается в llama-server: у локальной модели
+    # нет бюджета выходных токенов (генерация бесплатна). Thinking-вывод
+    # модели (reasoning_content и блоки размышлений) передаётся без вырезания.
+}
+
+# ==================== Управление llama-server (запуск/остановка) ====================
+# llama-server — общий сервис машины: одна GGUF-модель в памяти, к нему
+# ходят и прокси, и другие приложения (RAG и т.п.). Менеджер llm_server.py
+# при старте прокси проверяет, нет ли уже живого инстанса (и в каком режиме
+# он запущен), и переиспользует его вместо запуска второго.
+LLM_SERVER = {
+    # Путь к бинарю llama-server(.exe). Пусто — автопоиск: PATH,
+    # tools/llama.cpp/ (Windows-пре-билд), brew --prefix (macOS).
+    "bin": os.getenv("LLM_SERVER_BIN", ""),
+    # Путь к GGUF-файлу модели
+    # (например, data/models/llm/qwen3.5-9b-instruct-Q4_K_M.gguf)
+    "model": os.getenv("LLM_SERVER_MODEL", ""),
+    "host": os.getenv("LLM_SERVER_HOST", "127.0.0.1"),
+    # Родной дефолт llama.cpp; менеджер всегда передаёт --port явно
+    "port": int(os.getenv("LLM_SERVER_PORT", "8080")),
+    # Слоты llama-server: 1 = запросы выполняются строго по очереди
+    # (очередь бесплатна по памяти). Запрос всегда получает ровно
+    # ctx_per_slot токенов контекста.
+    "parallel": int(os.getenv("LLM_SERVER_PARALLEL", "1")),
+    # Контекст ОДНОГО запроса (файл через прокси / RAG-поиск): 32K.
+    # Общий --ctx-size = parallel × ctx_per_slot (вычисляет менеджер).
+    "ctx_per_slot": int(os.getenv("LLM_SERVER_CTX_PER_SLOT", "32768")),
+    # Ключ llama-server (--api-key); пусто — без авторизации (localhost)
+    "api_key": os.getenv("LLM_SERVER_API_KEY", ""),
+    # Прокси при старте сам проверяет/запускает llama-server (неблокирующе)
+    "autostart": os.getenv("LLM_SERVER_AUTOSTART", "1").strip().lower() in ("1", "true", "yes", "on"),
+    # Дополнительные флаги командной строки llama-server (GPU-слои,
+    # квантование KV-кэша и т.п.)
+    "extra_args": os.getenv("LLM_SERVER_EXTRA_ARGS", ""),
+    # Сколько секунд ждать готовности /health при старте (загрузка GGUF
+    # в память и выделение KV-кэша могут занимать десятки секунд)
+    "start_timeout": float(os.getenv("LLM_SERVER_START_TIMEOUT", "300")),
 }
 
 # ==================== Детектирование чат-команд ====================
 # Гибридная схема: дешёвый regex-префильтр (отсекает обычные промты) →
 # детерминированные правила для точных формулировок → GLiNER zero-shot для
 # свободных формулировок «безопасных» команд. GLiNER уже загружен в процесс
-# прокси (NER-контур): детекция команд офлайн и не зависит от LM Studio.
+# прокси (NER-контур): детекция команд офлайн и не зависит от llama-server.
 # Перезапуск прокси — ТОЛЬКО по правилам (деструктивная команда; GLiNER
 # путает «перезапусти прокси» с «перезапусти тестовый сервер» — проверено).
 COMMAND_CLASSIFIER = {

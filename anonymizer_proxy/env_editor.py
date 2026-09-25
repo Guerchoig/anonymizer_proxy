@@ -41,6 +41,9 @@ class EnvEditorError(ValueError):
 INT_KEYS: dict[str, tuple[int, int]] = {
     "PROXY_PORT": (1, 65535),
     "LOCAL_LLM_TIMEOUT": (1, 3600),
+    "LLM_SERVER_PORT": (1, 65535),
+    "LLM_SERVER_PARALLEL": (1, 32),
+    "LLM_SERVER_CTX_PER_SLOT": (1024, 131072),
 }
 CHOICE_KEYS: dict[str, list[str]] = {}
 
@@ -99,16 +102,57 @@ def schema() -> list[dict]:
         })
 
     items += [
-        {"key": "LOCAL_LLM_BASE_URL", "group": "Локальная модель (LM Studio)",
-         "description": "Адрес OpenAI-совместимого сервера LM Studio",
+        {"key": "LLM_SERVER_BIN", "group": "Локальная модель (llama.cpp)",
+         "description": "Путь к llama-server (пусто — автопоиск: общий "
+                        "llama-рантайм, tools/llama.cpp, PATH, Homebrew)",
          "is_secret": False},
-        {"key": "LOCAL_LLM_MODEL", "group": "Локальная модель (LM Studio)",
-         "description": "Имя загруженной модели", "is_secret": False},
-        {"key": "LOCAL_LLM_API_KEY", "group": "Локальная модель (LM Studio)",
-         "description": "Ключ авторизации LM Studio (обычно не требуется)",
+        {"key": "LLM_SERVER_MODEL", "group": "Локальная модель (llama.cpp)",
+         "description": "GGUF-модель: shared:chat — активная модель общего "
+                        "llama-рантайма (меняется в виджете «Общая чат-модель» "
+                        "или командой llama_runtime switch); абсолютный путь "
+                        "к .gguf — escape-hatch",
+         "is_secret": False},
+        {"key": "LLM_SERVER_HOST", "group": "Локальная модель (llama.cpp)",
+         "description": "Адрес привязки llama-server", "is_secret": False},
+        {"key": "LLM_SERVER_PORT", "group": "Локальная модель (llama.cpp)",
+         "description": "Порт llama-server (дефолт llama.cpp — 8080)",
+         "is_secret": False},
+        {"key": "LLM_SERVER_PARALLEL", "group": "Локальная модель (llama.cpp)",
+         "description": "Слотов конкурентности: 1 — запросы строго по "
+                        "очереди, каждый получает полный контекст (дефолт "
+                        "проекта)", "is_secret": False},
+        {"key": "LLM_SERVER_CTX_PER_SLOT",
+         "group": "Локальная модель (llama.cpp)",
+         "description": "Контекст на один запрос, токенов (32K — файл "
+                        "через прокси / RAG-поиск); общий буфер сервера = "
+                        "PARALLEL × это значение", "is_secret": False},
+        {"key": "LLM_SERVER_API_KEY", "group": "Локальная модель (llama.cpp)",
+         "description": "Ключ llama-server (--api-key; пусто — без "
+                        "авторизации, допустимо на localhost)",
          "is_secret": True},
-        {"key": "LOCAL_LLM_TIMEOUT", "group": "Локальная модель (LM Studio)",
-         "description": "Таймаут запроса, сек", "is_secret": False},
+        {"key": "LLM_SERVER_AUTOSTART",
+         "group": "Локальная модель (llama.cpp)",
+         "description": "Прокси при старте сам проверяет/запускает "
+                        "llama-server (1/0)", "is_secret": False},
+        {"key": "LLM_SERVER_EXTRA_ARGS",
+         "group": "Локальная модель (llama.cpp)",
+         "description": "Доп. флаги llama-server (например, --n-gpu-layers "
+                        "99, квантование KV-кэша)", "is_secret": False},
+
+        {"key": "LOCAL_LLM_BASE_URL", "group": "Локальная модель (llama.cpp)",
+         "description": "Адрес OpenAI-совместимого сервера llama-server "
+                        "(пусто — из LLM_SERVER_HOST/PORT)",
+         "is_secret": False},
+        {"key": "LOCAL_LLM_MODEL", "group": "Локальная модель (llama.cpp)",
+         "description": "Имя модели llama-server (пусто — первая с сервера)",
+         "is_secret": False},
+        {"key": "LOCAL_LLM_API_KEY", "group": "Локальная модель (llama.cpp)",
+         "description": "Ключ авторизации на llama-server (обычно не "
+                        "требуется; приоритетнее LLM_SERVER_API_KEY)",
+         "is_secret": True},
+        {"key": "LOCAL_LLM_TIMEOUT", "group": "Локальная модель (llama.cpp)",
+         "description": "Таймаут запроса, сек (покрывает ожидание в очереди "
+                        "за чужим длинным запросом)", "is_secret": False},
 
         {"key": "PROXY_HOST", "group": "Прокси-сервер",
          "description": "Адрес привязки (127.0.0.1 — только эта машина)",

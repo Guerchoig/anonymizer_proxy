@@ -1,4 +1,4 @@
-"""
+﻿"""
 Функциональные тесты проброса tool-calling (tools/tool_calls) через прокси.
 
 Проверяют исправление дефекта, из-за которого облачная модель не получала
@@ -28,7 +28,7 @@ from anonymizer_proxy.proxy.handlers import RequestHandler
 handlers_module.CURRENT_MODE = "full"
 
 
-# ==================== Фейки (без LM Studio и сети) ====================
+# ==================== Фейки (без llama-server и сети) ====================
 
 class FakeNER:
     """NER, который находит заданные PII-строки по точному совпадению"""

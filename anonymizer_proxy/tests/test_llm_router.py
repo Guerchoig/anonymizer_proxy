@@ -1,5 +1,5 @@
-"""
-Тесты LLMRouter (OpenRouter / локальная LM Studio) и чат-команд управления.
+﻿"""
+Тесты LLMRouter (OpenRouter / локальная llama-server) и чат-команд управления.
 
 Проверяют:
 1. Выбор бэкенда: префиксы local//cloud/, точное имя локальной модели,
@@ -7,7 +7,7 @@
 2. set_backend: переключение без перезапуска + персист в runtime_state.json.
 3. Thinking локальной модели НЕ вырезается: reasoning_content и
    <think>…</think> доходят до клиента как есть (non-stream и stream).
-4. max_tokens клиента не пересылается в LM Studio — у локальной модели
+4. max_tokens клиента не пересылается в llama-server — у локальной модели
    нет бюджета выходных токенов.
 5. Чат-команды «перезапусти прокси» / «работай через локальную модель» /
    «работай через облако» распознаются только в текущем сообщении.
@@ -183,7 +183,7 @@ def test_local_no_max_tokens():
     asyncio.run(local.chat_completion(
         messages=[{"role": "user", "content": "тест"}], max_tokens=512))
     assert "max_tokens" not in captured["json"], captured["json"]
-    print("TEST 6 OK: max_tokens не пересылается в LM Studio")
+    print("TEST 6 OK: max_tokens не пересылается в llama-server")
 
 
 def make_request(text: str) -> ChatCompletionRequest:

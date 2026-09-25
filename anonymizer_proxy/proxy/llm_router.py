@@ -1,7 +1,7 @@
-"""
+﻿"""
 Роутер LLM-бэкендов: облачные провайдеры (реестр CLOUD_PROVIDERS —
 OpenRouter, GPTunneL, BotHub, AITUNNEL, GenAPI, custom) и локальная
-модель (LM Studio).
+модель (llama.cpp / llama-server, менеджер — anonymizer_proxy.llm_server).
 
 Интерфейс совпадает с OpenRouterClient (chat_completion,
 chat_completion_stream, get_models, close), поэтому RequestHandler и
@@ -120,26 +120,28 @@ def _continue_messages(messages: list[dict]) -> list[dict]:
 
 
 class LocalLMClient:
-    """Клиент локальной модели (LM Studio, OpenAI-совместимый API).
+    """Клиент локальной модели (llama-server, OpenAI-совместимый API).
 
-    Thinking-вывод (reasoning_content, <think>…) передаётся клиенту без
-    изменений; max_tokens не пересылается — у локальной модели нет бюджета.
+    Thinking-вывод (reasoning_content и блоки размышлений) передаётся
+    клиенту без изменений; max_tokens не пересылается — у локальной модели
+    нет бюджета. Жизненным циклом сервера управляет модуль llm_server:
+    прокси при старте переиспользует живой инстанс или запускает свой.
     """
 
     def __init__(self, config: dict):
         self.base_url = config["base_url"].rstrip("/")
-        self.api_key = config.get("api_key") or "lm-studio"
+        self.api_key = config.get("api_key") or "llama-server"
         self.model = config.get("model") or ""
         self.timeout = config.get("timeout", 600.0)
         self._client: Optional[httpx.AsyncClient] = None
         self._resolved_model: Optional[str] = None
 
     async def _resolve_model(self, requested: Optional[str]) -> str:
-        """Имя модели для запроса: явное > из .env > первая из LM Studio.
+        """Имя модели для запроса: явное > из .env > первая с llama-server.
 
         Fallback нужен, чтобы связка работала «из коробки»: если
-        LOCAL_LLM_MODEL не задан, берётся первая загруженная в LM Studio
-        не-embedding модель.
+        LOCAL_LLM_MODEL не задан, берётся первая (единственная) модель
+        llama-server, отфильтровав embedding-модели.
         """
         if requested:
             return requested
@@ -152,8 +154,8 @@ class LocalLMClient:
             self._resolved_model = usable[0] if usable else ""
             if self._resolved_model:
                 logger.info(
-                    "LOCAL_LLM_MODEL не задан — использую модель из "
-                    "LM Studio: %s", self._resolved_model)
+                    "LOCAL_LLM_MODEL не задан — использую модель с "
+                    "llama-server: %s", self._resolved_model)
         return self._resolved_model
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -169,11 +171,11 @@ class LocalLMClient:
 
     def _unavailable_hint(self) -> str:
         return (
-            "Локальная модель недоступна: LM Studio не запущен или сервер "
-            f"не отвечает ({self.base_url}). Запустите LM Studio, загрузите "
-            f"модель {self.model or '(см. .env LOCAL_LLM_MODEL)'} и "
-            "повторите запрос, либо переключитесь на облако командой "
-            "«работай через облако»."
+            "Локальная модель недоступна: llama-server не отвечает на "
+            f"{self.base_url}. Запустите его командой "
+            "«python -m anonymizer_proxy.llm_server start» (проверьте "
+            "LLM_SERVER_BIN и LLM_SERVER_MODEL в .env), либо переключитесь "
+            "на облако командой «работай через облако»."
         )
 
     @staticmethod
@@ -220,7 +222,7 @@ class LocalLMClient:
                 logger.warning(
                     "Локальная модель остановлена по лимиту выходных "
                     "токенов (finish_reason=length) — ответ может быть "
-                    "обрезан (настройки генерации/контекст LM Studio)")
+                    "обрезан (настройки генерации/контекст llama-server)")
         return data
 
     async def chat_completion_stream(
@@ -368,11 +370,19 @@ class LLMRouter:
         return RUNTIME["backend"]
 
     async def local_status(self) -> dict:
-        """Доступность LM Studio и список загруженных моделей."""
+        """Доступность llama-server, список моделей и состояние сервера
+        (слоты, pid — из менеджера llm_server)."""
         try:
             models = await self._local.list_models()
+            try:
+                from .. import llm_server
+                server = llm_server.status()
+            except Exception:  # noqa: BLE001 — статус не должен падать
+                server = {}
             return {"available": True,
-                    "models": [m.get("id") for m in models]}
+                    "models": [m.get("id") for m in models],
+                    **{k: v for k, v in server.items()
+                       if k not in ("state", "running")}}
         except Exception as exc:  # noqa: BLE001 — статус не должен падать
             return {"available": False, "error": str(exc)}
 

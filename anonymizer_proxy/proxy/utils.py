@@ -113,7 +113,7 @@ PLACEHOLDER_DEANON_INTENT_RE = re.compile(
 PLACEHOLDER_TOKEN_RE = re.compile(r"\[[A-Z_]+_\d+\]")
 # Чат-команды управления прокси (проверяются ТОЛЬКО в текущем сообщении
 # пользователя — см. last_user_message_texts): перезапуск сервера и
-# переключение активного LLM-бэкенда (OpenRouter / локальная LM Studio).
+# переключение активного LLM-бэкенда (OpenRouter / локальная llama-server).
 # «перезагрузи прокси» и «рестартни сервер» — те же команды другими словами.
 RESTART_INTENT_RE = re.compile(
     r"(?:перезапусти|перезапустить|перезагрузи|перезагрузить"

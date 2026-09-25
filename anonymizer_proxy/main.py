@@ -27,9 +27,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from anonymizer_proxy.config import (
     Mode, PROXY, OPENROUTER, LOGS_DIR, CURRENT_MODE, NER_ENGINE,
     CLOUD_PROVIDER, CLOUD_PROVIDERS, acting_cloud_provider,
-    PROXY_VERSION, BASE_DIR, ensure_directories, logger
+    PROXY_VERSION, BASE_DIR, ensure_directories, logger, LLM_SERVER
 )
 from anonymizer_proxy import launcher
+from anonymizer_proxy import llm_server
+from anonymizer_proxy import llama_runtime
 from anonymizer_proxy.anonymizer.ner_service import NERService
 from anonymizer_proxy.anonymizer.mapping_store import MappingStore
 from anonymizer_proxy.proxy.openrouter_client import OpenRouterError
@@ -175,6 +177,28 @@ async def lifespan(app: FastAPI):
         mapping_store=mapping_store,
         openrouter_client=openrouter_client,
     )
+
+    # llama-server: неблокирующий ensure — проверяем/запускаем локальный
+    # бэкенд В ФОНЕ (не задерживаем прогрев NER и старт HTTP-сервера).
+    # Живой инстанс (в т.ч. запущенный другим приложением) переиспользуется;
+    # посторонний сервис на порту или отсутствие бинаря — только WARNING:
+    # облачные бэкенды работают без изменений.
+    if LLM_SERVER["autostart"]:
+        def _llm_ensure_job():
+            try:
+                info = llm_server.ensure()
+                logger.info("  [OK] llama-server: %s (слотов: %s)",
+                            info.get("state"), info.get("total_slots"))
+            except Exception as exc:  # noqa: BLE001 — не критично для прокси
+                logger.warning(
+                    "  [ВНИМАНИЕ] llama-server недоступен: %s — локальный "
+                    "бэкенд выключен, облачные бэкенды работают как обычно",
+                    exc)
+        threading.Thread(target=_llm_ensure_job, daemon=True,
+                         name="llama-server-ensure").start()
+    else:
+        logger.info("  llama-server: автозапуск отключён "
+                    "(LLM_SERVER_AUTOSTART=0)")
 
     # Прогреваем локальную NER-модель (загрузка весов при первом запуске)
     try:
@@ -745,6 +769,98 @@ async def get_provider_models(provider: Optional[str] = None):
                        provider or "действующий", exc)
         raise HTTPException(status_code=502,
                             detail=f"Список моделей недоступен: {exc}")
+
+
+# ==================== Общая чат-модель (llama-рантайм машины) ====================
+# Одна модель на все проекты: файл лежит в общем llama-рантайме
+# (%LLAMA_RUNTIME_DIR% / %LOCALAPPDATA%\llama-runtime), активная модель —
+# манифест models/chat/current.json (спецификатор "shared:chat" в конфигах).
+# Смена модели видна и hermes-disk-search: его llama-инстанс перезапускается
+# по реестру projects.json (см. llama_runtime.switch_chat_model).
+
+# Состояние фоновой операции смены/скачивания (для поллинга из UI)
+_CHAT_MODEL_JOB = {"running": False, "stage": "", "msg": "", "result": None}
+
+
+def _self_restart_local_llama() -> dict:
+    """Перезапуск llama-server ЭТОГО проекта с новой моделью из манифеста."""
+    try:
+        was_up = llm_server.probe()["state"] == llm_server.STATE_LLAMA
+        llm_server.stop()
+        if was_up or LLM_SERVER["autostart"]:
+            info = llm_server.start()
+            return {"ok": True,
+                    "msg": "llama-server перезапущен: %s слот(ов)"
+                           % (info.get("total_slots") or "?")}
+        return {"ok": True,
+                "msg": "llama-server не был запущен — стартует при следующем "
+                       "запуске прокси"}
+    except Exception as exc:  # noqa: BLE001 — не роняем UI из-за стопа/старта
+        return {"ok": False, "msg": str(exc)}
+
+
+def _chat_model_job_worker(filename: str, restart: bool) -> None:
+    """Фон: скачать (если пресет отсутствует) и применить модель везде."""
+    def progress(pct: float, msg: str) -> None:
+        _CHAT_MODEL_JOB["stage"] = "download"
+        _CHAT_MODEL_JOB["msg"] = f"{pct:5.1f}%  {msg}"
+
+    try:
+        _CHAT_MODEL_JOB.update({"running": True, "stage": "apply",
+                                "msg": "меняю модель…", "result": None})
+        info = llama_runtime.switch_chat_model(
+            filename, restart=restart,
+            self_root=str(BASE_DIR), self_restart=_self_restart_local_llama,
+            progress=progress)
+        _CHAT_MODEL_JOB["result"] = info
+        _CHAT_MODEL_JOB["msg"] = (
+            f"активная модель: {filename}" if info.get("ok")
+            else info.get("msg", "не удалось"))
+    except Exception as exc:  # noqa: BLE001
+        _CHAT_MODEL_JOB["result"] = {"ok": False, "msg": str(exc)}
+        _CHAT_MODEL_JOB["msg"] = str(exc)
+    finally:
+        _CHAT_MODEL_JOB["running"] = False
+        _CHAT_MODEL_JOB["stage"] = ""
+
+
+@app.get("/api/chat-model", dependencies=[Depends(require_api_token)])
+async def get_chat_model():
+    """Общая чат-модель llama-рантайма: доступные файлы, пресеты, текущая,
+    реестр проектов и состояние фоновой смены."""
+    info = llama_runtime.chat_models_overview()
+    info["server"] = llm_server.status()
+    info["job"] = dict(_CHAT_MODEL_JOB)
+    return info
+
+
+@app.post("/api/chat-model", dependencies=[Depends(require_api_token)])
+async def set_chat_model(body: dict):
+    """Сменить активную чат-модель ОБЩЕГО рантайма (применяется ко всем
+    зарегистрированным проектам).
+
+    {"file": "<имя GGUF в models/chat | имя пресета>", "restart": true}.
+    Операция (в т.ч. скачивание пресета ~5–7 ГБ) выполняется в фоне —
+    состояние в GET /api/chat-model (поле job)."""
+    file = os.path.basename(str((body or {}).get("file", "")).strip())
+    restart = bool((body or {}).get("restart", True))
+    if not file:
+        raise HTTPException(status_code=400, detail="Укажите file (имя GGUF)")
+    on_disk = (llama_runtime.models_dir("chat") / file).is_file()
+    if not on_disk and file not in llama_runtime.CHAT_PRESETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Модель '{file}' не найдена в llama-рантайме и не "
+                   "является известным пресетом")
+    if _CHAT_MODEL_JOB["running"]:
+        raise HTTPException(status_code=409,
+                            detail="Смена модели уже выполняется")
+    threading.Thread(target=_chat_model_job_worker,
+                     args=(file, restart), daemon=True,
+                     name="chat-model-switch").start()
+    what = "применяю" if on_disk else f"скачиваю ({file})"
+    return {"ok": True, "msg": f"{what} — прогресс в поле job",
+            "job": dict(_CHAT_MODEL_JOB)}
 
 
 # ==================== Редактор настроек (.env из веб-формы) ====================
