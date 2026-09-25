@@ -145,7 +145,8 @@ jobs:
           .venv/bin/python -m anonymizer_proxy.llama_runtime list
           test -f "$RT/projects.json" || { echo "ПРОВАЛ: нет $RT/projects.json"; exit 1; }
           grep -q 'anonymizer_proxy' "$RT/projects.json"
-          grep -q 'llama_server' "$RT/projects.json"
+          grep -q 'restart_args' "$RT/projects.json"
+          grep -q 'llm_server' "$RT/projects.json"
           echo "Проект anonymizer_proxy зарегистрирован в общем llama-рантайме"
 
       - name: install_selftest.py — код возврата обязан быть 0
