@@ -39,3 +39,10 @@ docs/
 Anonymizer Proxy.app/
 *.app/
 .DS_Store
+
+# Артефакты прогонов/отладки и анонимизированные копии документов:
+# это рабочие файлы (могут содержать PII) — в репозиторий и релиз не идут
+_smoke/
+*.anonymized.*
+preflight_*.out
+preflight_*.err

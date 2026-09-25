@@ -12,10 +12,15 @@
 #     - все тест-скрипты anonymizer_proxy/tests/test_*.py (код возврата).
 #   job macos-installer (macos-latest) — E2E-тест macOS-инсталлятора:
 #     - синтаксис всех *.sh / *.command (bash -n; zsh -n для zsh-скриптов);
-#     - bash install.sh неинтерактивно (stdin=/dev/null): uv sync
-#       --locked --extra cpu, генерация .env, скачивание NER-моделей;
-#     - scripts/install_selftest.py — код возврата обязан быть 0
+#     - bash install.sh неинтерактивно (stdin=/dev/null): карантин, preflight,
+#       uv sync --locked --extra cpu, генерация .env, скачивание NER-моделей,
+#       общий llama-рантайм (scripts/ensure_llama_runtime.sh);
+#     - install_selftest.py — код возврата обязан быть 0
 #       (install.sh сам прогоняет selftest, но НЕ фейлит установку);
+#     - preflight реально проверяет пороги (отказы на невыполнимых
+#       требованиях, которые задаются переменными ANONYMIZER_MIN_*);
+#     - общий llama-рантайм: проект зарегистрирован в projects.json
+#       (~/Library/Application Support/llama-runtime);
 #     - make_mac_app.sh: каркас Anonymizer Proxy.app, plutil -lint;
 #     - start_proxy.sh: сервер реально стартует, /health отвечает;
 #     - install_launchagent.sh: регистрация LaunchAgent (не блокирующе).
@@ -84,8 +89,9 @@ jobs:
           for f in *.sh *.command; do
             bash -n "$f" && echo "bash -n OK: $f"
           done
-          # У этих трёх shebang zsh — дополнительно парсим zsh
-          for f in make_mac_app.sh install_launchagent.sh start_proxy.command; do
+          # У этих четырёх shebang zsh — дополнительно парсим zsh
+          for f in make_mac_app.sh install_launchagent.sh start_proxy.command \
+                   install.command; do
             zsh -n "$f" && echo "zsh -n OK: $f"
           done
 
@@ -95,7 +101,44 @@ jobs:
       - name: bash install.sh (неинтерактивно, как у пользователя)
         # stdin </dev/null: read возвращает пустую строку, интерактивные шаги
         # (ввод OPENROUTER_API_KEY, автозапуск LaunchAgent) пропускаются.
+        # Пороги preflight понижены: у macOS-раннера GitHub 7 ГБ ОЗУ и
+        # ограниченный диск (проектный минимум — 8/10 ГБ), иначе установка
+        # штатно остановилась бы. Сами проверки порогов тестируются
+        # следующим шагом.
+        env:
+          ANONYMIZER_MIN_RAM_GB: "6"
+          ANONYMIZER_MIN_DISK_GB: "6"
         run: bash install.sh < /dev/null
+
+      - name: preflight — пороги реально проверяются (ожидаются отказы)
+        run: |
+          set -euo pipefail
+          if ANONYMIZER_MIN_DISK_GB=99999 bash install.sh < /dev/null \
+                  > preflight_disk.out 2> preflight_disk.err; then
+            echo "ПРОВАЛ: preflight не остановил установку при нехватке места"
+            exit 1
+          fi
+          grep -q 'Мало свободного места' preflight_disk.err
+          if ANONYMIZER_MIN_MACOS=999 bash install.sh < /dev/null \
+                  > preflight_os.out 2> preflight_os.err; then
+            echo "ПРОВАЛ: preflight не остановил установку при старой ОС"
+            exit 1
+          fi
+          grep -q 'Требуется macOS' preflight_os.err
+          rm -f preflight_*.out preflight_*.err
+          echo "preflight: отказы на невыполнимых требованиях подтверждены"
+
+      - name: Общий llama-рантайм — проект зарегистрирован (install.sh → ensure)
+        run: |
+          set -euo pipefail
+          RT="${LLAMA_RUNTIME_DIR:-$HOME/Library/Application Support/llama-runtime}"
+          test -d "$RT" || { echo "ПРОВАЛ: каталог рантайма не создан: $RT"; exit 1; }
+          .venv/bin/python -m anonymizer_proxy.llama_runtime dir
+          .venv/bin/python -m anonymizer_proxy.llama_runtime list
+          test -f "$RT/projects.json" || { echo "ПРОВАЛ: нет $RT/projects.json"; exit 1; }
+          grep -q 'anonymizer_proxy' "$RT/projects.json"
+          grep -q 'llama_server' "$RT/projects.json"
+          echo "Проект anonymizer_proxy зарегистрирован в общем llama-рантайме"
 
       - name: install_selftest.py — код возврата обязан быть 0
         run: .venv/bin/python scripts/install_selftest.py
