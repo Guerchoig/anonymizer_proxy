@@ -11,13 +11,17 @@
    сервисе на порту;
 4. stop по PID-файлу; битый PID-файл; отсутствие PID-файла.
 
-Запуск: python -m anonymizer_proxy.tests.test_llm_server (из корня проекта)
+Запуск: python anonymizer_proxy\\tests\\test_llm_server.py (из корня проекта)
+        или python -m anonymizer_proxy.tests.test_llm_server
 """
 import json
+import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import anonymizer_proxy.llm_server as m
 

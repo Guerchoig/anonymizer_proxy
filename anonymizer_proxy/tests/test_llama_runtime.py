@@ -6,13 +6,16 @@
 Сеть и реальные llama-инстансы не используются: каталог рантайма
 подменяется временным через LLAMA_RUNTIME_DIR.
 
-Запуск: python -m anonymizer_proxy.tests.test_llama_runtime
+Запуск: python anonymizer_proxy\\tests\\test_llama_runtime.py (из корня проекта)
+        или python -m anonymizer_proxy.tests.test_llama_runtime
 """
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from anonymizer_proxy import llama_runtime as lr
 

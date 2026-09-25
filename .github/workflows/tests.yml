@@ -111,20 +111,28 @@ jobs:
         run: bash install.sh < /dev/null
 
       - name: preflight — пороги реально проверяются (ожидаются отказы)
+        # Пороги ОЗУ/диска заданы ниже минимума раннера, чтобы отказ вызывало
+        # именно проверяемое требование (у мак-раннера 7 ГБ ОЗУ < 8 ГБ).
         run: |
           set -euo pipefail
-          if ANONYMIZER_MIN_DISK_GB=99999 bash install.sh < /dev/null \
-                  > preflight_disk.out 2> preflight_disk.err; then
+          if ANONYMIZER_MIN_RAM_GB=6 ANONYMIZER_MIN_DISK_GB=99999 \
+                  bash install.sh < /dev/null > preflight_disk.out 2> preflight_disk.err; then
             echo "ПРОВАЛ: preflight не остановил установку при нехватке места"
             exit 1
           fi
           grep -q 'Мало свободного места' preflight_disk.err
-          if ANONYMIZER_MIN_MACOS=999 bash install.sh < /dev/null \
-                  > preflight_os.out 2> preflight_os.err; then
+          if ANONYMIZER_MIN_RAM_GB=6 ANONYMIZER_MIN_DISK_GB=6 ANONYMIZER_MIN_MACOS=999 \
+                  bash install.sh < /dev/null > preflight_os.out 2> preflight_os.err; then
             echo "ПРОВАЛ: preflight не остановил установку при старой ОС"
             exit 1
           fi
           grep -q 'Требуется macOS' preflight_os.err
+          if ANONYMIZER_MIN_RAM_GB=99999 ANONYMIZER_MIN_DISK_GB=6 \
+                  bash install.sh < /dev/null > preflight_ram.out 2> preflight_ram.err; then
+            echo "ПРОВАЛ: preflight не остановил установку при нехватке ОЗУ"
+            exit 1
+          fi
+          grep -q 'Недостаточно оперативной памяти' preflight_ram.err
           rm -f preflight_*.out preflight_*.err
           echo "preflight: отказы на невыполнимых требованиях подтверждены"
 
