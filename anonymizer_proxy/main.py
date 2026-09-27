@@ -64,15 +64,26 @@ openrouter_client: Optional[LLMRouter] = None
 request_handler: Optional[RequestHandler] = None
 
 
+# Хелпер перезапуска — ОТСЛЕЖИВАЕМЫЙ файл пакета (попадает в релизный архив;
+# каталог data/ в git не хранится). Запускается ФАЙЛОМ, а не `-m`: перезапуск
+# не должен зависеть от импорта пакета/конфига (см. restart_helper.py).
+RESTART_HELPER = BASE_DIR / "anonymizer_proxy" / "restart_helper.py"
+
+
+def restart_helper_command() -> list:
+    """Команда запуска отвязанного хелпера перезапуска прокси."""
+    return [sys.executable, str(RESTART_HELPER)]
+
+
 def _schedule_proxy_restart(delay: float = 2.0) -> None:
-    """Чат-команда «перезапусти прокси»: ответ уже отправлен клиенту —
-    через delay запускаем отвязанный хелпер перезапуска (он ждёт
-    освобождения порта, поднимает сервер и пишет результат в
-    data/logs/restart.log) и завершаем этот процесс.
+    """Чат-команда «перезапусти прокси» / «Сохранить и перезапустить»:
+    ответ уже отправлен клиенту — через delay запускаем отвязанный хелпер
+    перезапуска (он ждёт освобождения порта, поднимает сервер и пишет
+    результат в data/logs/restart.log) и завершаем этот процесс.
     """
     async def _job():
         await asyncio.sleep(delay)
-        helper = BASE_DIR / "data" / "restart_helper.py"
+        command = restart_helper_command()
         if sys.platform == "win32":
             # DETACHED_PROCESS: хелпер живёт после смерти сервера и без окна
             popen_kwargs: dict = {
@@ -84,7 +95,7 @@ def _schedule_proxy_restart(delay: float = 2.0) -> None:
             # отвязывает процесс от нашей сессии терминала (setsid).
             popen_kwargs = {"start_new_session": True}
         subprocess.Popen(
-            [sys.executable, str(helper)],
+            command,
             cwd=str(BASE_DIR),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -331,6 +342,75 @@ def _make_openai_error(status_code: int, message: str, error_type: str = "server
     )
 
 
+# ==================== Прерывание генерации при отключении клиента ====================
+# «Отмена» запроса в UI агента (Hermes/Cline) может дойти до прокси БЕЗ
+# закрытия HTTP-соединения, а llama-server останавливает генерацию по обрыву
+# соединения не во всех сценариях. Без явной отмены модель продолжает
+# генерировать на CPU часами после того, как клиент уже ушёл (наблюдение:
+# «отменил запрос в Hermes, а CPU крутится»).
+
+class _ClientDisconnected(Exception):
+    """Клиент отключился до завершения ответа (не-стриминговый путь)."""
+
+
+async def _abort_backend_generation() -> None:
+    """Прервать генерацию на llama-server (best-effort, см. LLMRouter)."""
+    try:
+        if openrouter_client is not None:
+            await openrouter_client.abort_generation()
+    except Exception:  # noqa: BLE001 — отмена не должна ломать ответ
+        logger.debug("Не удалось прервать генерацию бэкенда", exc_info=True)
+
+
+async def _disconnect_watcher(request: Request, task=None) -> None:
+    """Опрашивать отключение клиента; при обрыве — abort бэкенда и отмена
+    задачи-обработчика (для не-стримингового пути)."""
+    try:
+        while True:
+            if await request.is_disconnected():
+                await _abort_backend_generation()
+                if task is not None and not task.done():
+                    task.cancel()
+                return
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+    except asyncio.CancelledError:
+        return
+    except Exception:  # noqa: BLE001 — watcher не должен ломать запрос
+        logger.debug("disconnect watcher завершился с ошибкой", exc_info=True)
+        return
+
+
+async def _with_disconnect_abort(request: Request, coro_factory) -> object:
+    """Выполнить awaitable, прервав его при отключении клиента.
+
+    Возвращает результат coro_factory(); при отключении клиента отменяет
+    задачу, просит бэкенд прервать генерацию и бросает _ClientDisconnected.
+    """
+    task = asyncio.ensure_future(coro_factory())
+    watcher = asyncio.create_task(_disconnect_watcher(request, task))
+    try:
+        return await task
+    except asyncio.CancelledError as exc:
+        raise _ClientDisconnected() from exc
+    finally:
+        watcher.cancel()
+
+
+def _guard_stream(agen):
+    """Обёртка стрима без keep-alive: при досрочном завершении генератора
+    (отмена клиента, обрыв, ошибка) просим бэкенд прервать генерацию."""
+    async def _wrapped():
+        completed = False
+        try:
+            async for event in agen:
+                yield event
+            completed = True
+        finally:
+            if not completed:
+                await _abort_backend_generation()
+    return _wrapped()
+
+
 # ==================== Keep-alive во время подготовки (NER) ====================
 # Раньше прокси не отдавал клиенту ни байта, пока NER + анонимизация не
 # завершатся, поэтому Cline мог считать запрос зависшим и таймаутить.
@@ -352,6 +432,11 @@ async def _stream_with_keepalive(prepare_factory, stream_factory):
     prepare_factory: async-колбэк без аргументов -> подготовленный объект.
     stream_factory: async-колбэк (подготовленный объект) -> AsyncIterator[str]
     (строки SSE-чанков, уже отформатированные).
+
+    Досрочное завершение стрима (отмена в UI агента, обрыв соединения,
+    ошибка бэкенда) — генератор закрывается и мы просим llama-server
+    прервать генерацию (см. _abort_backend_generation); при штатном
+    завершении отменять нечего (и опасно: слот мог взять чужой запрос).
     """
     prepare_task = asyncio.create_task(prepare_factory())
     try:
@@ -378,8 +463,14 @@ async def _stream_with_keepalive(prepare_factory, stream_factory):
         if not prepare_task.done():
             prepare_task.cancel()
 
-    async for event in stream_factory(prepared):
-        yield event
+    completed = False
+    try:
+        async for event in stream_factory(prepared):
+            yield event
+        completed = True
+    finally:
+        if not completed:
+            await _abort_backend_generation()
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_v1_token)])
@@ -479,7 +570,7 @@ async def chat_completions(
                             }
                         )
                 return StreamingResponse(
-                    request_handler.stream_manual(chat_request),
+                    _guard_stream(request_handler.stream_manual(chat_request)),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -513,11 +604,18 @@ async def chat_completions(
                 }
             )
 
-        # Обычный режим (без стриминга)
-        response, session_id = await request_handler.handle_chat_completion(
-            chat_request,
-            session_id=x_session_id
-        )
+        # Обычный режим (без стриминга). Отключение клиента (обрыв соединения)
+        # прерывает обработку и генерацию бэкенда (см. _with_disconnect_abort).
+        try:
+            response, session_id = await _with_disconnect_abort(
+                request,
+                lambda: request_handler.handle_chat_completion(
+                    chat_request, session_id=x_session_id
+                ),
+            )
+        except _ClientDisconnected:
+            logger.info("Клиент отключился во время обработки — генерация прервана")
+            return _make_openai_error(499, "Client disconnected request", "cancelled")
 
         # Чат-команда «перезапусти прокси»: ответ уйдёт клиенту, затем
         # процесс завершится и поднимется заново (см. _schedule_proxy_restart)

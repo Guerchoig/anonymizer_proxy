@@ -207,8 +207,25 @@ def check_llm_server() -> bool:
     llama-инстансом.
     """
     print("==> Шаг 5/5: llama-server (локальная LLM)")
+    import os
+    from urllib.parse import urlsplit
+
     from anonymizer_proxy import llm_server, llama_runtime
     from anonymizer_proxy.config import LLM_SERVER
+
+    # Схема .env: перенесены ли ключи из .env.example. Старый .env без секции
+    # LLM_SERVER_* (например, оставшийся после перехода с LM Studio) — частая
+    # причина «llama-server не отвечает»: прокси не запускает сервер, а клиент
+    # ходит на устаревший порт. Миграция: python scripts/ensure_env_keys.py
+    try:
+        import ensure_env_keys
+        missing_keys, _ = ensure_env_keys.ensure_env(check=True)
+    except Exception:  # noqa: BLE001 — проверка вспомогательная, не фейлим
+        missing_keys = []
+    if missing_keys:
+        WARNINGS.append(f"в .env нет ключей из .env.example ({len(missing_keys)})")
+        print(f"    [ВНИМАНИЕ] В .env отсутствуют ключи: {', '.join(missing_keys)}")
+        print("    Дополните конфигурацию: python scripts/ensure_env_keys.py")
 
     bin_path = llm_server.find_binary()
     if not bin_path:
@@ -222,8 +239,37 @@ def check_llm_server() -> bool:
         return True
     print(f"    OK: llama-server найден: {bin_path}")
 
-    # Модель: shared:chat — файл из манифеста общего llama-рантайма
-    spec = LLM_SERVER["model"] or "shared:chat"
+    # Модель: shared:chat — файл из манифеста общего llama-рантайма.
+    # Пустой LLM_SERVER_MODEL — конфигурация НЕ заработает: менеджер
+    # (llm_server.build_command) откажется запускать сервер, а локальные
+    # запросы упадут с 502 «llama-server не отвечает».
+    spec = LLM_SERVER["model"]
+    if not spec:
+        py_bin = (r".venv\Scripts\python.exe" if sys.platform == "win32"
+                  else ".venv/bin/python")
+        WARNINGS.append("LLM_SERVER_MODEL не задан в .env")
+        print("    [ВНИМАНИЕ] LLM_SERVER_MODEL не задан — прокси НЕ запустит "
+              "llama-server (локальный бэкенд не поднимется).")
+        print(f"    Дополните .env: {py_bin} scripts/ensure_env_keys.py")
+        spec = "shared:chat"
+
+    # Согласованность клиентского URL: явный LOCAL_LLM_BASE_URL перебивает
+    # LLM_SERVER_HOST/PORT — при расхождении портов прокси ходит «не туда»
+    # (502, хотя llama-server на другом порту жив).
+    base_url = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
+    try:
+        base_port = urlsplit(base_url).port if base_url else None
+    except ValueError:
+        base_port = None
+    if base_port and base_port != LLM_SERVER["port"]:
+        WARNINGS.append(f"LOCAL_LLM_BASE_URL ({base_port}) != "
+                        f"LLM_SERVER_PORT ({LLM_SERVER['port']})")
+        print(f"    [ВНИМАНИЕ] LOCAL_LLM_BASE_URL указывает на порт {base_port}, "
+              f"а LLM_SERVER_PORT={LLM_SERVER['port']} — прокси будет ходить "
+              "не на тот порт.")
+        print("    Уберите LOCAL_LLM_BASE_URL из .env (URL выводится из "
+              "LLM_SERVER_HOST/PORT) или сравняйте порты.")
+
     try:
         model = llama_runtime.resolve_model(spec, role="chat")
     except FileNotFoundError as exc:

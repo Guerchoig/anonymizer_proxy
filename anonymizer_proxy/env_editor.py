@@ -126,6 +126,12 @@ def schema() -> list[dict]:
          "description": "Контекст на один запрос, токенов (32K — файл "
                         "через прокси / RAG-поиск); общий буфер сервера = "
                         "PARALLEL × это значение", "is_secret": False},
+        {"key": "LLM_SERVER_MAX_OUTPUT_TOKENS",
+         "group": "Локальная модель (llama.cpp)",
+         "description": "Верхний предел выходных токенов локальной модели "
+                        "(защита от «залипшей» генерации thinking-моделей: "
+                        "отменённый запрос иначе продолжает жечь CPU). "
+                        "0 — без лимита", "is_secret": False},
         {"key": "LLM_SERVER_API_KEY", "group": "Локальная модель (llama.cpp)",
          "description": "Ключ llama-server (--api-key; пусто — без "
                         "авторизации, допустимо на localhost)",

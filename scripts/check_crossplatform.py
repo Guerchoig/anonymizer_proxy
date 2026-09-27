@@ -48,6 +48,8 @@ MAC_SCRIPTS = (
     "install_launchagent.sh",
     "scripts/ensure_llama_runtime.sh",
     "scripts/ensure_llama_runtime.ps1",
+    # Вызывается install.sh (миграция .env: недостающие ключи из .env.example)
+    "scripts/ensure_env_keys.py",
 )
 SHELL_SUFFIXES = (".sh", ".command")
 EXCLUDE_DIRS = {".git", ".venv", "__pycache__", "data", "models", "_smoke"}

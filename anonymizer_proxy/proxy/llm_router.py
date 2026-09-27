@@ -24,8 +24,10 @@ main.py работают с роутером без изменений.
 
 Thinking-вывод локальной модели (<think>…</think> и reasoning_content)
 НЕ вырезается — передаётся в чат так же, как у облачных бэкендов.
-max_tokens в запрос не пересылается: у локальной модели нет бюджета
-выходных токенов.
+max_tokens клиента не пересылается (клиентский бюджет непредсказуем),
+но генерация ограничена сверху LLM_SERVER_MAX_OUTPUT_TOKENS (дефолт 8192):
+без лимита runaway-генерация thinking-модели упирается только в контекст
+и после отмены запроса клиентом продолжает жечь CPU часами.
 """
 import json
 import re
@@ -123,9 +125,11 @@ class LocalLMClient:
     """Клиент локальной модели (llama-server, OpenAI-совместимый API).
 
     Thinking-вывод (reasoning_content и блоки размышлений) передаётся
-    клиенту без изменений; max_tokens не пересылается — у локальной модели
-    нет бюджета. Жизненным циклом сервера управляет модуль llm_server:
-    прокси при старте переиспользует живой инстанс или запускает свой.
+    клиенту без изменений; max_tokens клиента не пересылается (клиентский
+    бюджет непредсказуем), но генерация ограничена сверху
+    LLM_SERVER_MAX_OUTPUT_TOKENS. Жизненным циклом сервера управляет модуль
+    llm_server: прокси при старте переиспользует живой инстанс или запускает
+    свой.
     """
 
     def __init__(self, config: dict):
@@ -133,6 +137,8 @@ class LocalLMClient:
         self.api_key = config.get("api_key") or "llama-server"
         self.model = config.get("model") or ""
         self.timeout = config.get("timeout", 600.0)
+        self.max_output_tokens = max(
+            0, int(config.get("max_output_tokens") or 0))
         self._client: Optional[httpx.AsyncClient] = None
         self._resolved_model: Optional[str] = None
 
@@ -195,9 +201,13 @@ class LocalLMClient:
         payload: dict = {"model": await self._resolve_model(model), "messages": messages}
         if temperature is not None:
             payload["temperature"] = temperature
-        # max_tokens не пересылается: у локальной модели нет бюджета выходных
-        # токенов, генерация бесплатна — модель заканчивает ответ сама.
-        # Параметр оставлен в сигнатуре для совместимости интерфейса.
+        # max_tokens клиента не пересылается (клиентский бюджет непредсказуем),
+        # но генерация ограничена сверху LLM_SERVER_MAX_OUTPUT_TOKENS:
+        # runaway-генерация thinking-модели без лимита упирается только в
+        # контекст и после отмены запроса клиентом продолжает жечь CPU.
+        cap = self._output_cap()
+        if cap:
+            payload["max_tokens"] = cap
         for key, value in kwargs.items():
             if value is not None:
                 payload[key] = value
@@ -235,7 +245,10 @@ class LocalLMClient:
             "model": await self._resolve_model(model), "messages": messages, "stream": True}
         if temperature is not None:
             payload["temperature"] = temperature
-        # max_tokens не пересылается (см. chat_completion) — бюджета нет
+        # max_tokens: ограничение сверху (см. chat_completion)
+        cap = self._output_cap()
+        if cap:
+            payload["max_tokens"] = cap
         for key, value in kwargs.items():
             if value is not None:
                 payload[key] = value
@@ -272,6 +285,56 @@ class LocalLMClient:
         if response.status_code != 200:
             return []
         return response.json().get("data", [])
+
+    def _output_cap(self) -> Optional[int]:
+        """Верхний предел выходных токенов (n_predict): None — без лимита.
+
+        Предел защищает от runaway-генерации thinking-моделей: отменённый
+        клиентом запрос без лимита продолжает генерировать до исчерпания
+        контекста (наблюдение: «отменил запрос в Hermes, а CPU крутится»).
+        """
+        return self.max_output_tokens if self.max_output_tokens > 0 else None
+
+    async def abort_generation(self) -> int:
+        """Прервать текущую генерацию на llama-server (best-effort).
+
+        Вызывается при досрочном завершении стрима (отмена в UI агента,
+        обрыв соединения, ошибка прокси): «отмена» в агенте может дойти до
+        прокси без закрытия HTTP-соединения, а llama-server обрывает
+        генерацию по обрыву соединения не во всех сценариях — тогда
+        модель продолжает считать на CPU часами.
+
+        Слоты смотрим через GET /slots (llama.cpp, endpoint_slots), занятые
+        отменяем через POST /slots/{id}?action=cancel. Все ошибки глотаются:
+        у старых llama.cpp эндпоинта /slots может не быть, а отменять
+        нечего, если генерация уже завершилась. Возвращает число
+        отменённых занятых слотов.
+        """
+        root = self.base_url.split("/v1", 1)[0]
+        try:
+            client = await self._get_client()
+            resp = await client.get(f"{root}/slots")
+            if resp.status_code != 200:
+                return 0
+            slots = resp.json()
+        except Exception:  # noqa: BLE001 — отмена best-effort
+            return 0
+        cancelled = 0
+        for slot in slots:
+            if not slot.get("is_processing"):
+                continue
+            try:
+                r = await client.post(
+                    f"{root}/slots/{slot['id_slot']}",
+                    params={"action": "cancel"})
+                if r.status_code == 200:
+                    cancelled += 1
+            except Exception:  # noqa: BLE001
+                continue
+        if cancelled:
+            logger.info("Прервана генерация локальной модели (слотов: %d)",
+                        cancelled)
+        return cancelled
 
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -405,6 +468,25 @@ class LLMRouter:
         return result
 
     # ==================== Делегирование ====================
+
+    async def abort_generation(
+        self, model: Optional[str] = None, backend: Optional[str] = None,
+    ) -> int:
+        """Прервать генерацию на локальном llama-server (best-effort).
+
+        Вызывается из main.py при досрочном завершении запроса клиента
+        (отмена в UI агента / обрыв соединения). Для облачных бэкендов —
+        no-op (облако само останавливает генерацию при обрыве соединения);
+        для локального — POST /slots/{id}?action=cancel в llama-server.
+
+        model/backend — те же аргументы разрешения бэкенда, что у
+        chat_completion; без них берётся рантайм-дефолт RUNTIME["backend"].
+        Возвращает число отменённых занятых слотов (0 — нечего отменять).
+        """
+        target = self._resolve(model, backend)
+        if target != "local":
+            return 0
+        return await self._local.abort_generation()
 
     async def chat_completion(
         self, messages: list[dict], model: Optional[str] = None,

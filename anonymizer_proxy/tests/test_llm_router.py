@@ -7,8 +7,9 @@
 2. set_backend: переключение без перезапуска + персист в runtime_state.json.
 3. Thinking локальной модели НЕ вырезается: reasoning_content и
    <think>…</think> доходят до клиента как есть (non-stream и stream).
-4. max_tokens клиента не пересылается в llama-server — у локальной модели
-   нет бюджета выходных токенов.
+4. max_tokens клиента не пересылается в llama-server — вместо него
+   пересылается лимит LLM_SERVER_MAX_OUTPUT_TOKENS (защита от runaway-
+   генерации thinking-моделей).
 5. Чат-команды «перезапусти прокси» / «работай через локальную модель» /
    «работай через облако» распознаются только в текущем сообщении.
 6. На локальном бэкенде авто-анонимизация приложенных файлов отключена —
@@ -163,8 +164,9 @@ def test_local_stream_thinking_passthrough():
     print("TEST 3b OK: стрим — thinking проходит без фильтра")
 
 
-def test_local_no_max_tokens():
-    """max_tokens клиента не пересылается: у локальной модели нет бюджета"""
+def test_local_output_cap():
+    """max_tokens клиента не пересылается, но генерация ограничена лимитом
+    LLM_SERVER_MAX_OUTPUT_TOKENS (защита от runaway-генерации)"""
     import httpx
 
     captured: dict = {}
@@ -177,13 +179,72 @@ def test_local_no_max_tokens():
             "usage": {},
         })
 
-    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
+    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model",
+                           "max_output_tokens": 4096})
     local._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     asyncio.run(local.chat_completion(
         messages=[{"role": "user", "content": "тест"}], max_tokens=512))
+    assert captured["json"]["max_tokens"] == 4096, (
+        "должен пересылаться лимит сервера, а не клиента: %s" % captured["json"])
+
+    # 0 — без лимита (старое поведение)
+    local2 = LocalLMClient({"base_url": "http://x/v1", "model": "test-model",
+                            "max_output_tokens": 0})
+    local2._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    captured.clear()
+    asyncio.run(local2.chat_completion(
+        messages=[{"role": "user", "content": "тест"}], max_tokens=512))
     assert "max_tokens" not in captured["json"], captured["json"]
-    print("TEST 6 OK: max_tokens не пересылается в llama-server")
+    print("TEST 6 OK: max_tokens — лимит сервера вместо клиентского бюджета")
+
+
+def test_local_abort_generation():
+    """abort_generation отменяет занятые слоты llama-server (best-effort)"""
+    import httpx
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if request.method == "GET" and url.endswith("/slots"):
+            return httpx.Response(200, json=[
+                {"id_slot": 0, "is_processing": True},
+                {"id_slot": 1, "is_processing": False},
+            ])
+        if request.method == "POST" and "/slots/0" in url:
+            assert "action=cancel" in url, url
+            calls.append(url)
+            return httpx.Response(200, json={})
+        raise AssertionError(f"неожиданный запрос: {request.method} {url}")
+
+    local = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
+    local._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    cancelled = asyncio.run(local.abort_generation())
+    assert cancelled == 1, cancelled
+    assert len(calls) == 1, calls
+
+    # Нет эндпоинта /slots (старый llama.cpp) — молча 0
+    def handler404(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    local2 = LocalLMClient({"base_url": "http://x/v1", "model": "test-model"})
+    local2._client = httpx.AsyncClient(transport=httpx.MockTransport(handler404))
+    assert asyncio.run(local2.abort_generation()) == 0
+    print("TEST 7 OK: abort_generation отменяет занятый слот")
+
+
+def test_router_abort_noop_for_cloud():
+    """abort_generation для облачного бэкенда — no-op"""
+    router = make_router()
+    old = RUNTIME["backend"]
+    try:
+        RUNTIME["backend"] = "openrouter"
+        assert asyncio.run(router.abort_generation()) == 0
+    finally:
+        RUNTIME["backend"] = old
+    print("TEST 8 OK: abort_generation — no-op для облачных бэкендов")
 
 
 def make_request(text: str) -> ChatCompletionRequest:
@@ -297,7 +358,9 @@ def main():
     test_set_backend_persists()
     test_local_thinking_passthrough()
     test_local_stream_thinking_passthrough()
-    test_local_no_max_tokens()
+    test_local_output_cap()
+    test_local_abort_generation()
+    test_router_abort_noop_for_cloud()
     test_command_detection()
     test_local_backend_skips_file_anon()
     print("\nALL LLM ROUTER TESTS PASSED")

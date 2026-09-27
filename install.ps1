@@ -170,6 +170,31 @@ if (Test-Path ".env") {
     Write-Host "POST /api/backend или переменная CLOUD_PROVIDER в .env."
 }
 
+# ---------- 4b. Миграция .env: недостающие ключи из .env.example ----------
+# Установщик НЕ перезаписывает существующий .env (настройки пользователя
+# сохраняются), но при обновлении поверх СТАРОЙ установки схема конфига
+# меняется. Идемпотентно добавляем отсутствующие ключи (например, секцию
+# LLM_SERVER_* после перехода с LM Studio на llama-server) — без них прокси
+# молча работает в устаревшей конфигурации: LLM_SERVER_MODEL пуст, сервер не
+# запускается, а «залипший» LOCAL_LLM_BASE_URL даёт 502 «llama-server не
+# отвечает». Заодно уводятся в комментарий устаревшие ключи.
+Write-Step "Миграция .env (недостающие ключи из .env.example)"
+& $py scripts\ensure_env_keys.py
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] .env не дополнен — проверьте настройки" -ForegroundColor Yellow
+    Write-Host "  локальной модели (LLM_SERVER_*) вручную: scripts\ensure_env_keys.py" -ForegroundColor Yellow
+}
+
+# ---------- 5b. GPU-аргументы llama-server под железо ----------
+# llama.cpp по умолчанию считает всё на CPU; скрипт детектирует NVIDIA/VRAM
+# и размер GGUF-модели, подбирает -ngl (99/16/0). Если пользователь сам
+# задал -ngl в .env — не перезаписываем (детали: scripts/configure_llm_args.py).
+Write-Step "Подбор GPU-аргументов llama-server (-ngl) под железо"
+& $py scripts\configure_llm_args.py
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Не удалось подобрать -ngl — .env оставлен без изменений." -ForegroundColor Yellow
+}
+
 # ---------- 6. Прогрев моделей ----------
 if (-not $SkipModels) {
     Write-Step "Прогрев NER-моделей (GLiNER + Natasha, первый раз — скачивание)"

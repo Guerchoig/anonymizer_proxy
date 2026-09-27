@@ -46,3 +46,7 @@ _smoke/
 *.anonymized.*
 preflight_*.out
 preflight_*.err
+
+# Локальные артефакты отладки (дампы процессов/портов) — не для репозитория
+_pslist.*
+pyprocs.txt

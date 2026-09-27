@@ -190,7 +190,8 @@ async function renderCloudCard(backends, items) {
     '<div class="row"><label>Модель<span class="desc">текущая: ' +
     esc(curCfg.model || "не задана") + ' — сохраняется перманентно</span></label>' +
     '<input type="text" id="modelInput" list="modelList" data-key="' +
-    esc(modelEnv(acting)) + '" value="' + esc(curCfg.model || "") + '">' +
+    esc(modelEnv(acting)) + '" data-original="' + esc(curCfg.model || "") +
+    '" value="' + esc(curCfg.model || "") + '">' +
     '<button class="ghost" id="btnModels" title="Загрузить список моделей провайдера">⟳</button></div>' +
     '<datalist id="modelList"></datalist>';
   $("#provSelect").addEventListener("change", async () => {
@@ -279,7 +280,7 @@ function renderChatModel(info) {
       esc(info.models_dir || "") +
       (info.binary_ok ? "" : " · бинарь llama-server не найден") +
     '</span></label><select id="chatModelSel">' + opts + '</select>' +
-    '<button id="btnChatModelApply">Применить везде</button></div>' +
+    '<button id="btnChatModelApply">Применить во всех проектах</button></div>' +
     '<div class="row"><label>Проекты<span class="desc">их llama-серверы ' +
       'перезапускаются при смене модели</span></label><div class="note">' +
       esc((info.projects || []).map(p => p.name).join(", ") ||
@@ -291,9 +292,10 @@ function renderChatModel(info) {
 async function applyChatModel() {
   const file = $("#chatModelSel").value;
   if (!file) return;
-  if (!confirm("Применить модель " + file + "?\n\nllama-серверы всех " +
-      "проектов (включая hermes-disk-search) будут перезапущены: текущие " +
-      "локальные запросы прервутся. Отсутствующий пресет будет скачан.")) return;
+  if (!confirm("Применить модель " + file + " во всех проектах?\n\n" +
+      "llama-серверы всех проектов (включая hermes-disk-search) будут " +
+      "перезапущены: текущие локальные запросы прервутся. Отсутствующий " +
+      "пресет будет скачан.")) return;
   try {
     const r = await api("/api/chat-model", { method: "POST",
       body: JSON.stringify({ file: file, restart: true }) });
@@ -318,6 +320,7 @@ function fieldRow(item) {
     /* текущее значение показываем в поле; неизменённые значения сервер
        игнорирует как no-op */
     input = '<input type="text" data-key="' + esc(item.key) +
+      '" data-original="' + esc(item.value || "") +
       '" placeholder="не задано" value="' + esc(item.value || "") + '">';
   }
   return '<div class="row"><label>' + esc(item.key) + desc + '</label>' +
@@ -378,7 +381,14 @@ function collectUpdates() {
     if (sel.value !== "") updates[sel.dataset.key] = sel.value;
   });
   document.querySelectorAll("input[type=text][data-key]").forEach(inp => {
-    if (inp.value.trim() !== "") updates[inp.dataset.key] = inp.value;
+    const val = inp.value.trim();
+    if (val !== "") {
+      updates[inp.dataset.key] = inp.value;
+    } else if ((inp.dataset.original || "") !== "") {
+      /* поле имело значение и очищено — закомментировать ключ
+         (сервер применит null: строка KEY=… станет # KEY=…) */
+      updates[inp.dataset.key] = null;
+    }
   });
   document.querySelectorAll("input[type=password][data-key]").forEach(inp => {
     if (inp.value !== "") updates[inp.dataset.key] = inp.value;
@@ -405,19 +415,26 @@ $("#btnSave").addEventListener("click", async () => {
   try {
     const r = await api("/api/env", { method: "POST",
       body: JSON.stringify({ updates: collectUpdates() }) });
-    showMsg("Сохранено (бэкап: " + r.backup.split(/[\\/]/).pop() +
-            "). Перезапустите прокси, чтобы применить.");
+    const saved = (r.changed || []).concat(r.added || []);
+    showMsg(saved.length
+      ? "Сохранено: " + saved.join(", ") + " (бэкап: " +
+        r.backup.split(/[\\/]/).pop() + "). Перезапустите прокси, чтобы применить."
+      : "Изменений нет: значения совпали с текущими (бэкап: " +
+        r.backup.split(/[\\/]/).pop() + ")");
     loadAll();
   } catch (e) { /* сообщение уже показано */ }
 });
 
 $("#btnSaveRestart").addEventListener("click", async () => {
   try {
-    await api("/api/env", { method: "POST",
+    const r = await api("/api/env", { method: "POST",
       body: JSON.stringify({ updates: collectUpdates() }) });
+    const saved = (r.changed || []).concat(r.added || []);
     await api("/api/restart", { method: "POST", body: "{}" });
     let left = 30;
-    showMsg("Сохранено. Прокси перезапускается…");
+    showMsg(saved.length
+      ? "Сохранено: " + saved.join(", ") + ". Прокси перезапускается…"
+      : "Изменений нет (значения совпали с текущими). Прокси перезапускается…");
     const t = setInterval(() => {
       $("#backend").textContent = "перезапуск… ~" + left + " сек";
       if (--left < 0) { clearInterval(t); location.reload(); }
