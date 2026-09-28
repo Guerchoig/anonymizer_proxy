@@ -17,6 +17,16 @@ step() { printf '\n==> %s\n' "$1"; }
 fail() { printf '[ОШИБКА] %s\n' "$1" >&2; exit 1; }
 warn() { printf '[ПРЕДУПРЕЖДЕНИЕ] %s\n' "$1" >&2; }
 
+# ---------- Аргументы ----------
+# --skip-clients — не предлагать подключение Cline Desktop / Hermes Agent
+SKIP_CLIENTS=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-clients) SKIP_CLIENTS=1 ;;
+        *) fail "Неизвестный аргумент: $arg (доступен --skip-clients)" ;;
+    esac
+done
+
 # ---------- 0. Карантин Gatekeeper ----------
 # Файлы, распакованные из скачанного браузером архива, получают метку
 # com.apple.quarantine; без её снятия macOS блокирует неподписанные
@@ -192,6 +202,51 @@ step "Прогрев NER-моделей (GLiNER + Natasha, первый раз �
 step "Самопроверка установки"
 "$PY" scripts/install_selftest.py || echo "[ПРЕДУПРЕЖДЕНИЕ] Self-test FAIL — см. выше."
 
+# ---------- 8b. Подключение клиентов (если установлены) ----------
+# Автонастройка провайдера в установленных клиентах: standalone-приложение
+# Cline Desktop (~/.cline) и Hermes Agent (config.yaml). Каждый вопрос
+# пропускается ответом «n»; целиком отключить шаг — --skip-clients.
+# Скрипты идемпотентны, делают резервные копии и требуют закрытого клиента
+# (запущенный клиент перезаписывает свои настройки при выходе).
+if [ "$SKIP_CLIENTS" != "1" ]; then
+    step "Подключение клиентов (Cline Desktop / Hermes Agent), если установлены"
+    if [ -d "$HOME/.cline" ]; then
+        printf 'Найден Cline Desktop — подключить к прокси? [Y/n]: '
+        read -r ANS || ANS=""
+        case "${ANS:-}" in
+            n|N|н|Н)
+                echo "Пропущено. Позже: .venv/bin/python scripts/configure_cline.py --set-active" ;;
+            *)
+                if ! "$PY" scripts/configure_cline.py --set-active; then
+                    warn "Не удалось — выполните позже:"
+                    warn "  .venv/bin/python scripts/configure_cline.py --set-active"
+                fi ;;
+        esac
+    else
+        echo "Cline Desktop не найден (~/.cline отсутствует) — пропускаю."
+    fi
+    HERMES_CFG=""
+    for c in "$HOME/.hermes/config.yaml" \
+             "$HOME/Library/Application Support/hermes/config.yaml"; do
+        if [ -f "$c" ]; then HERMES_CFG="$c"; break; fi
+    done
+    if [ -n "$HERMES_CFG" ]; then
+        printf 'Найден Hermes Agent (%s) — подключить к прокси? [Y/n]: ' "$HERMES_CFG"
+        read -r ANS || ANS=""
+        case "${ANS:-}" in
+            n|N|н|Н)
+                echo "Пропущено. Позже: .venv/bin/python scripts/configure_hermes.py" ;;
+            *)
+                if ! "$PY" scripts/configure_hermes.py --file "$HERMES_CFG"; then
+                    warn "Не удалось — выполните позже:"
+                    warn "  .venv/bin/python scripts/configure_hermes.py --file \"$HERMES_CFG\""
+                fi ;;
+        esac
+    else
+        echo "Hermes Agent не найден (config.yaml отсутствует) — пропускаю."
+    fi
+fi
+
 # ---------- 9. Ярлыки запуска ----------
 step "Ярлыки запуска (двойной клик / Dock)"
 chmod +x start_proxy.sh start_proxy.command 2>/dev/null || true
@@ -230,6 +285,10 @@ echo "Подключение Cline (расширение VS Code):"
 echo "  Base URL:  http://127.0.0.1:8081/v1"
 echo "  API Key:   любое значение (прокси его игнорирует)"
 echo "  Model:     любое значение"
+echo ""
+echo "Cline Desktop / Hermes Agent (если установлены) — скрипты подключения:"
+echo "  .venv/bin/python scripts/configure_cline.py --set-active"
+echo "  .venv/bin/python scripts/configure_hermes.py"
 echo ""
 echo "Правила анонимизации берутся из папки проекта:"
 echo "  .clinerules уже в корне прокси (для Cline в этой папке)."

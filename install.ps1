@@ -6,7 +6,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipModels,   # пропустить прогрев NER-моделей
-    [switch]$SkipSelfTest  # пропустить самопроверку
+    [switch]$SkipSelfTest, # пропустить самопроверку
+    [switch]$SkipClients   # пропустить подключение Cline Desktop / Hermes
 )
 
 $ErrorActionPreference = "Stop"
@@ -216,6 +217,53 @@ if (-not $SkipSelfTest) {
     }
 }
 
+# ---------- 6b. Подключение клиентов (если установлены) ----------
+# Автонастройка провайдера в установленных клиентах: standalone-приложение
+# Cline Desktop (~\.cline) и Hermes Agent (config.yaml). Каждый вопрос
+# пропускается ответом «n»; целиком отключить шаг — -SkipClients.
+# Скрипты идемпотентны, делают резервные копии и требуют закрытого клиента
+# (запущенный клиент перезаписывает свои настройки при выходе).
+if (-not $SkipClients) {
+    Write-Step "Подключение клиентов (Cline Desktop / Hermes Agent), если установлены"
+    $clineCfg = Join-Path $env:USERPROFILE ".cline\data\settings\providers.json"
+    if (Test-Path $clineCfg) {
+        $ans = Read-Host "Найден Cline Desktop — подключить к прокси? [Y/n]"
+        if ($ans -match '^[nN]') {
+            Write-Host "Пропущено. Позже: scripts\configure_cline.cmd --set-active"
+        }
+        else {
+            & $py scripts\configure_cline.py --set-active
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Не удалось — выполните позже:" -ForegroundColor Yellow
+                Write-Host "  scripts\configure_cline.cmd --set-active" -ForegroundColor Yellow
+            }
+        }
+    }
+    else {
+        Write-Host "Cline Desktop не найден (~\.cline отсутствует) — пропускаю."
+    }
+
+    $hermesCfg = @("$env:LOCALAPPDATA\hermes\config.yaml",
+                   "$env:USERPROFILE\.hermes\config.yaml") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($hermesCfg) {
+        $ans = Read-Host "Найден Hermes Agent ($hermesCfg) — подключить к прокси? [Y/n]"
+        if ($ans -match '^[nN]') {
+            Write-Host "Пропущено. Позже: scripts\configure_hermes.cmd"
+        }
+        else {
+            & $py scripts\configure_hermes.py --file $hermesCfg
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Не удалось — выполните позже:" -ForegroundColor Yellow
+                Write-Host "  scripts\configure_hermes.cmd --file $hermesCfg" -ForegroundColor Yellow
+            }
+        }
+    }
+    else {
+        Write-Host "Hermes Agent не найден (config.yaml отсутствует) — пропускаю."
+    }
+}
+
 # ---------- 7. Ярлык в меню Пуск ----------
 Write-Step "Ярлык «Anonymizer Proxy» в меню Пуск"
 try {
@@ -249,6 +297,10 @@ Write-Host "Подключение Cline (расширение VS Code):"
 Write-Host "  Base URL:  http://127.0.0.1:8081/v1"
 Write-Host "  API Key:   любое значение (прокси его игнорирует)"
 Write-Host "  Model:     любое значение"
+Write-Host ""
+Write-Host "Cline Desktop / Hermes Agent (если установлены) — скрипты подключения:"
+Write-Host "  scripts\configure_cline.cmd --set-active"
+Write-Host "  scripts\configure_hermes.cmd"
 Write-Host ""
 Write-Host "Правила анонимизации берутся из папки проекта:"
 Write-Host "  .clinerules уже в корне прокси (для Cline в этой папке)."
